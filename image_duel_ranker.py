@@ -10,6 +10,7 @@ import webbrowser
 from pathlib import Path
 from datetime import datetime
 from collections import deque
+from typing import Optional
 
 from PIL import Image, ImageTk, ImageSequence
 import tkinter as tk
@@ -242,7 +243,7 @@ def hide_image(conn, row):
     print(f"[hide] removed from pool: {img_path}")
 
 # -------------------- e621 link helper --------------------
-def e621_url_for_path(path: str) -> str | None:
+def e621_url_for_path(path: str) -> Optional[str]:
     stem = Path(path).stem
     m = re.search(r"(\d+)$", stem) or re.search(r"(\d+)", stem)
     if not m:
