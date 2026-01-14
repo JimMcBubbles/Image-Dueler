@@ -1223,6 +1223,9 @@ class App:
         st.setdefault("scrubbing", False)
         st.setdefault("waveform_ready", False)
         st.setdefault("waveform_img", None)    # PhotoImage (keep ref)
+        st.setdefault("waveform_src", None)    # PIL image source (unscaled)
+        st.setdefault("waveform_img_size", None)  # (w,h) of current PhotoImage
+        st.setdefault("waveform_status", "")      # "", "loading", "no-audio", "error"
         st.setdefault("waveform_key", None)    # cache key
         st.setdefault("waveform_job", None)    # background thread guard
         st.setdefault("pending_seek_frac", None)
@@ -1550,6 +1553,9 @@ class App:
         st["waveform_key"] = key
         st["waveform_ready"] = False
         st["waveform_img"] = None
+        st["waveform_src"] = None
+        st["waveform_img_size"] = None
+        st["waveform_status"] = "loading"
 
         # Avoid duplicate jobs
         if st.get("waveform_job") is not None:
@@ -1578,12 +1584,41 @@ class App:
                     "-frames:v", "1",
                     "-y", str(out_png)
                 ]
-                subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                r = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
+            # If ffmpeg failed (commonly: no audio stream), we still proceed and show a placeholder.
             if not out_png.exists():
-                raise RuntimeError("waveform render failed")
+                img = None
+                status = "error"
+                try:
+                    err = (getattr(r, "stderr", "") or "").lower()
+                    # Heuristic: if ffmpeg complains about missing audio, treat as "no-audio".
+                    if ("audio" in err and ("matches no streams" in err or "stream specifier" in err or "no such file or directory" not in err)):
+                        status = "no-audio"
+                except Exception:
+                    pass
+            else:
+                img = Image.open(str(out_png)).convert("RGBA")
+                status = ""
+                # Detect "blank" waveforms and tint for visibility on dark UI.
+                try:
+                    gray = img.convert("L")
+                    mx = int(gray.getextrema()[1] or 0)
+                    if mx < 8:
+                        img = None
+                        status = "no-audio"
+                    else:
+                        hx = ACCENT.lstrip("#")
+                        if len(hx) == 3:
+                            hx = "".join([c*2 for c in hx])
+                        r0, g0, b0 = int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16)
+                        alpha = gray.point(lambda p: 0 if p < 8 else min(255, int(p * 1.6)))
+                        col = Image.new("RGBA", img.size, (r0, g0, b0, 0))
+                        col.putalpha(alpha)
+                        img = col
+                except Exception:
+                    pass
 
-            img = Image.open(str(out_png)).convert("RGBA")
 
             def done():
                 st = self._side.get(side)
@@ -1595,11 +1630,12 @@ class App:
                 if not ui:
                     return
 
-                w = max(1, int(ui["wave"].winfo_width() or 1))
-                h2 = max(1, int(ui["wave"].winfo_height() or 1))
-                im2 = img.resize((w, h2), Image.BILINEAR)
-                st["waveform_img"] = ImageTk.PhotoImage(im2)
+                                # Store source image; scale on-demand in _redraw_waveform
+                st["waveform_src"] = img
+                st["waveform_img"] = None
+                st["waveform_img_size"] = None
                 st["waveform_ready"] = True
+                st["waveform_status"] = status
                 st["waveform_job"] = None
                 self._redraw_waveform(side)
 
@@ -1626,16 +1662,45 @@ class App:
         except Exception:
             return
 
-        if st.get("waveform_ready") and st.get("waveform_img"):
+
+        # Ensure waveform PhotoImage matches current canvas size (canvas may have been 1px wide when generated).
+        img_to_draw = None
+        if st.get("waveform_ready"):
+            src = st.get("waveform_src")
             try:
-                c.create_image(0, 0, anchor="nw", image=st["waveform_img"], tags="wave")
+                w = max(1, int(c.winfo_width() or 1))
+                h = max(1, int(c.winfo_height() or 1))
+            except Exception:
+                w, h = 1, 1
+
+            if src is not None:
+                try:
+                    if st.get("waveform_img") is None or st.get("waveform_img_size") != (w, h):
+                        im2 = src.resize((w, h), Image.BILINEAR)
+                        st["waveform_img"] = ImageTk.PhotoImage(im2)
+                        st["waveform_img_size"] = (w, h)
+                    img_to_draw = st.get("waveform_img")
+                except Exception:
+                    img_to_draw = None
+
+        if img_to_draw is not None:
+            try:
+                c.create_image(0, 0, anchor="nw", image=img_to_draw, tags="wave")
             except Exception:
                 pass
         else:
             try:
                 w = max(1, int(c.winfo_width() or 1))
                 h = max(1, int(c.winfo_height() or 1))
-                c.create_line(0, h//2, w, h//2, fill=TEXT_COLOR, stipple="gray50", tags="wave")
+                c.create_line(0, h // 2, w, h // 2, fill=TEXT_COLOR, stipple="gray50", tags="wave")
+
+                status = (st.get("waveform_status") or "").strip()
+                if status == "loading":
+                    c.create_text(6, h // 2, anchor="w", text="Waveform…", fill=TEXT_COLOR, font=("Segoe UI", 8), tags="wave")
+                elif status == "no-audio":
+                    c.create_text(w - 6, h // 2, anchor="e", text="No audio", fill=TEXT_COLOR, font=("Segoe UI", 8), tags="wave")
+                elif status == "error":
+                    c.create_text(w - 6, h // 2, anchor="e", text="Waveform unavailable", fill=TEXT_COLOR, font=("Segoe UI", 8), tags="wave")
             except Exception:
                 pass
 
