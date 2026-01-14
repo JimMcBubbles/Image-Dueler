@@ -38,9 +38,12 @@ LINK_COLOR = "#4ea1ff"
 
 # -------------------- CONFIG --------------------
 ROOT_DIR = r"I:\OneDrive\Discord Downloader Output\+\Grabber"
-DB_PATH = Path(ROOT_DIR) / ".image_ranking.sqlite"
-SIDEcar_DIR = Path(ROOT_DIR) / ".image_duel_sidecars"
-SIDEcar_DIR.mkdir(exist_ok=True)
+
+# Store DB + sidecars next to this .py
+SCRIPT_DIR = Path(__file__).resolve().parent
+DB_PATH = SCRIPT_DIR / ".image_ranking.sqlite"
+SIDEcar_DIR = SCRIPT_DIR / ".image_duel_sidecars"
+SIDEcar_DIR.mkdir(parents=True, exist_ok=True)
 
 EMBED_JPEG_EXIF = False
 WINDOW_SIZE = (1500, 950)
@@ -179,7 +182,7 @@ def find_folder_rank(leader, folder_path_str):
 
 # -------------------- Record results --------------------
 def update_image_metadata(path: Path, score: float):
-    SIDEcar_DIR.mkdir(exist_ok=True)
+    SIDEcar_DIR.mkdir(parents=True, exist_ok=True)
     side = SIDEcar_DIR / (path.name + ".json")
     side.write_text(json.dumps({
         "path": str(path),
