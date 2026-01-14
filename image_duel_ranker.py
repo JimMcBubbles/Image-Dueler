@@ -11,6 +11,7 @@ from pathlib import Path
 from datetime import datetime
 from collections import deque
 from typing import Optional
+from urllib.parse import quote_plus
 
 from PIL import Image, ImageTk, ImageSequence
 import tkinter as tk
@@ -37,9 +38,9 @@ ACCENT     = "#569cd6"
 LINK_COLOR = "#4ea1ff"
 
 # -------------------- CONFIG --------------------
-ROOT_DIR = r"I:\OneDrive\Discord Downloader Output\+\Grabber"
+DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
-# Store DB + sidecars next to this .py
+ROOT_DIR = r"I:\OneDrive\Discord Downloader Output\+\Grabber"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DB_PATH = SCRIPT_DIR / ".image_ranking.sqlite"
 SIDEcar_DIR = SCRIPT_DIR / ".image_duel_sidecars"
@@ -340,6 +341,21 @@ class App:
         self.link_right.bind("<Button-1>", lambda e, w=self.link_right: self._open_url(w.url))
 
         # ---- Keys table (4 columns: key | bind | key | bind) ----
+        self.search_header = tk.Label(self.sidebar, text="Search tags",
+                                      font=("Segoe UI", 11, "bold"), fg=ACCENT, bg=DARK_BG)
+        self.common_tags_entry = tk.Entry(self.sidebar, font=("Consolas", 9),
+                                          bg=DARK_PANEL, fg=TEXT_COLOR, insertbackground=TEXT_COLOR,
+                                          relief="flat")
+        self.common_tags_entry.insert(0, DEFAULT_COMMON_TAGS)
+
+        self.export_links_btn = tk.Button(self.sidebar, text="Export e621 links (clipboard + file)",
+                                          command=self.export_e621_links,
+                                          bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT,
+                                          relief="flat")
+
+        self.export_status = tk.Label(self.sidebar, text="", font=("Segoe UI", 9),
+                                      fg=TEXT_COLOR, bg=DARK_BG)
+
         self.keys_table = tk.Frame(self.sidebar, bg=DARK_PANEL, bd=1, relief="solid")
 
         # keybinds
@@ -362,6 +378,8 @@ class App:
         root.bind("<Prior>", lambda e: self.change_page(-1))
         root.bind("<Next>", lambda e: self.change_page(+1))
         root.bind("t", lambda e: self.toggle_metric())
+        root.bind("g", lambda e: self.export_e621_links())
+        root.bind("G", lambda e: self.export_e621_links())
 
         root.bind("<Configure>", self._on_configure)
 
@@ -593,7 +611,7 @@ class App:
 
         for w in (self.leader_header, self.metric_label, self.page_label,
                   self.board, self.nav_row, self.now_header, self.now,
-                  self.links_header, self.link_left, self.link_right, self.keys_table):
+                  self.links_header, self.link_left, self.link_right, self.search_header, self.common_tags_entry, self.export_links_btn, self.export_status, self.keys_table):
             w.pack_forget()
 
         self.leader_header.pack(anchor="w")
@@ -671,6 +689,11 @@ class App:
         self.link_left.pack(anchor="w")
         self.link_right.pack(anchor="w", pady=(0, 6))
 
+        self.search_header.pack(anchor="w")
+        self.common_tags_entry.pack(fill="x", pady=(2, 6))
+        self.export_links_btn.pack(fill="x", pady=(0, 2))
+        self.export_status.pack(anchor="w", pady=(0, 6))
+
         # Build keys table and make it match the sidebar width
         self._build_keys_table()
         self.keys_table.pack(side="bottom", fill="x", padx=0, pady=(0, 6))
@@ -717,6 +740,111 @@ class App:
     def quit(self):
         print("[quit] closing UI")
         self.root.quit()
+
+
+    # ---------- e621 link export ----------
+    def _parse_common_tags(self) -> list[str]:
+        """Parse the common tags entry into a list of tags."""
+        raw = self.common_tags_entry.get().strip() if hasattr(self, "common_tags_entry") else ""
+        return [t for t in raw.split() if t.strip()]
+
+    def _ranked_artist_tags(self) -> list[str]:
+        """
+        Best-effort artist tag source:
+        - uses folder leaderboard order
+        - converts folder leaf to a tag-like token (spaces -> underscores)
+        """
+        leader = folder_leaderboard(self.conn, metric=self.metric)
+        out: list[str] = []
+        seen = set()
+        for row in leader:
+            folder = row.get("folder", "")
+            leaf = Path(folder).name.strip()
+            if not leaf:
+                continue
+            tag = leaf.replace(" ", "_").strip()
+            if tag.startswith("~"):
+                tag = tag[1:]
+            if not tag:
+                continue
+            tag_norm = tag.lower()
+            if tag_norm in seen:
+                continue
+            seen.add(tag_norm)
+            out.append(tag_norm)
+        return out
+
+    def _build_e621_urls(self, common_tags: list[str], artist_tags: list[str]) -> list[str]:
+        """Build a list of e621 URLs respecting the 40-tag max."""
+        max_total = 40
+        max_artist = max_total - len(common_tags)
+        if max_artist < 1:
+            raise ValueError(f"Common tags use {len(common_tags)} tags; e621 max is {max_total}. Remove some common tags.")
+
+        total = len(artist_tags)
+        if total == 0:
+            return []
+
+        # Match your Excel logic: balanced groups, highest-ranked first
+        num_groups = max(1, math.ceil(total / max_artist))
+        items_per_group = max(1, math.ceil(total / num_groups))
+
+        urls: list[str] = []
+        for g in range(num_groups):
+            chunk = artist_tags[g * items_per_group:(g + 1) * items_per_group]
+            if not chunk:
+                continue
+
+            tags = list(common_tags) + [f"~{t}" for t in chunk[:max_artist]]
+            tag_str = " ".join(tags)
+            encoded = quote_plus(tag_str, safe="~()_-.'")
+            urls.append(f"https://e621.net/posts?tags={encoded}")
+
+        return urls
+
+    def export_e621_links(self):
+        """Write ranked e621 search URLs to e621_links.txt and copy to clipboard."""
+        try:
+            common = self._parse_common_tags()
+            artists = self._ranked_artist_tags()
+            urls = self._build_e621_urls(common, artists)
+        except Exception as e:
+            msg = f"Export failed: {e}"
+            print("[e621] " + msg)
+            if hasattr(self, "export_status"):
+                self.export_status.configure(text=msg)
+            return
+
+        if not urls:
+            msg = "No artist tags found to export."
+            print("[e621] " + msg)
+            if hasattr(self, "export_status"):
+                self.export_status.configure(text=msg)
+            return
+
+        out_path = SCRIPT_DIR / "e621_links.txt"
+        try:
+            out_path.write_text("\n".join(urls) + "\n", encoding="utf-8")
+        except Exception as e:
+            msg = f"Export failed writing file: {e}"
+            print("[e621] " + msg)
+            if hasattr(self, "export_status"):
+                self.export_status.configure(text=msg)
+            return
+
+        clip_msg = ""
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append("\n".join(urls))
+            self.root.update()
+            clip_msg = "Copied to clipboard; "
+        except Exception:
+            pass
+
+        msg = f"{clip_msg}wrote {len(urls)} link(s) to {out_path.name} (max 40 tags/search)."
+        print("[e621] " + msg)
+        if hasattr(self, "export_status"):
+            self.export_status.configure(text=msg)
 
 # -------------------- Report on quit --------------------
 def export_csv(conn, path: Path):
