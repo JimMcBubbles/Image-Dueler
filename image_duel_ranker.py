@@ -1,83 +1,107 @@
+# image_duel_ranker.py
+# Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
+# Build: 2026-01-14d (video controls revamp: seek ±5s, speed, fullscreen, waveform)
+
 import os
+import sys
 import re
 import math
 import random
 import sqlite3
 import time
 import json
-import threading
-import webbrowser
 from pathlib import Path
 from datetime import datetime
 from collections import deque
-from typing import Optional
+from typing import Optional, Tuple, List
 from urllib.parse import quote_plus
+import webbrowser
 
-from PIL import Image, ImageTk, ImageSequence
+import subprocess
+import shutil
+import tempfile
+import hashlib
 import tkinter as tk
+import tkinter.ttk as ttk
 import tkinter.font as tkfont
 import tkinter.messagebox as messagebox
 
-# Optional: folder chart on quit
+from PIL import Image, ImageTk, ImageSequence
+
+# Optional chart (only used on exit)
 try:
     import matplotlib.pyplot as plt
 except Exception:
     plt = None
 
-# Optional: embed JPEG EXIF UserComment
+# Optional EXIF embed
 try:
     import piexif
 except Exception:
     piexif = None
 
-
-# Optional: in-app video preview (requires: imageio + imageio-ffmpeg)
+# Optional "proper" video playback (with audio) via VLC
 try:
-    import imageio.v2 as imageio
+    import vlc  # type: ignore
+    HAVE_VLC = True
 except Exception:
-    imageio = None
+    vlc = None
+    HAVE_VLC = False
 
 # -------------------- THEME (Dark Mode) --------------------
-DARK_BG    = "#1e1e1e"
-DARK_PANEL = "#252526"
-DARK_BORDER= "#333333"
-TEXT_COLOR = "#eeeeee"
-ACCENT     = "#569cd6"
-LINK_COLOR = "#4ea1ff"
+DARK_BG     = "#1e1e1e"
+DARK_PANEL  = "#252526"
+DARK_BORDER = "#333333"
+TEXT_COLOR  = "#eeeeee"
+ACCENT      = "#569cd6"
+LINK_COLOR  = "#4ea1ff"
 
 # -------------------- CONFIG --------------------
-DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
-
-POOL_FILTER_OPTIONS = ["All", "Images", "GIFs", "Videos", "Animated", "Hidden"]
-
 ROOT_DIR = r"I:\OneDrive\Discord Downloader Output\+\Grabber"
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 DB_PATH = SCRIPT_DIR / ".image_ranking.sqlite"
-SIDEcar_DIR = SCRIPT_DIR / ".image_duel_sidecars"
-SIDEcar_DIR.mkdir(parents=True, exist_ok=True)
+SIDECAR_DIR = SCRIPT_DIR / ".image_duel_sidecars"
+SIDECAR_DIR.mkdir(parents=True, exist_ok=True)
 
 EMBED_JPEG_EXIF = False
 WINDOW_SIZE = (1500, 950)
 
+# UI polish
+INFO_BAR_HEIGHT = 26
+INFO_BAR_BG = "#0f0f0f"
+INFO_BAR_FG = "#d0d0d0"
+INFO_BAR_FONT = ("Segoe UI", 10)
+SEPARATOR_BG = "#242424"
+SIDEBAR_WIDTH = 420
+
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 GIF_EXTS = {".gif"}
-VIDEO_EXTS = {".mp4", ".m4v", ".webm", ".mkv", ".avi", ".mov", ".wmv"}
+VIDEO_EXTS = {
+    ".mp4", ".webm", ".mkv", ".avi", ".mov", ".wmv", ".m4v", ".mpg", ".mpeg"
+}
 SUPPORTED_EXTS = IMAGE_EXTS | GIF_EXTS | VIDEO_EXTS
-K_FACTOR   = 32.0
+
+K_FACTOR = 32.0
 BASE_SCORE = 1000.0
+DOWNVOTE_PENALTY = 12.0
 
-LEADERBOARD_SIZE  = 30
-DOWNVOTE_PENALTY  = 12.0
-LEAF_MAX          = 24
+LEADERBOARD_SIZE = 30
+LEAF_MAX = 24
 
-# Leaderboard anti-bias options
-LEADERBOARD_METRIC_DEFAULT = "shrunken_avg"  # 'avg', 'shrunken_avg', 'lcb'
-FOLDER_MIN_N        = 1
+LEADERBOARD_METRIC_DEFAULT = "shrunken_avg"  # avg | shrunken_avg | lcb
+FOLDER_MIN_N = 1
 FOLDER_PRIOR_IMAGES = 8
-LCB_Z               = 1.0
+LCB_Z = 1.0
+
+E621_MAX_TAGS = 40
+DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
+
+BUILD_STAMP = '2026-01-14c (UI polish: focus mode, info bars, separators)'
 
 # -------------------- DB --------------------
-def init_db():
+def init_db() -> sqlite3.Connection:
+    print(f"[build] {BUILD_STAMP} | {Path(__file__).resolve()}")
     print("[init] opening database:", DB_PATH)
     conn = sqlite3.connect(DB_PATH)
     conn.execute(f"""
@@ -106,7 +130,7 @@ def init_db():
     migrate_schema(conn)
     return conn
 
-def migrate_schema(conn):
+def migrate_schema(conn: sqlite3.Connection) -> None:
     cols = [row[1] for row in conn.execute("PRAGMA table_info(images)")]
     if "hidden" not in cols:
         print("[migrate] adding 'hidden' column to images")
@@ -115,12 +139,16 @@ def migrate_schema(conn):
         conn.execute("UPDATE images SET hidden=0 WHERE hidden IS NULL")
         conn.commit()
 
-def scan_images(conn):
+def scan_images(conn: sqlite3.Connection) -> None:
     cur = conn.cursor()
     existing = {row[0] for row in cur.execute("SELECT path FROM images")}
     to_add = []
     print("[scan] scanning", ROOT_DIR)
-    for p in Path(ROOT_DIR).rglob("*"):
+    root = Path(ROOT_DIR)
+    if not root.exists():
+        print("[scan] ROOT_DIR does not exist:", ROOT_DIR)
+        return
+    for p in root.rglob("*"):
         if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS:
             sp = str(p)
             if sp not in existing:
@@ -134,24 +162,24 @@ def scan_images(conn):
     print(f"[scan] total images in DB: {n}")
 
 # -------------------- Elo helpers --------------------
-def elo_expected(sa, sb):
+def elo_expected(sa: float, sb: float) -> float:
     return 1.0 / (1.0 + 10 ** ((sb - sa) / 400.0))
 
-def elo_update(sa, sb, winner_is_a):
+def elo_update(sa: float, sb: float, winner_is_a: Optional[bool]) -> Tuple[float, float]:
     ea, eb = elo_expected(sa, sb), elo_expected(sb, sa)
     if winner_is_a is None:
         return (sa + K_FACTOR * (0.5 - ea), sb + K_FACTOR * (0.5 - eb))
-    elif winner_is_a:
+    if winner_is_a:
         return (sa + K_FACTOR * (1.0 - ea), sb + K_FACTOR * (0.0 - eb))
-    else:
-        return (sa + K_FACTOR * (0.0 - ea), sb + K_FACTOR * (1.0 - eb))
+    return (sa + K_FACTOR * (0.0 - ea), sb + K_FACTOR * (1.0 - eb))
 
 # -------------------- Leaderboard (anti-bias) --------------------
-def folder_leaderboard(conn, metric=LEADERBOARD_METRIC_DEFAULT, min_n=FOLDER_MIN_N):
+def folder_leaderboard(conn: sqlite3.Connection, metric: str = LEADERBOARD_METRIC_DEFAULT,
+                       min_n: int = FOLDER_MIN_N) -> List[dict]:
     mu_row = conn.execute("SELECT AVG(score) FROM images WHERE hidden=0").fetchone()
     global_mu = float(mu_row[0] if mu_row and mu_row[0] is not None else BASE_SCORE)
 
-    rows = []
+    rows: List[dict] = []
     if metric in ("avg", "shrunken_avg"):
         data = conn.execute("""
             SELECT folder, AVG(score) AS avg_s, COUNT(*) AS n
@@ -162,8 +190,8 @@ def folder_leaderboard(conn, metric=LEADERBOARD_METRIC_DEFAULT, min_n=FOLDER_MIN
         """, (min_n,)).fetchall()
         for (folder, avg_s, n) in data:
             avg_s = float(avg_s); n = int(n)
-            score = (avg_s * n + global_mu * FOLDER_PRIOR_IMAGES) / (n + FOLDER_PRIOR_IMAGES) \
-                    if metric == "shrunken_avg" else avg_s
+            score = ((avg_s * n + global_mu * FOLDER_PRIOR_IMAGES) / (n + FOLDER_PRIOR_IMAGES)
+                     if metric == "shrunken_avg" else avg_s)
             rows.append({"folder": folder, "avg": avg_s, "n": n, "score": score})
     elif metric == "lcb":
         data = conn.execute("""
@@ -175,7 +203,7 @@ def folder_leaderboard(conn, metric=LEADERBOARD_METRIC_DEFAULT, min_n=FOLDER_MIN
         """, (min_n,)).fetchall()
         for (folder, n, avg_s, avg_sq) in data:
             n = int(n); avg_s = float(avg_s); avg_sq = float(avg_sq)
-            var = max(0.0, avg_sq - avg_s*avg_s)
+            var = max(0.0, avg_sq - avg_s * avg_s)
             se = (var ** 0.5) / (n ** 0.5) if n > 0 else 0.0
             score = avg_s - LCB_Z * se
             rows.append({"folder": folder, "avg": avg_s, "n": n, "score": score})
@@ -183,27 +211,32 @@ def folder_leaderboard(conn, metric=LEADERBOARD_METRIC_DEFAULT, min_n=FOLDER_MIN
         return folder_leaderboard(conn, metric="avg", min_n=min_n)
 
     rows.sort(key=lambda r: r["score"], reverse=True)
-    out = []
+    out: List[dict] = []
     for i, r in enumerate(rows, start=1):
-        out.append({'folder': r['folder'], 'avg': r['avg'], 'n': r['n'], 'rank': i, 'score': r['score'], 'metric': metric})
+        out.append({
+            "folder": r["folder"], "avg": r["avg"], "n": r["n"],
+            "rank": i, "score": r["score"], "metric": metric
+        })
     return out
 
-def find_folder_rank(leader, folder_path_str):
+def find_folder_rank(leader: List[dict], folder_path_str: str) -> Tuple[Optional[int], Optional[float], Optional[int], Optional[float]]:
     for item in leader:
-        if item['folder'] == folder_path_str:
-            return item['rank'], item['avg'], item['n']
-    return None, None, None
+        if item["folder"] == folder_path_str:
+            return item["rank"], item["avg"], item["n"], item["score"]
+    return None, None, None, None
 
-# -------------------- Record results --------------------
-def update_image_metadata(path: Path, score: float):
-    SIDEcar_DIR.mkdir(parents=True, exist_ok=True)
-    side = SIDEcar_DIR / (path.name + ".json")
-    side.write_text(json.dumps({
-        "path": str(path),
-        "rating_score": float(score),
-        "updated_utc": datetime.utcnow().isoformat() + "Z",
-        "note": "Generated by Image Duel Ranker (Elo)."
-    }, indent=2), encoding="utf-8")
+# -------------------- Sidecar metadata --------------------
+def update_image_metadata(path: Path, score: float) -> None:
+    try:
+        side = SIDECAR_DIR / (path.name + ".json")
+        side.write_text(json.dumps({
+            "path": str(path),
+            "rating_score": float(score),
+            "updated_utc": datetime.utcnow().isoformat() + "Z",
+            "note": "Generated by Image Duel Ranker (Elo)."
+        }, indent=2), encoding="utf-8")
+    except Exception:
+        return
 
     if EMBED_JPEG_EXIF and piexif and path.suffix.lower() in {".jpg", ".jpeg"}:
         try:
@@ -215,57 +248,69 @@ def update_image_metadata(path: Path, score: float):
             exif_dict.setdefault("Exif", {})[piexif.ExifIFD.UserComment] = comment
             exif_bytes = piexif.dump(exif_dict)
             piexif.insert(exif_bytes, str(path))
-        except Exception as e:
-            print(f"[warn] EXIF embed failed for {path.name}: {e}")
+        except Exception:
+            pass
 
-def record_result(conn, a, b, winner):
-    a_id, a_path, a_folder, a_duels, a_score, _a_wins_cur, _a_losses_cur = a
-    b_id, b_path, b_folder, b_duels, b_score, _b_wins_cur, _b_losses_cur = b
+# -------------------- Record results --------------------
+def record_result(conn: sqlite3.Connection, a: tuple, b: tuple, winner: Optional[str]) -> None:
+    a_id, a_path, a_folder, a_duels, a_wins, a_losses, a_score, a_hidden = a
+    b_id, b_path, b_folder, b_duels, b_wins, b_losses, b_score, b_hidden = b
 
-    a_wins = b_wins = 0
-    a_losses = b_losses = 0
-    w_id = None
+    a_wins_inc = b_wins_inc = 0
+    a_losses_inc = b_losses_inc = 0
+    chosen_id = None
 
     if winner == "a":
         new_a, new_b = elo_update(a_score, b_score, True)
-        w_id, a_wins, b_losses = a_id, 1, 1
+        chosen_id = a_id
+        a_wins_inc, b_losses_inc = 1, 1
     elif winner == "b":
         new_a, new_b = elo_update(a_score, b_score, False)
-        w_id, b_wins, a_losses = b_id, 1, 1
+        chosen_id = b_id
+        b_wins_inc, a_losses_inc = 1, 1
     elif winner == "downvote":
         new_a, new_b = a_score - DOWNVOTE_PENALTY, b_score - DOWNVOTE_PENALTY
-        a_losses, b_losses = 1, 1
-    else:  # draw/skip
+        a_losses_inc, b_losses_inc = 1, 1
+    else:  # skip/tie
         new_a, new_b = elo_update(a_score, b_score, None)
 
     ts = int(time.time())
     cur = conn.cursor()
-    cur.execute("UPDATE images SET score=?, duels=duels+1, wins=wins+?, losses=losses+?, last_seen=? WHERE id=?",
-                (new_a, a_wins, a_losses, ts, a_id))
-    cur.execute("UPDATE images SET score=?, duels=duels+1, wins=wins+?, losses=losses+?, last_seen=? WHERE id=?",
-                (new_b, b_wins, b_losses, ts, b_id))
-    cur.execute("INSERT INTO comparisons(left_id, right_id, chosen_id, ts) VALUES (?,?,?,?)",
-                (a_id, b_id, w_id, ts))
+    cur.execute(
+        "UPDATE images SET score=?, duels=duels+1, wins=wins+?, losses=losses+?, last_seen=? WHERE id=?",
+        (new_a, a_wins_inc, a_losses_inc, ts, a_id),
+    )
+    cur.execute(
+        "UPDATE images SET score=?, duels=duels+1, wins=wins+?, losses=losses+?, last_seen=? WHERE id=?",
+        (new_b, b_wins_inc, b_losses_inc, ts, b_id),
+    )
+    cur.execute(
+        "INSERT INTO comparisons(left_id, right_id, chosen_id, ts) VALUES (?,?,?,?)",
+        (a_id, b_id, chosen_id, ts),
+    )
     conn.commit()
 
-    print(f"[result] stored: winner={winner} | {Path(a_path).name} vs {Path(b_path).name}")
+    # Sidecars (async-ish, but safe in a short thread)
+    try:
+        import threading
+        threading.Thread(target=update_image_metadata, args=(Path(a_path), float(new_a)), daemon=True).start()
+        threading.Thread(target=update_image_metadata, args=(Path(b_path), float(new_b)), daemon=True).start()
+    except Exception:
+        pass
 
-    threading.Thread(target=update_image_metadata, args=(Path(a_path), new_a), daemon=True).start()
-    threading.Thread(target=update_image_metadata, args=(Path(b_path), new_b), daemon=True).start()
-
-def set_image_hidden(conn, row, hidden: int):
-    img_id, img_path = row[0], row[1]
+def set_image_hidden(conn: sqlite3.Connection, img_id: int, hidden: int) -> None:
     conn.execute("UPDATE images SET hidden=?, last_seen=? WHERE id=?", (hidden, int(time.time()), img_id))
     conn.commit()
-    action = "unhide" if hidden == 0 else "hide"
-    print(f"[{action}] set hidden={hidden}: {img_path}")
 
-def hide_image(conn, row):
-    set_image_hidden(conn, row, 1)
+def hide_image(conn: sqlite3.Connection, row: tuple) -> None:
+    set_image_hidden(conn, row[0], 1)
+    print(f"[hide] {row[1]}")
 
-def unhide_image(conn, row):
-    set_image_hidden(conn, row, 0)
+def unhide_image(conn: sqlite3.Connection, row: tuple) -> None:
+    set_image_hidden(conn, row[0], 0)
+    print(f"[unhide] {row[1]}")
 
+# -------------------- e621 helper --------------------
 def e621_url_for_path(path: str) -> Optional[str]:
     stem = Path(path).stem
     m = re.search(r"(\d+)$", stem) or re.search(r"(\d+)", stem)
@@ -278,244 +323,177 @@ def e621_url_for_path(path: str) -> Optional[str]:
     return f"https://e621.net/posts/{pid}"
 
 # -------------------- UI --------------------
-
-class VideoPlayer:
-    """Tkinter video playback (frames only, no audio).
-
-    - Starts paused on the first frame.
-    - Uses imageio (ffmpeg backend) if available.
-    - Playback is best-effort; if decoding fails, falls back to a placeholder.
-    """
-
-    def __init__(self, root: tk.Tk, widget: tk.Label, path: str, target_size: tuple[int, int]):
-        self.root = root
-        self.widget = widget
-        self.path = path
-        self.target_size = target_size
-
-        self.reader = None
-        self.iter = None
-        self.fps = 24.0
-        self.delay_ms = 42
-
-        self.after_job = None
-        self.paused = True
-        self.ended = False
-
-    def _open(self) -> bool:
-        if imageio is None:
-            return False
-        try:
-            self.reader = imageio.get_reader(self.path)
-            meta = {}
-            try:
-                meta = self.reader.get_meta_data() or {}
-            except Exception:
-                meta = {}
-            fps = meta.get("fps")
-            if isinstance(fps, (int, float)) and fps and fps > 0:
-                self.fps = float(fps)
-            self.fps = max(5.0, min(60.0, self.fps))
-            self.delay_ms = int(1000.0 / self.fps)
-            self.iter = self.reader.iter_data()
-            self.ended = False
-            return True
-        except Exception:
-            self.reader = None
-            self.iter = None
-            return False
-
-    def close(self):
-        self._cancel()
-        try:
-            if self.reader:
-                self.reader.close()
-        except Exception:
-            pass
-        self.reader = None
-        self.iter = None
-        self.paused = True
-        self.ended = False
-
-    def _cancel(self):
-        if self.after_job:
-            try:
-                self.root.after_cancel(self.after_job)
-            except Exception:
-                pass
-            self.after_job = None
-
-    def _display_frame(self, frame) -> bool:
-        try:
-            im = Image.fromarray(frame)
-        except Exception:
-            return False
-        if im.mode not in ("RGB", "RGBA"):
-            im = im.convert("RGB")
-        im.thumbnail(self.target_size, Image.Resampling.LANCZOS)
-        tk_im = ImageTk.PhotoImage(im)
-        self.widget.configure(image=tk_im, text="", bg=DARK_PANEL, borderwidth=0, highlightthickness=0)
-        self.widget.image = tk_im
-        return True
-
-    def show_first_frame(self) -> bool:
-        # Always reopen to guarantee frame 0 and reset end-state
-        self.close()
-        if not self._open():
-            return False
-        try:
-            frame = next(self.iter)
-        except Exception:
-            self.close()
-            return False
-        ok = self._display_frame(frame)
-        self.paused = True
-        return ok
-
-    def toggle(self):
-        if self.reader is None or self.iter is None:
-            if not self.show_first_frame():
-                return
-
-        if self.ended:
-            # restart from beginning on next play
-            if not self.show_first_frame():
-                return
-            self.ended = False
-
-        if self.paused:
-            self.paused = False
-            self._schedule(0)
-        else:
-            self.paused = True
-            self._cancel()
-
-    def _schedule(self, delay_ms: int):
-        self._cancel()
-        self.after_job = self.root.after(delay_ms, self.step)
-
-    def step(self):
-        if self.paused:
-            return
-        if self.reader is None or self.iter is None:
-            self.paused = True
-            return
-        try:
-            frame = next(self.iter)
-        except StopIteration:
-            self.paused = True
-            self.ended = True
-            self._cancel()
-            return
-        except Exception:
-            self.paused = True
-            self.ended = True
-            self._cancel()
-            return
-
-        if not self._display_frame(frame):
-            self.paused = True
-            self.ended = True
-            self._cancel()
-            return
-
-        self._schedule(self.delay_ms)
-
 class App:
-    def __init__(self, root, conn):
+    def __init__(self, root: tk.Tk, conn: sqlite3.Connection):
         self.root = root
         self.conn = conn
-        self.current = None
-        self.prev_artists = deque(maxlen=4)
-        self.page = 0
-        self.metric = LEADERBOARD_METRIC_DEFAULT
-        self._last_ranks = {r['folder']: r['rank'] for r in folder_leaderboard(self.conn, metric=self.metric)}
-        self._resize_job = None
-        self._sidebar_width_px = 420  # set precisely on first sidebar build
 
-        root.title("Image Duel Ranker")
+        root.title(f"Image Duel Ranker — {BUILD_STAMP.split(' ')[0]}")
         root.geometry(f"{WINDOW_SIZE[0]}x{WINDOW_SIZE[1]}")
         root.configure(bg=DARK_BG)
 
-        # ----- Main containers (no draggable splitters) -----
+        # state
+        self.current: Optional[Tuple[tuple, tuple]] = None
+        self.prev_artists = deque(maxlen=6)
+        self.page = 0
+        self.metric = LEADERBOARD_METRIC_DEFAULT
+        self._last_ranks = {r["folder"]: r["rank"] for r in folder_leaderboard(self.conn, metric=self.metric)}
+        self._resize_job = None
+
+        # video state per side
+        self.vlc_instance = None
+        if HAVE_VLC:
+            try:
+                self.vlc_instance = vlc.Instance("--no-video-title-show", "--quiet")
+            except Exception:
+                self.vlc_instance = None
+
+        self._side = {
+            "a": self._new_side_state(),
+            "b": self._new_side_state(),
+        }
+
+        # ---- Layout containers ----
         self.container = tk.Frame(root, bg=DARK_BG)
         self.container.pack(fill="both", expand=True)
 
-        # left: images area (expands)
+        # Left: duel panels
         self.images_frame = tk.Frame(self.container, bg=DARK_BG)
         self.images_frame.pack(side="left", fill="both", expand=True)
 
-        self.left_panel  = tk.Label(self.images_frame,  bd=0, bg=DARK_PANEL, cursor="hand2")
-        self.right_panel = tk.Label(self.images_frame,  bd=0, bg=DARK_PANEL, cursor="hand2")
-        self.left_panel.pack(side="left",  fill="both", expand=True, padx=(6,3), pady=6)
-        self.right_panel.pack(side="left", fill="both", expand=True, padx=(3,6), pady=6)
+        # Each panel is a container with an image label + a video frame + overlay controls.
+        self.left_container = tk.Frame(self.images_frame, bg=DARK_PANEL, bd=0, highlightthickness=0)
+        self.right_container = tk.Frame(self.images_frame, bg=DARK_PANEL, bd=0, highlightthickness=0)
+        self.left_container.pack(side="left", fill="both", expand=True, padx=(6, 3), pady=6)
+        self.right_container.pack(side="left", fill="both", expand=True, padx=(3, 6), pady=6)
 
-        # right: sidebar (fixed width)
+        
+        # Save pack options for fullscreen / layout restores
+        self._left_pack_opts = self.left_container.pack_info()
+        self._right_pack_opts = self.right_container.pack_info()
+# Hover highlight for duel panels
+        def _hover_on(c: tk.Frame):
+            c.configure(highlightthickness=2, highlightbackground=ACCENT, highlightcolor=ACCENT)
+
+        def _hover_off(c: tk.Frame):
+            c.configure(highlightthickness=0)
+
+        for c in (self.left_container, self.right_container):
+            c.configure(highlightthickness=0)
+        self.left_container.bind("<Enter>", lambda e: _hover_on(self.left_container))
+        self.left_container.bind("<Leave>", lambda e: _hover_off(self.left_container))
+        self.right_container.bind("<Enter>", lambda e: _hover_on(self.right_container))
+        self.right_container.bind("<Leave>", lambda e: _hover_off(self.right_container))
+
+        self.left_panel = tk.Label(self.left_container, bd=0, bg=DARK_PANEL, cursor="hand2")
+        self.right_panel = tk.Label(self.right_container, bd=0, bg=DARK_PANEL, cursor="hand2")
+        self.left_panel.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self.right_panel.place(relx=0, rely=0, relwidth=1, relheight=1)
+
+        # Info bars (top overlay) for each side
+        self.left_info_bar = tk.Frame(self.left_container, bg=INFO_BAR_BG, bd=0, highlightthickness=0)
+        self.right_info_bar = tk.Frame(self.right_container, bg=INFO_BAR_BG, bd=0, highlightthickness=0)
+        self.left_info_bar.place(relx=0, rely=0, relwidth=1, height=INFO_BAR_HEIGHT)
+        self.right_info_bar.place(relx=0, rely=0, relwidth=1, height=INFO_BAR_HEIGHT)
+
+        self.left_info_text = tk.Label(self.left_info_bar, text="", font=INFO_BAR_FONT,
+                                       fg=INFO_BAR_FG, bg=INFO_BAR_BG, anchor="w")
+        self.right_info_text = tk.Label(self.right_info_bar, text="", font=INFO_BAR_FONT,
+                                        fg=INFO_BAR_FG, bg=INFO_BAR_BG, anchor="w")
+        self.left_info_text.pack(fill="both", expand=True, padx=8)
+        self.right_info_text.pack(fill="both", expand=True, padx=8)
+
+        # Make info bars behave like the image/video panel for clicks
+        for w in (self.left_info_bar, self.left_info_text):
+            w.bind("<Button-1>", lambda e: self.choose("a"))
+            w.bind("<Button-3>", lambda e: self.choose("downvote"))
+            w.bind("<Button-2>", lambda e: self.hide_side("a"))
+            w.bind("<Double-Button-1>", self.open_left)
+            w.bind("<Control-Button-1>", lambda e: self.toggle_video("a"))
+
+        for w in (self.right_info_bar, self.right_info_text):
+            w.bind("<Button-1>", lambda e: self.choose("b"))
+            w.bind("<Button-3>", lambda e: self.choose("downvote"))
+            w.bind("<Button-2>", lambda e: self.hide_side("b"))
+            w.bind("<Double-Button-1>", self.open_right)
+            w.bind("<Control-Button-1>", lambda e: self.toggle_video("b"))
+
+        self.left_video = tk.Frame(self.left_container, bg="black", bd=0, highlightthickness=0)
+        self.right_video = tk.Frame(self.right_container, bg="black", bd=0, highlightthickness=0)
+        self.left_video.place_forget()
+        self.right_video.place_forget()
+
+        # Hover control bars
+        self._build_hover_video_controls()
+
+        # Right: sidebar
         self.sidebar = tk.Frame(self.container, bg=DARK_BG, bd=0, highlightthickness=0)
+        self._sidebar_pack_opts = dict(side="right", fill="y", padx=(0, 6), pady=6)
+        self.sidebar.pack(**self._sidebar_pack_opts)
+        self.sidebar.configure(width=SIDEBAR_WIDTH)
+        self.sidebar.pack_propagate(False)
+
+        # Floating restore button when sidebar is hidden
+        self.sidebar_restore_btn = tk.Button(self.root, text="Show sidebar",
+                                             command=self.toggle_sidebar,
+                                             bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat")
+        self.sidebar_restore_btn.place_forget()
 
         # ---- Pool filter ----
         self.pool_filter_var = tk.StringVar(value="All")
         self.pool_filter_row = tk.Frame(self.sidebar, bg=DARK_BG)
-        self.pool_filter_label = tk.Label(self.pool_filter_row, text="Pool:", font=("Segoe UI", 9),
-                                          fg=TEXT_COLOR, bg=DARK_BG)
-        self.pool_filter_label.pack(side="left")
-        self.pool_filter_menu = tk.OptionMenu(self.pool_filter_row, self.pool_filter_var, *POOL_FILTER_OPTIONS,
-                                             command=self.on_pool_filter_change)
-        self.pool_filter_menu.configure(bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT,
-                                        relief="flat", highlightthickness=0)
-        try:
-            self.pool_filter_menu["menu"].configure(bg=DARK_PANEL, fg=TEXT_COLOR)
-        except Exception:
-            pass
-        self.pool_filter_menu.pack(side="right", fill="x", expand=True, padx=(8, 0))
+        tk.Label(self.pool_filter_row, text="Pool:", font=("Segoe UI", 10, "bold"),
+                 fg=ACCENT, bg=DARK_BG).pack(side="left")
+        self.pool_filter = ttk.Combobox(
+            self.pool_filter_row,
+            textvariable=self.pool_filter_var,
+            values=["All", "Images", "GIFs", "Videos", "Animated", "Hidden"],
+            state="readonly",
+            width=12,
+        )
+        self.pool_filter.pack(side="right")
+        self.pool_filter.bind("<<ComboboxSelected>>", lambda e: self.on_pool_filter_change())
 
+        # Sidebar toggle (focus mode)
+        self.sidebar_visible = True
+        self.sidebar_toggle_btn = tk.Button(self.pool_filter_row, text="Focus",
+                                            command=self.toggle_sidebar,
+                                            bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat", width=7)
+        self.sidebar_toggle_btn.pack(side="right")
+        self.pool_filter_row.pack(fill="x", pady=(0, 6))
 
-        # -------------------- Mouse controls --------------------
-        self.left_panel.bind("<Button-1>",  lambda e: self.choose("a"))
-        self.right_panel.bind("<Button-1>", lambda e: self.choose("b"))
-        self.left_panel.bind("<Control-Button-1>",  lambda e: (self.toggle_video("a") or "break"))
-        self.right_panel.bind("<Control-Button-1>", lambda e: (self.toggle_video("b") or "break"))
-        self.left_panel.bind("<Double-Button-1>", self.open_left)
-        self.right_panel.bind("<Double-Button-1>", self.open_right)
-        self.left_panel.bind("<Button-3>",  lambda e: self.choose("downvote"))
-        self.right_panel.bind("<Button-3>", lambda e: self.choose("downvote"))
-        self.left_panel.bind("<Button-2>",  lambda e: self.hide("a"))
-        self.right_panel.bind("<Button-2>", lambda e: self.hide("b"))
-
-        # -------------------- Sidebar widgets --------------------
+        # ---- Leaderboard ----
         self.leader_header = tk.Label(self.sidebar, text="Top Artists",
                                       font=("Segoe UI", 12, "bold"), fg=ACCENT, bg=DARK_BG)
-        self.metric_label  = tk.Label(self.sidebar, text="", font=("Segoe UI", 9),
-                                      fg=TEXT_COLOR, bg=DARK_BG)
-        self.page_label    = tk.Label(self.sidebar, text="", font=("Segoe UI", 9),
-                                      fg=TEXT_COLOR, bg=DARK_BG)
+        self.metric_label = tk.Label(self.sidebar, text="", font=("Segoe UI", 9), fg=TEXT_COLOR, bg=DARK_BG)
+        self.page_label = tk.Label(self.sidebar, text="", font=("Segoe UI", 9), fg=TEXT_COLOR, bg=DARK_BG)
 
-        self.board = tk.Text(self.sidebar, height=28, font=("Consolas", 10),
+        self.board = tk.Text(self.sidebar, height=20, font=("Consolas", 10),
                              bg=DARK_PANEL, fg=TEXT_COLOR, insertbackground=TEXT_COLOR,
                              relief="flat", wrap="none")
         self.nav_row = tk.Frame(self.sidebar, bg=DARK_BG)
-        self.btn_prev = tk.Button(self.nav_row, text="◀ Prev [", width=10,
+        self.btn_prev = tk.Button(self.nav_row, text="Prev [ / PgUp", width=14,
                                   command=lambda: self.change_page(-1),
-                                  bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT,
-                                  relief="flat")
-        self.btn_next = tk.Button(self.nav_row, text="Next ] ▶", width=10,
+                                  bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat")
+        self.btn_next = tk.Button(self.nav_row, text="Next ] / PgDn", width=14,
                                   command=lambda: self.change_page(+1),
-                                  bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT,
-                                  relief="flat")
-        self.btn_prev.pack(side="left", padx=(0,6))
+                                  bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat")
+        self.btn_prev.pack(side="left", padx=(0, 6))
         self.btn_next.pack(side="right")
 
+        # ---- Counters ----
+        self.counters_header = tk.Label(self.sidebar, text="Counters",
+                                        font=("Segoe UI", 11, "bold"), fg=ACCENT, bg=DARK_BG)
+        self.counters_text = tk.Label(self.sidebar, text="", justify="left",
+                                      font=("Consolas", 9), fg=TEXT_COLOR, bg=DARK_BG)
+
+        # ---- Current / Previous ----
         self.now_header = tk.Label(self.sidebar, text="Current / Previous",
                                    font=("Segoe UI", 11, "bold"), fg=ACCENT, bg=DARK_BG)
-        self.now = tk.Label(self.sidebar, text="", justify="left", font=("Segoe UI", 10),
-                            fg=TEXT_COLOR, bg=DARK_BG)
+        self.now = tk.Label(self.sidebar, text="", justify="left",
+                            font=("Segoe UI", 10), fg=TEXT_COLOR, bg=DARK_BG)
 
-
-        self.stats_header = tk.Label(self.sidebar, text="Counters",
-                                     font=("Segoe UI", 11, "bold"), fg=ACCENT, bg=DARK_BG)
-        self.stats = tk.Label(self.sidebar, text="", justify="left", font=("Consolas", 9),
-                              fg=TEXT_COLOR, bg=DARK_BG)
-
+        # ---- Links ----
         self.links_header = tk.Label(self.sidebar, text="Links",
                                      font=("Segoe UI", 11, "bold"), fg=ACCENT, bg=DARK_BG)
         self.link_left = tk.Label(self.sidebar, text="Left e621: (n/a)", fg=LINK_COLOR,
@@ -524,10 +502,10 @@ class App:
                                    bg=DARK_BG, cursor="hand2", font=("Consolas", 9), justify="left")
         self.link_left.url = ""
         self.link_right.url = ""
-        self.link_left.bind("<Button-1>",  lambda e, w=self.link_left:  self._open_url(w.url))
-        self.link_right.bind("<Button-1>", lambda e, w=self.link_right: self._open_url(w.url))
+        self.link_left.bind("<Button-1>", lambda e: self._open_url(getattr(self.link_left, "url", "")))
+        self.link_right.bind("<Button-1>", lambda e: self._open_url(getattr(self.link_right, "url", "")))
 
-        # ---- Keys table (4 columns: key | bind | key | bind) ----
+        # ---- Search tags + export ----
         self.search_header = tk.Label(self.sidebar, text="Search tags",
                                       font=("Segoe UI", 11, "bold"), fg=ACCENT, bg=DARK_BG)
         self.common_tags_entry = tk.Entry(self.sidebar, font=("Consolas", 9),
@@ -537,42 +515,84 @@ class App:
 
         self.export_links_btn = tk.Button(self.sidebar, text="Export e621 links (clipboard + file)",
                                           command=self.export_e621_links,
-                                          bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT,
-                                          relief="flat")
-
+                                          bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat")
         self.view_links_btn = tk.Button(self.sidebar, text="View/open e621 links",
                                         command=self.show_links_view,
-                                        bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT,
-                                        relief="flat")
+                                        bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat")
+        self.db_stats_btn = tk.Button(self.sidebar, text="DB stats (I)",
+                                      command=self.show_db_stats,
+                                      bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat")
 
-        # Links viewer window state
-        self._links_window = None
-        self._links_listbox = None
-        self._links_count_label = None
-        self._links_common_label = None
-        self._links_status_label = None
-        self._links_open_cancel = False
-        self.export_status = tk.Label(self.sidebar, text="", font=("Segoe UI", 9),
-                                      fg=TEXT_COLOR, bg=DARK_BG)
+        self.export_status = tk.Label(self.sidebar, text="", font=("Segoe UI", 9), fg=TEXT_COLOR, bg=DARK_BG)
 
-        self.db_stats_btn = tk.Button(self.sidebar, text="DB stats",
-                                     command=self.show_db_stats,
-                                     bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT,
-                                     relief="flat")
+        # ---- Keybind panel (compact list) ----
+        self.keys_header = tk.Label(self.sidebar, text="Keybinds",
+                                    font=("Segoe UI", 11, "bold"), fg=ACCENT, bg=DARK_BG)
+        self.keys_text = tk.Label(self.sidebar, text=self._keybind_text(), justify="left",
+                                  font=("Consolas", 9), fg=TEXT_COLOR, bg=DARK_BG)
 
-        self.keys_table = tk.Frame(self.sidebar, bg=DARK_PANEL, bd=1, relief="solid")
+        # Layout (sidebar)
+        self.leader_header.pack(anchor="w")
+        self.metric_label.pack(anchor="w")
+        self.page_label.pack(anchor="e", pady=(0, 4))
+        self.board.pack(fill="x", pady=(4, 6))
+        self.nav_row.pack(fill="x", pady=(0, 6))
+        tk.Frame(self.sidebar, height=1, bg=SEPARATOR_BG).pack(fill="x", pady=(0, 6))
 
-        # keybinds
+        self.counters_header.pack(anchor="w", pady=(2, 0))
+        self.counters_text.pack(anchor="w", pady=(2, 6))
+        tk.Frame(self.sidebar, height=1, bg=SEPARATOR_BG).pack(fill="x", pady=(0, 6))
+
+        self.now_header.pack(anchor="w")
+        self.now.pack(anchor="w", pady=(2, 6))
+
+        self.links_header.pack(anchor="w")
+        self.link_left.pack(anchor="w")
+        self.link_right.pack(anchor="w", pady=(0, 6))
+        tk.Frame(self.sidebar, height=1, bg=SEPARATOR_BG).pack(fill="x", pady=(0, 6))
+
+        self.search_header.pack(anchor="w")
+        self.common_tags_entry.pack(fill="x", pady=(2, 6))
+        self.export_links_btn.pack(fill="x", pady=(0, 2))
+        self.view_links_btn.pack(fill="x", pady=(0, 2))
+        self.db_stats_btn.pack(fill="x", pady=(0, 6))
+        self.export_status.pack(anchor="w", pady=(0, 6))
+        tk.Frame(self.sidebar, height=1, bg=SEPARATOR_BG).pack(fill="x", pady=(0, 6))
+
+        self.keys_header.pack(anchor="w")
+        self.keys_text.pack(anchor="w")
+
+        # ---- Mouse controls ----
+        self.left_panel.bind("<Button-1>", lambda e: self.choose("a"))
+        self.right_panel.bind("<Button-1>", lambda e: self.choose("b"))
+        self.left_panel.bind("<Double-Button-1>", self.open_left)
+        self.right_panel.bind("<Double-Button-1>", self.open_right)
+        self.left_panel.bind("<Button-3>", lambda e: self.choose("downvote"))
+        self.right_panel.bind("<Button-3>", lambda e: self.choose("downvote"))
+
+        # Hide: middle click
+        self.left_panel.bind("<Button-2>", lambda e: self.hide_side("a"))
+        self.right_panel.bind("<Button-2>", lambda e: self.hide_side("b"))
+
+        # Ctrl+Click: play/pause that side if video
+        self.left_panel.bind("<Control-Button-1>", lambda e: self.toggle_video("a"))
+        self.right_panel.bind("<Control-Button-1>", lambda e: self.toggle_video("b"))
+
+        # Also allow click on video frames
+        for w, side in [(self.left_video, "a"), (self.right_video, "b")]:
+            w.bind("<Control-Button-1>", lambda e, s=side: self.toggle_video(s))
+            w.bind("<Double-Button-1>", self.open_left if side == "a" else self.open_right)
+            w.bind("<Button-1>", lambda e, s=side: self.choose("a" if s == "a" else "b"))
+
+        # ---- Keybinds ----
         root.bind("1", lambda e: self.choose("a"))
         root.bind("2", lambda e: self.choose("b"))
-        root.bind("<Control-Key-1>", lambda e: self.toggle_video("a"))
-        root.bind("<Control-Key-2>", lambda e: self.toggle_video("b"))
         root.bind("3", lambda e: self.choose("downvote"))
-        root.bind("x", lambda e: self.hide("a"))
-        root.bind("m", lambda e: self.hide("b"))
         root.bind("0", lambda e: self.choose(None))
         root.bind("<space>", lambda e: self.choose(None))
-        root.bind("q", lambda e: self.quit())
+
+        root.bind("x", lambda e: self.hide_side("a"))
+        root.bind("m", lambda e: self.hide_side("b"))
 
         root.bind("o", self.open_left)
         root.bind("p", self.open_right)
@@ -583,6 +603,7 @@ class App:
         root.bind("]", lambda e: self.change_page(+1))
         root.bind("<Prior>", lambda e: self.change_page(-1))
         root.bind("<Next>", lambda e: self.change_page(+1))
+
         root.bind("t", lambda e: self.toggle_metric())
         root.bind("g", lambda e: self.export_e621_links())
         root.bind("G", lambda e: self.export_e621_links())
@@ -591,33 +612,51 @@ class App:
         root.bind("i", lambda e: self.show_db_stats())
         root.bind("I", lambda e: self.show_db_stats())
 
+        # Video (VLC) controls
+        root.bind("<Control-1>", lambda e: self.toggle_video("a"))
+        root.bind("<Control-2>", lambda e: self.toggle_video("b"))
+        root.bind("<Control-Shift-1>", lambda e: self.toggle_mute("a"))
+        root.bind("<Control-Shift-2>", lambda e: self.toggle_mute("b"))
+
+        root.bind("q", lambda e: self.quit())
+
         root.bind("<Configure>", self._on_configure)
+
+        # Start periodic UI tick (scrub/time updates)
+        self._tick_job = None
+        self._tick()
 
         self.load_duel()
 
-    # -------- window resize only refreshes images -------
+    # -------------------- helpers / state --------------------
+    def _new_side_state(self) -> dict:
+        return {
+            "row": None,
+            "media_kind": None,   # "image" | "gif" | "video"
+            "anim_job": None,
+            "anim_frames": None,
+            "anim_delays": None,
+            "anim_index": 0,
+
+            "vlc_player": None,
+            "vlc_media": None,
+            "vlc_ready": False,
+            "vlc_init_job": None,
+            "vlc_play_pending": False,
+            "vlc_was_playing_before_seek": False,
+            "vlc_total_ms": None,
+
+            "scrubbing": False,
+        }
+
     def _on_configure(self, event=None):
+        # avoid recreating players on resize; only re-render still images/gifs
         if self._resize_job:
             try:
                 self.root.after_cancel(self._resize_job)
             except Exception:
                 pass
-        self._resize_job = self.root.after(120, self._refresh_images)
-
-    # ---------- core flow ----------
-
-    def on_pool_filter_change(self, value=None):
-        # When filter changes, start a fresh duel from the new pool.
-        try:
-            self.page = 0
-        except Exception:
-            pass
-        # Clear any export status noise
-        try:
-            self.export_status.configure(text="")
-        except Exception:
-            pass
-        self.load_duel()
+        self._resize_job = self.root.after(120, self._refresh_visuals_only)
 
     def _media_kind(self, path: str) -> str:
         ext = Path(path).suffix.lower()
@@ -625,16 +664,21 @@ class App:
             return "video"
         if ext in GIF_EXTS:
             return "gif"
-        if ext in IMAGE_EXTS:
-            return "image"
-        return "other"
+        return "image"
 
-    def _row_matches_filter(self, row) -> bool:
-        # row: (id, path, folder, duels, score, wins, losses)
+    def _row_matches_filter(self, row: tuple) -> bool:
+        # row: (id, path, folder, duels, wins, losses, score, hidden)
+        hidden = int(row[7] or 0)
+        f = self.pool_filter_var.get()
         kind = self._media_kind(row[1])
-        f = (self.pool_filter_var.get() or "All").strip()
+
+        if f == "Hidden":
+            return hidden == 1
+        if hidden == 1:
+            return False
+
         if f == "All":
-            return kind in ("image", "gif", "video")
+            return True
         if f == "Images":
             return kind == "image"
         if f == "GIFs":
@@ -643,204 +687,1030 @@ class App:
             return kind == "video"
         if f == "Animated":
             return kind in ("gif", "video")
-        if f == "Hidden":
-            return kind in ("image", "gif", "video")
-        return kind in ("image", "gif", "video")
+        return True
 
-    def _pool_rows(self):
-        f = (self.pool_filter_var.get() or "All").strip()
-        if f == "Hidden":
-            q = "SELECT id, path, folder, duels, score, wins, losses FROM images WHERE hidden=1"
-        else:
-            q = "SELECT id, path, folder, duels, score, wins, losses FROM images WHERE hidden=0"
-        rows = list(self.conn.execute(q))
+    def _pool_rows(self) -> List[tuple]:
+        rows = list(self.conn.execute("""
+            SELECT id, path, folder, duels, wins, losses, score, hidden
+            FROM images
+        """))
         rows = [r for r in rows if self._row_matches_filter(r)]
         return rows
 
-    def pick_one(self, exclude_ids=None):
-        exclude_ids = set(exclude_ids or [])
-        rows = [r for r in self._pool_rows() if r[0] not in exclude_ids]
-        if not rows:
-            return None
-        return random.choice(rows)
+    def on_pool_filter_change(self):
+        # if current images are not in the new pool, replace them
+        if not self.current:
+            self.load_duel()
+            return
+        a, b = self.current
+        pool = self._pool_rows()
+        ids = {r[0] for r in pool}
+        changed = False
+        if a[0] not in ids:
+            na = self.pick_one(exclude_id=b[0], pool=pool)
+            if na:
+                a = na
+                changed = True
+        if b[0] not in ids:
+            nb = self.pick_one(exclude_id=a[0], pool=pool)
+            if nb:
+                b = nb
+                changed = True
+        if changed:
+            self._set_current(a, b)
+            self._render_side("a")
+            self._render_side("b")
+            self.update_sidebar()
+        else:
+            self.update_sidebar()
 
-    def pick_two(self):
-        rows = self._pool_rows()
-        if len(rows) < 2:
+    # -------------------- picking --------------------
+    def pick_one(self, exclude_id: Optional[int], pool: List[tuple]) -> Optional[tuple]:
+        if not pool:
+            return None
+        tries = 0
+        while tries < 200:
+            r = random.choice(pool)
+            if exclude_id is None or r[0] != exclude_id:
+                return r
+            tries += 1
+        return None
+
+    def pick_two(self) -> Tuple[Optional[tuple], Optional[tuple]]:
+        pool = self._pool_rows()
+        if len(pool) < 2:
             return None, None
-        a = random.choice(rows)
-        b = random.choice(rows)
-        while b[0] == a[0]:
-            b = random.choice(rows)
+        a = self.pick_one(exclude_id=None, pool=pool)
+        b = self.pick_one(exclude_id=a[0] if a else None, pool=pool)
         return a, b
+
+    # -------------------- duel flow --------------------
+    def _set_current(self, a: tuple, b: tuple):
+        self.current = (a, b)
+        self._side["a"]["row"] = a
+        self._side["b"]["row"] = b
+        self._side["a"]["media_kind"] = self._media_kind(a[1])
+        self._side["b"]["media_kind"] = self._media_kind(b[1])
+
     def load_duel(self):
         a, b = self.pick_two()
         if not a or not b:
-            print("[duel] not enough visible images (need at least 2).")
+            messagebox.showerror("No images", "Not enough items in the selected pool (need at least 2).")
             self.quit()
             return
 
-        self.current = (a, b)
+        self._set_current(a, b)
+        self._update_info_bars(a, b)
         self.prev_artists.appendleft(a[2])
         self.prev_artists.appendleft(b[2])
 
         print("[duel] showing:")
-        print("  LEFT: ", a[1], f"(score={a[4]:.2f}, duels={a[3]}, W={a[5]}, L={a[6]})")
-        print("  RIGHT:", b[1], f"(score={b[4]:.2f}, duels={b[3]}, W={b[5]}, L={b[6]})")
+        print(f"  LEFT:  {a[1]} (score={a[6]:.2f}, duels={a[3]}, W={a[4]}, L={a[5]})")
+        print(f"  RIGHT: {b[1]} (score={b[6]:.2f}, duels={b[3]}, W={b[4]}, L={b[5]})")
 
-        self._render_media(self.left_panel, a[1])
-        self._render_media(self.right_panel, b[1])
+        self._render_side("a")
+        self._render_side("b")
+        self.update_sidebar()
 
-        self.update_sidebar(a[2], b[2])
-        self.root.after(50, self._refresh_images)
+    def choose(self, winner: Optional[str]):
+        if not self.current:
+            return
+        # snapshot ranks for delta arrows
+        prev_ranks = {r["folder"]: r["rank"] for r in folder_leaderboard(self.conn, metric=self.metric)}
 
-    # ---------- image display (with GIF support) ----------
-    def _render_media(self, widget, path):
-        # Stop any prior GIF animation
-        if hasattr(widget, "_anim_job") and widget._anim_job:
-            try:
-                self.root.after_cancel(widget._anim_job)
-            except Exception:
-                pass
-            widget._anim_job = None
+        a, b = self.current
+        record_result(self.conn, a, b, winner)
 
-        # Stop any prior video playback
-        if hasattr(widget, "_video_player") and widget._video_player:
-            try:
-                widget._video_player.close()
-            except Exception:
-                pass
-            widget._video_player = None
+        self._last_ranks = prev_ranks
 
+        # stop video playback when advancing
+        self._stop_video("a")
+        self._stop_video("b")
+        self.load_duel()
+
+    def hide_side(self, side: str):
+        if not self.current:
+            return
+        a, b = self.current
+        target = a if side == "a" else b
+        other = b if side == "a" else a
+
+        # In "Hidden" pool, middle-click acts as UNHIDE (to make recovery easy).
+
+
+        if self.pool_filter_var.get() == "Hidden":
+
+
+            unhide_image(self.conn, target)
+
+
+        else:
+
+
+            hide_image(self.conn, target)
+
+        pool = self._pool_rows()  # respects current filter
+        replacement = self.pick_one(exclude_id=other[0], pool=pool)
+        if not replacement:
+            # if no replacement in pool, just reload duel
+            self.load_duel()
+            return
+
+        if side == "a":
+            self._set_current(replacement, other)
+        else:
+            self._set_current(other, replacement)
+
+        # stop old side video
+        self._stop_video(side)
+        self._render_side(side)
+        self.update_sidebar()
+
+    # -------------------- rendering --------------------
+    def _render_side(self, side: str):
+        st = self._side[side]
+        row = st["row"]
+        if not row:
+            return
+        kind = self._media_kind(row[1])
+        st["media_kind"] = kind
+
+        if side == "a":
+            panel = self.left_panel
+            container = self.left_container
+            vframe = self.left_video
+        else:
+            panel = self.right_panel
+            container = self.right_container
+            vframe = self.right_video
+
+        # cancel gif animation
+        self._cancel_animation(side)
+
+        if kind == "video":
+            # show video frame, hide image label
+            panel.place_forget()
+            vframe.place(relx=0, rely=0, relwidth=1, relheight=1)
+            self._render_video(side, vframe, row[1])
+        else:
+            # show image label, hide video frame
+            self._stop_video(side)
+            vframe.place_forget()
+            panel.place(relx=0, rely=0, relwidth=1, relheight=1)
+            self._render_image_or_gif(side, panel, row[1])
+
+        self._update_video_controls_state()
+
+    def _render_image_or_gif(self, side: str, widget: tk.Label, path: str):
         self.root.update_idletasks()
         w = max(1, widget.winfo_width())
         h = max(1, widget.winfo_height())
         if w <= 5 or h <= 5:
-            self.root.after(50, lambda: self._render_media(widget, path))
+            self.root.after(50, lambda: self._render_image_or_gif(side, widget, path))
             return
+        target = (max(120, w - 12), max(120, h - 12))
 
-        target = (max(100, w - 12), max(100, h - 12))
-        ext = Path(path).suffix.lower()
-
-        # --- Videos: show first frame (paused), allow play/pause ---
-        if ext in VIDEO_EXTS:
-            wrap = max(100, w - 24)
-            name = Path(path).name
-
-            if imageio is None:
-                widget.configure(
-                    image="",
-                    text=f"[VIDEO]\n{name}\n\n(Install for preview)\npy -m pip install imageio imageio-ffmpeg",
-                    fg=TEXT_COLOR,
-                    bg=DARK_PANEL,
-                    justify="center",
-                    font=("Consolas", 11),
-                    wraplength=wrap,
-                    borderwidth=0,
-                    highlightthickness=0,
-                )
-                widget.image = None
-                return
-
-            vp = VideoPlayer(self.root, widget, path, target)
-            if vp.show_first_frame():
-                widget._video_player = vp
-                return
-
-            # Fallback placeholder if decode fails
-            widget.configure(
-                image="",
-                text=f"[VIDEO]\n{name}\n\n(Preview unavailable)\n(Double-click to open)",
-                fg=TEXT_COLOR,
-                bg=DARK_PANEL,
-                justify="center",
-                font=("Consolas", 11),
-                wraplength=wrap,
-                borderwidth=0,
-                highlightthickness=0,
-            )
-            widget.image = None
-            return
-
-        # Images / GIFs
         try:
-            widget.configure(text="")
-        except Exception:
-            pass
-        self._render_img(widget, path)
-
-    def _render_img(self, widget, path):
-        if hasattr(widget, "_anim_job") and widget._anim_job:
-            try:
-                self.root.after_cancel(widget._anim_job)
-            except Exception:
-                pass
-            widget._anim_job = None
-
-        self.root.update_idletasks()
-        w = max(1, widget.winfo_width())
-        h = max(1, widget.winfo_height())
-        if w <= 5 or h <= 5:
-            self.root.after(50, lambda: self._render_img(widget, path))
+            im = Image.open(path)
+        except Exception as e:
+            widget.configure(text=f"Failed to load:\n{path}\n\n{e}", fg=TEXT_COLOR, bg=DARK_PANEL)
             return
-        target = (max(100, w - 12), max(100, h - 12))
 
-        im = Image.open(path)
-        is_animated = getattr(im, "is_animated", False) and getattr(im, "n_frames", 1) > 1
+        is_animated = (getattr(im, "is_animated", False) and getattr(im, "n_frames", 1) > 1)
 
         if not is_animated:
-            try: im.seek(0)
-            except Exception: pass
+            try:
+                im.seek(0)
+            except Exception:
+                pass
             if im.mode not in ("RGB", "RGBA"):
                 im = im.convert("RGB")
             im.thumbnail(target, Image.Resampling.LANCZOS)
             tk_im = ImageTk.PhotoImage(im)
-            widget.configure(image=tk_im, bg=DARK_PANEL, borderwidth=0, highlightthickness=0)
+            widget.configure(image=tk_im, text="", bg=DARK_PANEL)
             widget.image = tk_im
             return
 
-        frames, delays = [], []
+        # GIF animation
+        frames: List[ImageTk.PhotoImage] = []
+        delays: List[int] = []
         try:
             for frame in ImageSequence.Iterator(im):
                 delay = frame.info.get("duration", im.info.get("duration", 100))
-                delays.append(delay)
+                delays.append(int(delay))
                 fr = frame.convert("RGBA") if frame.mode != "RGBA" else frame.copy()
                 fr.thumbnail(target, Image.Resampling.LANCZOS)
                 frames.append(ImageTk.PhotoImage(fr))
         except Exception:
+            # fallback: first frame only
             im.seek(0)
-            if im.mode not in ("RGB", "RGBA"):
-                im = im.convert("RGB")
-            im.thumbnail(target, Image.Resampling.LANCZOS)
-            tk_im = ImageTk.PhotoImage(im)
-            widget.configure(image=tk_im, bg=DARK_PANEL, borderwidth=0, highlightthickness=0)
+            fr = im.convert("RGBA") if im.mode != "RGBA" else im.copy()
+            fr.thumbnail(target, Image.Resampling.LANCZOS)
+            tk_im = ImageTk.PhotoImage(fr)
+            widget.configure(image=tk_im, text="", bg=DARK_PANEL)
             widget.image = tk_im
             return
 
-        widget._anim_frames = frames
-        widget._anim_delays = delays
-        widget._anim_index  = 0
+        st = self._side[side]
+        st["anim_frames"] = frames
+        st["anim_delays"] = delays
+        st["anim_index"] = 0
 
         def step():
-            if not getattr(widget, "_anim_frames", None):
+            st2 = self._side[side]
+            if not st2.get("anim_frames"):
                 return
-            idx = widget._anim_index % len(widget._anim_frames)
-            widget.configure(image=widget._anim_frames[idx], bg=DARK_PANEL, borderwidth=0, highlightthickness=0)
-            widget.image = widget._anim_frames[idx]
-            widget._anim_index = (idx + 1) % len(widget._anim_frames)
-            delay = max(20, int(widget._anim_delays[idx] if idx < len(widget._anim_delays) else 100))
-            widget._anim_job = self.root.after(delay, step)
+            idx = st2["anim_index"] % len(st2["anim_frames"])
+            widget.configure(image=st2["anim_frames"][idx], text="", bg=DARK_PANEL)
+            widget.image = st2["anim_frames"][idx]
+            st2["anim_index"] = (idx + 1) % len(st2["anim_frames"])
+            delay = max(20, int(st2["anim_delays"][idx] if idx < len(st2["anim_delays"]) else 100))
+            st2["anim_job"] = self.root.after(delay, step)
 
-        widget._anim_job = self.root.after(0, step)
+        st["anim_job"] = self.root.after(0, step)
 
-    def _refresh_images(self):
-        if self.current:
-            a, b = self.current
-            self._render_media(self.left_panel, a[1])
-            self._render_media(self.right_panel, b[1])
+    def _cancel_animation(self, side: str):
+        st = self._side[side]
+        if st.get("anim_job"):
+            try:
+                self.root.after_cancel(st["anim_job"])
+            except Exception:
+                pass
+            st["anim_job"] = None
+        st["anim_frames"] = None
+        st["anim_delays"] = None
+        st["anim_index"] = 0
 
-    # ---------- sidebar ----------
-    def _metric_human(self):
+    # -------------------- video (VLC) --------------------
+    def _render_video(self, side: str, video_frame: tk.Frame, path: str):
+        st = self._side[side]
+
+        # VLC not available -> placeholder
+        if not self.vlc_instance:
+            self._show_video_placeholder(video_frame, path, reason="Install VLC + python-vlc for in-app playback.")
+            return
+
+        # If already playing this path, do nothing (do not reset on refresh)
+        if st.get("vlc_player") and st.get("vlc_media") == path:
+            return
+
+        self._stop_video(side)
+
+        # Create a new player
+        try:
+            player = self.vlc_instance.media_player_new()
+        except Exception as e:
+            self._show_video_placeholder(video_frame, path, reason=f"VLC player create failed: {e}")
+            return
+
+        st["vlc_player"] = player
+        st["vlc_media"] = path
+        st["vlc_ready"] = False
+        st["vlc_play_pending"] = False
+        st["vlc_total_ms"] = None
+
+        try:
+            self.root.update_idletasks()
+            hwnd = video_frame.winfo_id()
+            player.set_hwnd(hwnd)  # Windows
+            try:
+                player.video_set_mouse_input(False)
+                player.video_set_key_input(False)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        try:
+            media = self.vlc_instance.media_new_path(path)
+            player.set_media(media)
+        except Exception as e:
+            self._show_video_placeholder(video_frame, path, reason=f"VLC media set failed: {e}")
+            self._stop_video(side)
+            return
+
+        # Start muted and "paused on first frame"
+        try:
+            player.audio_set_mute(True)
+            player.audio_set_volume(0)
+        except Exception:
+            pass
+
+        # Kick playback briefly so VLC has a frame to render, then pause+seek to 0.
+        try:
+            player.play()
+        except Exception:
+            self._show_video_placeholder(video_frame, path, reason="VLC play() failed.")
+            self._stop_video(side)
+            return
+
+        # finalize init after a short delay
+        def finalize():
+            st2 = self._side[side]
+            if st2.get("vlc_player") is not player or st2.get("vlc_media") != path:
+                return
+            try:
+                player.pause()
+                # Seek to 0; some media need a second seek
+                player.set_time(0)
+            except Exception:
+                pass
+            st2["vlc_ready"] = True
+            # If user requested play during init, start now.
+            if st2.get("vlc_play_pending"):
+                try:
+                    player.play()
+                except Exception:
+                    pass
+            self._update_video_controls_state()
+
+        st["vlc_init_job"] = self.root.after(180, finalize)
+
+    def _show_video_placeholder(self, video_frame: tk.Frame, path: str, reason: str):
+        # Clear any existing children
+        for c in list(video_frame.winfo_children()):
+            try:
+                c.destroy()
+            except Exception:
+                pass
+        msg = f"VIDEO\n{Path(path).name}\n\n{reason}\n\nDouble-click to open externally."
+        lbl = tk.Label(video_frame, text=msg, bg="black", fg=TEXT_COLOR, justify="center")
+        lbl.place(relx=0, rely=0, relwidth=1, relheight=1)
+
+    def _stop_video(self, side: str):
+        st = self._side[side]
+        if st.get("vlc_init_job"):
+            try:
+                self.root.after_cancel(st["vlc_init_job"])
+            except Exception:
+                pass
+            st["vlc_init_job"] = None
+        player = st.get("vlc_player")
+        if player:
+            try:
+                player.stop()
+            except Exception:
+                pass
+        st["vlc_player"] = None
+        st["vlc_media"] = None
+        st["vlc_ready"] = False
+        st["vlc_play_pending"] = False
+        st["vlc_total_ms"] = None
+        st["scrubbing"] = False
+
+    def toggle_video(self, side: str):
+        st = self._side[side]
+        row = st.get("row")
+        if not row:
+            return
+        if self._media_kind(row[1]) != "video":
+            return
+
+        # Ensure player exists
+        if not st.get("vlc_player"):
+            vframe = self.left_video if side == "a" else self.right_video
+            self._render_video(side, vframe, row[1])
+            st["vlc_play_pending"] = True
+            self._update_video_controls_state()
+            return
+
+        player = st["vlc_player"]
+        if not st.get("vlc_ready"):
+            # toggle play intent during init
+            st["vlc_play_pending"] = not bool(st.get("vlc_play_pending"))
+            self._update_video_controls_state()
+            return
+
+        try:
+            if player.is_playing():
+                player.pause()
+            else:
+                player.play()
+        except Exception:
+            pass
+        self._update_video_controls_state()
+
+    def toggle_mute(self, side: str):
+        st = self._side[side]
+        player = st.get("vlc_player")
+        if not player or not st.get("vlc_ready"):
+            return
+        try:
+            muted = bool(player.audio_get_mute())
+            player.audio_set_mute(not muted)
+            if muted:
+                player.audio_set_volume(80)
+            else:
+                player.audio_set_volume(0)
+        except Exception:
+            pass
+        self._update_video_controls_state()
+
+    def _format_mmss(self, ms: int) -> str:
+        ms = max(0, int(ms))
+        sec = ms // 1000
+        m = sec // 60
+        s = sec % 60
+        return f"{m:02d}:{s:02d}"
+
+    def _tick(self):
+        # periodic update for scrub/time
+        self._update_scrub_and_time("a")
+        self._update_scrub_and_time("b")
+        self._tick_job = self.root.after(200, self._tick)
+
+    def _update_scrub_and_time(self, side: str):
+        st = self._side[side]
+        ui = st.get("ui")
+        if not ui:
+            return
+        player = st.get("vlc_player")
+        ready = bool(st.get("vlc_ready"))
+        if not player or not ready:
+            ui["time"].configure(text="00:00 / 00:00")
+            return
+
+        # Set total length once available
+        if st.get("vlc_total_ms") is None:
+            try:
+                length = int(player.get_length() or -1)
+            except Exception:
+                length = -1
+            if length > 0:
+                st["vlc_total_ms"] = length
+                # Kick off waveform generation once per media
+                self._maybe_request_waveform(side)
+
+        try:
+            cur = int(player.get_time() or 0)
+        except Exception:
+            cur = 0
+        total = int(st.get("vlc_total_ms") or 0)
+
+        if total <= 0:
+            ui["time"].configure(text=f"{self._format_mmss(cur)} / 00:00")
+        else:
+            ui["time"].configure(text=f"{self._format_mmss(cur)} / {self._format_mmss(total)}")
+
+        # Update playhead if not dragging
+        if not st.get("scrubbing"):
+            self._update_playhead(side, cur, total)
+
+        self._update_video_controls_state()
+
+    def _build_hover_video_controls(self):
+        # Attach a bottom control bar (hidden) to each side container.
+        self._attach_hover_controls("a", self.left_container, self.left_panel, self.left_video)
+        self._attach_hover_controls("b", self.right_container, self.right_panel, self.right_video)
+
+    def _attach_hover_controls(self, side: str, container: tk.Frame, image_label: tk.Label, video_frame: tk.Frame):
+        """
+        Bottom video controls that appear on hover.
+
+        Layout (left -> right):
+        Play/Pause | -5s | +5s | Mute | Waveform/Seek Bar | Time | Speed | Fullscreen
+        """
+        bar = tk.Frame(container, bg=DARK_PANEL, bd=1, relief="solid")
+        bar.place_forget()
+
+        btn_opts = dict(bg=DARK_BG, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat", bd=0)
+
+        play_btn = tk.Button(bar, text="Play", width=7, command=lambda: self.toggle_video(side), **btn_opts)
+        back_btn = tk.Button(bar, text="-5s", width=5, command=lambda: self.seek_relative(side, -5000), **btn_opts)
+        fwd_btn  = tk.Button(bar, text="+5s", width=5, command=lambda: self.seek_relative(side, +5000), **btn_opts)
+        mute_btn = tk.Button(bar, text="Mute", width=7, command=lambda: self.toggle_mute(side), **btn_opts)
+
+        # Waveform / seek bar (Canvas)
+        wave = tk.Canvas(bar, height=18, bg=DARK_BG, highlightthickness=0, bd=0, relief="flat")
+        time_lbl = tk.Label(bar, text="00:00 / 00:00", bg=DARK_PANEL, fg=TEXT_COLOR, font=("Consolas", 9))
+
+        speed_var = tk.StringVar(value="1.0x")
+        speed_box = ttk.Combobox(
+            bar,
+            values=["0.25x","0.5x","0.75x","1.0x","1.25x","1.5x","2.0x"],
+            textvariable=speed_var,
+            width=6,
+            state="readonly",
+        )
+        fs_btn = tk.Button(bar, text="Full", width=6, command=lambda: self.toggle_fullscreen(side), **btn_opts)
+
+        # Grid layout
+        bar.columnconfigure(4, weight=1)  # waveform expands
+        play_btn.grid(row=0, column=0, padx=(8, 6), pady=8, sticky="w")
+        back_btn.grid(row=0, column=1, padx=(0, 6), pady=8, sticky="w")
+        fwd_btn.grid(row=0, column=2, padx=(0, 10), pady=8, sticky="w")
+        mute_btn.grid(row=0, column=3, padx=(0, 10), pady=8, sticky="w")
+        wave.grid(row=0, column=4, padx=(0, 10), pady=8, sticky="ew")
+        time_lbl.grid(row=0, column=5, padx=(0, 10), pady=8, sticky="e")
+        speed_box.grid(row=0, column=6, padx=(0, 10), pady=8, sticky="e")
+        fs_btn.grid(row=0, column=7, padx=(0, 8), pady=8, sticky="e")
+
+        # Save UI handles
+        st = self._side[side]
+        st["ui"] = {
+            "bar": bar,
+            "play": play_btn,
+            "mute": mute_btn,
+            "back": back_btn,
+            "fwd": fwd_btn,
+            "wave": wave,
+            "time": time_lbl,
+            "speed_var": speed_var,
+            "speed": speed_box,
+            "fs": fs_btn,
+        }
+        st.setdefault("scrubbing", False)
+        st.setdefault("waveform_ready", False)
+        st.setdefault("waveform_img", None)    # PhotoImage (keep ref)
+        st.setdefault("waveform_key", None)    # cache key
+        st.setdefault("waveform_job", None)    # background thread guard
+        st.setdefault("pending_seek_frac", None)
+
+        # Hover show/hide
+        def show(_e=None):
+            if self._side[side].get("media_kind") != "video":
+                return
+            # bottom overlay
+            bar.place(relx=0.02, rely=0.90, relwidth=0.96, height=44)
+            self._update_video_controls_state()
+            self._redraw_waveform(side)
+
+        def hide(_e=None):
+            bar.place_forget()
+
+        for w in (container, image_label, video_frame, bar):
+            w.bind("<Enter>", show)
+            w.bind("<Leave>", lambda e, b=bar: self._hide_bar_if_left(side, b))
+
+        # Waveform / scrub interactions
+        wave.bind("<ButtonPress-1>", lambda e: self._wave_press(side, e))
+        wave.bind("<B1-Motion>", lambda e: self._wave_drag(side, e))
+        wave.bind("<ButtonRelease-1>", lambda e: self._wave_release(side, e))
+        wave.bind("<Configure>", lambda e: self._redraw_waveform(side))
+
+        # Speed changes
+        speed_box.bind("<<ComboboxSelected>>", lambda e: self.set_speed_from_ui(side))
+
+    def _hide_bar_if_left(self, side: str, bar: tk.Frame):
+        # hide after short delay if pointer isn't over container/bar
+        def do():
+            try:
+                x, y = self.root.winfo_pointerx(), self.root.winfo_pointery()
+                w = self.root.winfo_containing(x, y)
+                # if pointer is within bar or within the main container, keep shown
+                container = self.left_container if side == "a" else self.right_container
+                if w and (self._is_descendant(w, bar) or self._is_descendant(w, container)):
+                    return
+            except Exception:
+                pass
+            bar.place_forget()
+        self.root.after(120, do)
+
+    def _is_descendant(self, widget: tk.Widget, ancestor: tk.Widget) -> bool:
+        w = widget
+        while w is not None:
+            if w == ancestor:
+                return True
+            try:
+                w = w.master
+            except Exception:
+                break
+        return False
+
+    def _begin_scrub(self, side: str):
+        st = self._side[side]
+        player = st.get("vlc_player")
+        if not player or not st.get("vlc_ready"):
+            return
+        st["scrubbing"] = True
+        try:
+            st["vlc_was_playing_before_seek"] = bool(player.is_playing())
+            player.pause()
+        except Exception:
+            st["vlc_was_playing_before_seek"] = False
+
+    def _end_scrub(self, side: str):
+        st = self._side[side]
+        player = st.get("vlc_player")
+        if not player or not st.get("vlc_ready"):
+            st["scrubbing"] = False
+            return
+
+        frac = st.get("pending_seek_frac")
+        total = int(st.get("vlc_total_ms") or 0)
+        if frac is not None and total > 0:
+            try:
+                player.set_time(max(0, min(total, int(frac * total))))
+            except Exception:
+                pass
+
+        was_playing = bool(st.get("vlc_was_playing_before_seek"))
+        st["pending_seek_frac"] = None
+        st["scrubbing"] = False
+        if was_playing:
+            try:
+                player.play()
+            except Exception:
+                pass
+
+    def _update_video_controls_state(self):
+        for side in ("a", "b"):
+            st = self._side[side]
+            ui = st.get("ui")
+            if not ui:
+                continue
+
+            is_video = (st.get("media_kind") == "video")
+            player = st.get("vlc_player")
+            ready = bool(st.get("vlc_ready"))
+
+            # Enable/disable controls
+            ui["play"].configure(state=("normal" if is_video else "disabled"))
+            state_ready = ("normal" if (is_video and player and ready) else "disabled")
+            for k in ("mute", "back", "fwd", "speed", "fs"):
+                try:
+                    ui[k].configure(state=state_ready)
+                except Exception:
+                    pass
+
+            # Play label
+            if not is_video:
+                ui["play"].configure(text="Play")
+            elif not player:
+                ui["play"].configure(text="Play")
+            elif not ready:
+                ui["play"].configure(text="Init…")
+            else:
+                try:
+                    playing = bool(player.is_playing())
+                except Exception:
+                    playing = False
+                ui["play"].configure(text=("Pause" if playing else "Play"))
+
+            # Mute label
+            if player and ready:
+                try:
+                    muted = bool(player.audio_get_mute())
+                except Exception:
+                    muted = True
+                ui["mute"].configure(text=("Unmute" if muted else "Mute"))
+            else:
+                ui["mute"].configure(text="Mute")
+
+            # Speed label (sync from player if possible)
+            if player and ready:
+                try:
+                    r = float(player.get_rate() or 1.0)
+                except Exception:
+                    r = 1.0
+                known = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+                nearest = min(known, key=lambda x: abs(x - r))
+                ui["speed_var"].set(f"{nearest:g}x")
+            else:
+                ui["speed_var"].set("1.0x")
+
+
+
+    # -------------------- video control helpers (seek, speed, fullscreen, waveform) --------------------
+    def seek_relative(self, side: str, delta_ms: int):
+        st = self._side[side]
+        player = st.get("vlc_player")
+        if not player or not st.get("vlc_ready"):
+            return
+        try:
+            cur = int(player.get_time() or 0)
+        except Exception:
+            cur = 0
+        total = int(st.get("vlc_total_ms") or 0)
+        new_t = cur + int(delta_ms)
+        if total > 0:
+            new_t = max(0, min(total, new_t))
+        else:
+            new_t = max(0, new_t)
+        try:
+            player.set_time(new_t)
+        except Exception:
+            return
+        self._update_playhead(side, new_t, total)
+
+    def set_speed_from_ui(self, side: str):
+        st = self._side[side]
+        ui = st.get("ui")
+        player = st.get("vlc_player")
+        if not ui or not player or not st.get("vlc_ready"):
+            return
+        s = (ui["speed_var"].get() or "1.0x").strip().lower().replace("×", "x")
+        try:
+            rate = float(s.replace("x", ""))
+        except Exception:
+            rate = 1.0
+        rate = max(0.25, min(4.0, rate))
+        try:
+            player.set_rate(rate)
+        except Exception:
+            pass
+        ui["speed_var"].set(f"{rate:g}x")
+
+    def toggle_fullscreen(self, side: str):
+        if getattr(self, "_fs_active", False):
+            self._exit_fullscreen()
+        else:
+            self._enter_fullscreen(side)
+
+    def _enter_fullscreen(self, side: str):
+        self._fs_active = True
+        self._fs_side = side
+        try:
+            self._fs_prev_geom = self.root.geometry()
+        except Exception:
+            self._fs_prev_geom = None
+        self._fs_prev_sidebar_visible = bool(getattr(self, "sidebar_visible", True))
+
+        # Hide sidebar
+        try:
+            if getattr(self, "sidebar_visible", True):
+                self.toggle_sidebar()
+        except Exception:
+            pass
+
+        # Hide the other side container
+        try:
+            if side == "a":
+                self.right_container.pack_forget()
+            else:
+                self.left_container.pack_forget()
+        except Exception:
+            pass
+
+        # Fullscreen the root
+        try:
+            self.root.attributes("-fullscreen", True)
+        except Exception:
+            pass
+
+        # Exit button + ESC binding
+        if not hasattr(self, "_fs_exit_btn") or self._fs_exit_btn is None:
+            self._fs_exit_btn = tk.Button(
+                self.root,
+                text="Exit Fullscreen (Esc)",
+                bg=DARK_BG,
+                fg=TEXT_COLOR,
+                activebackground=ACCENT,
+                relief="flat",
+                command=self._exit_fullscreen,
+            )
+        try:
+            self._fs_exit_btn.place(relx=1.0, x=-10, y=10, anchor="ne")
+        except Exception:
+            pass
+        self.root.bind("<Escape>", lambda e: self._exit_fullscreen())
+
+    def _exit_fullscreen(self):
+        try:
+            self.root.attributes("-fullscreen", False)
+        except Exception:
+            pass
+
+        # Restore both containers
+        try:
+            if not self.left_container.winfo_ismapped():
+                self.left_container.pack(**getattr(self, "_left_pack_opts", dict(side="left", fill="both", expand=True, padx=(6, 3), pady=6)))
+            if not self.right_container.winfo_ismapped():
+                self.right_container.pack(**getattr(self, "_right_pack_opts", dict(side="left", fill="both", expand=True, padx=(3, 6), pady=6)))
+        except Exception:
+            pass
+
+        # Restore sidebar if it was visible
+        try:
+            if getattr(self, "_fs_prev_sidebar_visible", True) and not getattr(self, "sidebar_visible", True):
+                self.toggle_sidebar()
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, "_fs_exit_btn") and self._fs_exit_btn is not None:
+                self._fs_exit_btn.place_forget()
+        except Exception:
+            pass
+
+        self._fs_active = False
+        self._fs_side = None
+        try:
+            self.root.unbind("<Escape>")
+        except Exception:
+            pass
+
+        # Restore geometry
+        try:
+            if getattr(self, "_fs_prev_geom", None):
+                self.root.geometry(self._fs_prev_geom)
+        except Exception:
+            pass
+
+    # -------------------- waveform + scrub canvas --------------------
+    def _ffmpeg_exe(self) -> Optional[str]:
+        # Try imageio-ffmpeg first (recommended), fallback to PATH.
+        try:
+            import imageio_ffmpeg
+            exe = imageio_ffmpeg.get_ffmpeg_exe()
+            if exe and os.path.exists(exe):
+                return exe
+        except Exception:
+            pass
+        try:
+            exe = shutil.which("ffmpeg")
+            if exe:
+                return exe
+        except Exception:
+            pass
+        return None
+
+    def _maybe_request_waveform(self, side: str):
+        st = self._side[side]
+        ui = st.get("ui")
+        if not ui:
+            return
+        path = st.get("vlc_media")
+        if not path:
+            row = st.get("row")
+            if row:
+                path = row[1]
+        if not path or not os.path.exists(path):
+            return
+
+        try:
+            mtime = int(os.path.getmtime(path))
+        except Exception:
+            mtime = 0
+        key = f"{path}|{mtime}"
+        if st.get("waveform_key") == key and st.get("waveform_ready"):
+            return
+
+        st["waveform_key"] = key
+        st["waveform_ready"] = False
+        st["waveform_img"] = None
+
+        # Avoid duplicate jobs
+        if st.get("waveform_job") is not None:
+            return
+
+        exe = self._ffmpeg_exe()
+        if not exe:
+            return
+
+        t = threading.Thread(target=self._waveform_worker, args=(side, path, key, exe), daemon=True)
+        st["waveform_job"] = t
+        t.start()
+
+    def _waveform_worker(self, side: str, path: str, key: str, exe: str):
+        try:
+            out_dir = Path(tempfile.gettempdir()) / "image_duel_ranker_waveforms"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            h = hashlib.md5(key.encode("utf-8")).hexdigest()
+            out_png = out_dir / f"wave_{h}.png"
+
+            if not out_png.exists():
+                cmd = [
+                    exe, "-hide_banner", "-loglevel", "error",
+                    "-i", path,
+                    "-filter_complex", "showwavespic=s=800x60:split_channels=0",
+                    "-frames:v", "1",
+                    "-y", str(out_png)
+                ]
+                subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            if not out_png.exists():
+                raise RuntimeError("waveform render failed")
+
+            img = Image.open(str(out_png)).convert("RGBA")
+
+            def done():
+                st = self._side.get(side)
+                if not st:
+                    return
+                if st.get("waveform_key") != key:
+                    return
+                ui = st.get("ui")
+                if not ui:
+                    return
+
+                w = max(1, int(ui["wave"].winfo_width() or 1))
+                h2 = max(1, int(ui["wave"].winfo_height() or 1))
+                im2 = img.resize((w, h2), Image.BILINEAR)
+                st["waveform_img"] = ImageTk.PhotoImage(im2)
+                st["waveform_ready"] = True
+                st["waveform_job"] = None
+                self._redraw_waveform(side)
+
+            self.root.after(0, done)
+        except Exception:
+            def clear():
+                st = self._side.get(side)
+                if st:
+                    st["waveform_job"] = None
+            try:
+                self.root.after(0, clear)
+            except Exception:
+                pass
+
+    def _redraw_waveform(self, side: str):
+        st = self._side[side]
+        ui = st.get("ui")
+        if not ui:
+            return
+        c = ui["wave"]
+        try:
+            c.delete("wave")
+            c.delete("playhead")
+        except Exception:
+            return
+
+        if st.get("waveform_ready") and st.get("waveform_img"):
+            try:
+                c.create_image(0, 0, anchor="nw", image=st["waveform_img"], tags="wave")
+            except Exception:
+                pass
+        else:
+            try:
+                w = max(1, int(c.winfo_width() or 1))
+                h = max(1, int(c.winfo_height() or 1))
+                c.create_line(0, h//2, w, h//2, fill=TEXT_COLOR, stipple="gray50", tags="wave")
+            except Exception:
+                pass
+
+        try:
+            player = st.get("vlc_player")
+            if player and st.get("vlc_ready"):
+                cur = int(player.get_time() or 0)
+                total = int(st.get("vlc_total_ms") or 0)
+                self._update_playhead(side, cur, total)
+        except Exception:
+            pass
+
+    def _update_playhead(self, side: str, cur_ms: int, total_ms: int):
+        st = self._side[side]
+        ui = st.get("ui")
+        if not ui:
+            return
+        c = ui["wave"]
+        try:
+            c.delete("playhead")
+        except Exception:
+            return
+        w = max(1, int(c.winfo_width() or 1))
+        h = max(1, int(c.winfo_height() or 1))
+        frac = 0.0 if total_ms <= 0 else max(0.0, min(1.0, float(cur_ms) / float(total_ms)))
+        x = int(frac * w)
+        try:
+            c.create_line(x, 0, x, h, fill=ACCENT, width=2, tags="playhead")
+        except Exception:
+            pass
+
+    def _wave_event_fraction(self, side: str, event) -> Optional[float]:
+        st = self._side[side]
+        ui = st.get("ui")
+        if not ui:
+            return None
+        c = ui["wave"]
+        w = max(1, int(c.winfo_width() or 1))
+        x = max(0, min(w, int(getattr(event, "x", 0))))
+        frac = float(x) / float(w)
+        return max(0.0, min(1.0, frac))
+
+    def _wave_press(self, side: str, event):
+        st = self._side[side]
+        player = st.get("vlc_player")
+        if not player or not st.get("vlc_ready"):
+            return
+        self._begin_scrub(side)
+        frac = self._wave_event_fraction(side, event)
+        if frac is None:
+            return
+        st["pending_seek_frac"] = frac
+        total = int(st.get("vlc_total_ms") or 0)
+        self._update_playhead(side, int(frac * total) if total > 0 else 0, total)
+
+    def _wave_drag(self, side: str, event):
+        st = self._side[side]
+        if not st.get("scrubbing"):
+            return
+        frac = self._wave_event_fraction(side, event)
+        if frac is None:
+            return
+        st["pending_seek_frac"] = frac
+        total = int(st.get("vlc_total_ms") or 0)
+        self._update_playhead(side, int(frac * total) if total > 0 else 0, total)
+
+    def _wave_release(self, side: str, event):
+        st = self._side[side]
+        if not st.get("scrubbing"):
+            return
+        frac = self._wave_event_fraction(side, event)
+        if frac is not None:
+            st["pending_seek_frac"] = frac
+        self._end_scrub(side)
+
+    def _metric_human(self) -> str:
         return {
             "avg": "Simple Avg",
             "shrunken_avg": f"Shrunken Avg (prior={FOLDER_PRIOR_IMAGES})",
@@ -851,144 +1721,50 @@ class App:
         order = ["shrunken_avg", "avg", "lcb"]
         i = order.index(self.metric) if self.metric in order else 0
         self.metric = order[(i + 1) % len(order)]
-        print("[metric] leaderboard metric changed to:", self.metric)
-        self._last_ranks = {r['folder']: r['rank'] for r in folder_leaderboard(self.conn, metric=self.metric)}
-        if self.current:
-            self.update_sidebar(self.current[0][2], self.current[1][2])
+        self._last_ranks = {r["folder"]: r["rank"] for r in folder_leaderboard(self.conn, metric=self.metric)}
+        self.page = 0
+        self.update_sidebar()
 
-    def change_page(self, delta):
+    def change_page(self, delta: int):
         leader = folder_leaderboard(self.conn, metric=self.metric)
         total_pages = max(1, math.ceil(len(leader) / LEADERBOARD_SIZE))
         self.page = (self.page + delta) % total_pages
-        if self.current:
-            self.update_sidebar(self.current[0][2], self.current[1][2])
+        self.update_sidebar()
 
-    def _format_delta(self, folder, leader):
+    def _format_delta(self, folder: str, leader: List[dict]) -> str:
         old = self._last_ranks.get(folder)
-        now, _, _ = find_folder_rank(leader, folder)
-        if not now: return ""
-        if old is None: return " (new)"
+        now, _, _, _ = find_folder_rank(leader, folder)
+        if not now:
+            return ""
+        if old is None:
+            return " (new)"
         d = old - now
         return f"  ↑{d}" if d > 0 else (f"  ↓{abs(d)}" if d < 0 else "  →0")
 
-    def _build_lines_all(self, leader):
-        def trunc(name: str) -> str:
-            return name if len(name) <= LEAF_MAX else (name[:LEAF_MAX - 1] + "…")
-        out = []
-        for row in leader:
-            leaf = trunc(Path(row['folder']).name)
-            if self.metric == "avg":
-                out.append(f"{row['rank']:>3}. {leaf:<{LEAF_MAX}} {row['avg']:6.1f}  (n={row['n']})")
-            elif self.metric == "shrunken_avg":
-                out.append(f"{row['rank']:>3}. {leaf:<{LEAF_MAX}} {row['score']:6.1f}  avg={row['avg']:5.1f} (n={row['n']})")
-            else:
-                out.append(f"{row['rank']:>3}. {leaf:<{LEAF_MAX}} {row['score']:6.1f}  avg={row['avg']:5.1f} (n={row['n']})")
-        return out
+    def update_sidebar(self):
+        if not self.current:
+            return
+        a, b = self.current
+        folder_left, folder_right = a[2], b[2]
 
-    def _ensure_sidebar_width(self, lines_all):
-        f = tkfont.Font(family="Consolas", size=10)
-        max_px = max((f.measure(s) for s in lines_all), default=320)
-        need_px = max(300, min(700, max_px + 32))
-        self._sidebar_width_px = int(need_px)
-
-        self.sidebar.pack_forget()
-        self.sidebar.pack(side="right", fill="y", padx=(0,6), pady=6)
-        self.sidebar.configure(width=self._sidebar_width_px)
-        self.sidebar.pack_propagate(False)
-
-        char_w = max(1, f.measure("M"))
-        self.board.configure(width=int((self._sidebar_width_px - 24) / char_w))
-
-    def _build_keys_table(self):
-        # Clear existing
-        for w in self.keys_table.winfo_children():
-            w.destroy()
-
-        hdr_font    = ("Segoe UI", 9, "bold")
-        key_font    = ("Consolas", 9)
-        action_font = ("Segoe UI", 9)
-
-        def header(col, text):
-            lbl = tk.Label(
-                self.keys_table,
-                text=text,
-                font=hdr_font,
-                fg=ACCENT,
-                bg=DARK_PANEL,
-                anchor="w",
-            )
-            lbl.grid(row=0, column=col, sticky="we", padx=(8 if col in (0, 2) else 6), pady=(6, 3))
-
-        header(0, "Key"); header(1, "Action"); header(2, "Key"); header(3, "Action")
-
-        rows = [
-            ("L-Click image",    "Pick clicked",        "1",        "Pick LEFT"),
-            ("R-Click image",    "Downvote both",       "2",        "Pick RIGHT"),
-            ("M-Click image",    "Hide clicked",        "3",        "Downvote both"),
-            ("Dbl-Click image",  "Open clicked",        "X",        "Hide LEFT"),
-            ("0 / Space",        "Skip/tie",            "M",        "Hide RIGHT"),
-            ("Ctrl+1",           "Play/Pause video LEFT", "Ctrl+2",   "Play/Pause video RIGHT"),
-            ("O",                "Open LEFT image",     "P",        "Open RIGHT image"),
-            ("Shift+O",          "Reveal LEFT folder",  "Shift+P",  "Reveal RIGHT folder"),
-            ("[ / PgUp",         "Prev page",           "] / PgDn", "Next page"),
-            ("T",                "Toggle metric",       "G",        "Export e621 links"),
-            ("V",                "Links viewer",        "I",        "DB stats"),
-            ("Q",                "Quit",                "",         ""),
-        ]
-
-        for r, (k1, a1, k2, a2) in enumerate(rows, start=1):
-            lbl_k1 = tk.Label(self.keys_table, text=k1, font=key_font, fg=TEXT_COLOR, bg=DARK_PANEL, anchor="w")
-            lbl_k1.grid(row=r, column=0, sticky="we", padx=(8, 6))
-
-            lbl_a1 = tk.Label(self.keys_table, text=a1, font=action_font, fg=TEXT_COLOR, bg=DARK_PANEL, anchor="w")
-            lbl_a1.grid(row=r, column=1, sticky="we", padx=(6, 12))
-
-            lbl_k2 = tk.Label(self.keys_table, text=k2, font=key_font, fg=TEXT_COLOR, bg=DARK_PANEL, anchor="w")
-            lbl_k2.grid(row=r, column=2, sticky="we", padx=(8, 6))
-
-            lbl_a2 = tk.Label(self.keys_table, text=a2, font=action_font, fg=TEXT_COLOR, bg=DARK_PANEL, anchor="w")
-            lbl_a2.grid(row=r, column=3, sticky="we", padx=(6, 8))
-
-        # Compact layout: keep keys tight; let action columns expand
-        self.keys_table.grid_columnconfigure(0, weight=0)
-        self.keys_table.grid_columnconfigure(1, weight=1)
-        self.keys_table.grid_columnconfigure(2, weight=0)
-        self.keys_table.grid_columnconfigure(3, weight=1)
-
-    def update_sidebar(self, folder_left, folder_right):
         leader = folder_leaderboard(self.conn, metric=self.metric)
         total = len(leader)
-        total_pages = max(1, math.ceil(len(leader) / LEADERBOARD_SIZE))
+        total_pages = max(1, math.ceil(total / LEADERBOARD_SIZE))
         self.page = min(self.page, total_pages - 1)
         start = self.page * LEADERBOARD_SIZE
         end = min(start + LEADERBOARD_SIZE, total)
 
-        lines_all = self._build_lines_all(leader)
-        self._ensure_sidebar_width(lines_all)
-
-        for w in (self.leader_header, self.metric_label, self.page_label,
-                  self.pool_filter_row,
-                  self.board, self.nav_row, self.now_header, self.now,
-                  self.stats_header, self.stats,
-                  self.links_header, self.link_left, self.link_right,
-                  self.search_header, self.common_tags_entry, self.export_links_btn,
-                  self.view_links_btn, self.export_status, self.db_stats_btn, self.keys_table):
-            w.pack_forget()
-
-        self.leader_header.pack(anchor="w")
         self.metric_label.configure(text=f"[Metric: {self._metric_human()}]")
-        self.metric_label.pack(anchor="w")
-        self.pool_filter_row.pack(fill="x", pady=(2, 4))
         self.page_label.configure(text=f"Page {self.page+1}/{total_pages}  (total {total})")
-        self.page_label.pack(anchor="e", pady=(0,4))
 
-        # leaderboard page
+        # Leaderboard lines
         def trunc(name: str) -> str:
             return name if len(name) <= LEAF_MAX else (name[:LEAF_MAX - 1] + "…")
+
         lines = []
         for row in leader[start:end]:
-            leaf = trunc(Path(row['folder']).name)
-            marker = "  ◀" if row['folder'] in {folder_left, folder_right} else ""
+            leaf = trunc(Path(row["folder"]).name)
+            marker = "  ◀" if row["folder"] in {folder_left, folder_right} else ""
             if self.metric == "avg":
                 line = f"{row['rank']:>3}. {leaf:<{LEAF_MAX}} {row['avg']:6.1f}  (n={row['n']}){marker}"
             elif self.metric == "shrunken_avg":
@@ -1001,18 +1777,17 @@ class App:
         self.board.delete("1.0", "end")
         self.board.insert("1.0", "\n".join(lines) if lines else "No folders yet.")
         self.board.configure(state="disabled")
-        self.board.pack(fill="x", pady=(4, 6))
 
-        self.nav_row.pack(fill="x", pady=(0, 6))
-
-        self.now_header.pack(anchor="w")
-        l_rank, l_avg, l_n = find_folder_rank(leader, folder_left)
-        r_rank, r_avg, r_n = find_folder_rank(leader, folder_right)
+        # Current / previous rank lines
+        l_rank, l_avg, l_n, _ = find_folder_rank(leader, folder_left)
+        r_rank, r_avg, r_n, _ = find_folder_rank(leader, folder_right)
         left_leaf = Path(folder_left).name
         right_leaf = Path(folder_right).name
 
-        l_line = f"Left:  #{l_rank} {left_leaf} — {l_avg:.1f} (n={l_n}){self._format_delta(folder_left, leader)}" if l_rank else f"Left:  {left_leaf} — (unranked)"
-        r_line = f"Right: #{r_rank} {right_leaf} — {r_avg:.1f} (n={r_n}){self._format_delta(folder_right, leader)}" if r_rank else f"Right: {right_leaf} — (unranked)"
+        l_line = (f"Left:  #{l_rank} {left_leaf} — {l_avg:.1f} (n={l_n}){self._format_delta(folder_left, leader)}"
+                  if l_rank else f"Left:  {left_leaf} — (unranked)")
+        r_line = (f"Right: #{r_rank} {right_leaf} — {r_avg:.1f} (n={r_n}){self._format_delta(folder_right, leader)}"
+                  if r_rank else f"Right: {right_leaf} — (unranked)")
 
         prev_display = []
         seen = {folder_left, folder_right}
@@ -1020,7 +1795,7 @@ class App:
             if f in seen:
                 continue
             seen.add(f)
-            pr, pa, pn = find_folder_rank(leader, f)
+            pr, pa, pn, _ = find_folder_rank(leader, f)
             leaf = Path(f).name
             if pr:
                 prev_display.append(f"• Prev: #{pr} {leaf} — {pa:.1f} (n={pn}){self._format_delta(f, leader)}")
@@ -1030,379 +1805,258 @@ class App:
                 break
 
         self.now.configure(text="\n".join([l_line, r_line] + prev_display))
-        self.now.pack(anchor="w", pady=(2, 6))
 
-        # Counters (helps verify whether the DB has meaningful history)
-        if self.current:
-            a, b = self.current
+        # Links for current duel
+        left_url = e621_url_for_path(a[1])
+        right_url = e621_url_for_path(b[1])
+        self.link_left.url = left_url or ""
+        self.link_right.url = right_url or ""
+        self.link_left.configure(
+            text=f"Left e621: {left_url}" if left_url else "Left e621: (n/a)",
+            fg=LINK_COLOR if left_url else TEXT_COLOR,
+            cursor="hand2" if left_url else "arrow",
+        )
+        self.link_right.configure(
+            text=f"Right e621: {right_url}" if right_url else "Right e621: (n/a)",
+            fg=LINK_COLOR if right_url else TEXT_COLOR,
+            cursor="hand2" if right_url else "arrow",
+        )
 
-            def folder_totals(folder: str):
-                row = self.conn.execute(
-                    "SELECT COUNT(*), COALESCE(SUM(duels),0), COALESCE(SUM(wins),0), COALESCE(SUM(losses),0) "
-                    "FROM images WHERE folder=?",
-                    (folder,),
-                ).fetchone()
-                n = int(row[0] or 0)
-                shown = int(row[1] or 0)
-                wins = int(row[2] or 0)
-                losses = int(row[3] or 0)
-                return n, shown, wins, losses
-
-            ln, lshown, lw, ll = folder_totals(folder_left)
-            rn, rshown, rw, rl = folder_totals(folder_right)
-            ldec = lw + ll
-            rdec = rw + rl
-
-            stats_lines = [
-                f"L img: shown={a[3]}  W={a[5]}  L={a[6]}  score={a[4]:.1f}",
-                f"R img: shown={b[3]}  W={b[5]}  L={b[6]}  score={b[4]:.1f}",
-                f"L artist: imgs={ln}  shown={lshown}  decisions={ldec}  (W={lw} L={ll})",
-                f"R artist: imgs={rn}  shown={rshown}  decisions={rdec}  (W={rw} L={rl})",
-            ]
-        else:
-            stats_lines = ["(no active duel)"]
-
-        self.stats.configure(text="\n".join(stats_lines))
-        self.stats_header.pack(anchor="w")
-        self.stats.pack(anchor="w", pady=(2, 6))
-
-        self.links_header.pack(anchor="w")
-        if self.current:
-            a, b = self.current
-            left_url = e621_url_for_path(a[1]); right_url = e621_url_for_path(b[1])
-            self.link_left.url = left_url or ""
-            self.link_right.url = right_url or ""
-            self.link_left.configure(
-                text=f"Left e621: {left_url}" if left_url else "Left e621: (n/a)",
-                fg=LINK_COLOR if left_url else TEXT_COLOR,
-                cursor="hand2" if left_url else "arrow",
-            )
-            self.link_right.configure(
-                text=f"Right e621: {right_url}" if right_url else "Right e621: (n/a)",
-                fg=LINK_COLOR if right_url else TEXT_COLOR,
-                cursor="hand2" if right_url else "arrow",
-            )
-        self.link_left.pack(anchor="w")
-        self.link_right.pack(anchor="w", pady=(0, 6))
-
-        self.search_header.pack(anchor="w")
-        self.common_tags_entry.pack(fill="x", pady=(2, 6))
-        self.export_links_btn.pack(fill="x", pady=(0, 2))
-        self.view_links_btn.pack(fill="x", pady=(0, 6))
-        self.export_status.pack(anchor="w", pady=(0, 6))
-        self.db_stats_btn.pack(fill="x", pady=(0, 10))
-
-        # Build keys table and make it match the sidebar width
-        self._build_keys_table()
-        self.keys_table.pack(side="bottom", fill="x", padx=0, pady=(0, 6))
-
-    # ---------- actions ----------
-    def choose(self, winner):
-        prev = {r['folder']: r['rank'] for r in folder_leaderboard(self.conn, metric=self.metric)}
-        a, b = self.current
-        record_result(self.conn, a, b, winner)
-        self._last_ranks = prev
-        self.load_duel()
-
-    def hide(self, which):
-        if not self.current:
-            return
-        a, b = self.current
-        victim = a if which == "a" else b
-        survivor = b if which == "a" else a
-
-        # In Hidden mode, M-click acts as "unhide"; otherwise it hides.
-        f = (self.pool_filter_var.get() or "All").strip()
-        if f == "Hidden":
-            unhide_image(self.conn, victim)
-        else:
-            hide_image(self.conn, victim)
-
-        # Replace only the removed side with a new random item from the current pool.
-        replacement = self.pick_one(exclude_ids=[survivor[0], victim[0]])
-        if not replacement:
-            # Fallback: if we cannot find a replacement, reset the duel.
-            self.load_duel()
-            return
-
-        if which == "a":
-            self.current = (replacement, survivor)
-            self.prev_artists.appendleft(replacement[2])
-            self._render_media(self.left_panel, replacement[1])
-        else:
-            self.current = (survivor, replacement)
-            self.prev_artists.appendleft(replacement[2])
-            self._render_media(self.right_panel, replacement[1])
-
-        self.update_sidebar(self.current[0][2], self.current[1][2])
-        self.root.after(50, self._refresh_images)
-
-    def _open_url(self, url):
-        if url and url.startswith("http"):
-            try: webbrowser.open(url)
-            except Exception as e: print("[link] open failed:", e)
-
-    def open_left(self, ev=None):
-        if not self.current: return
-        a, _ = self.current
-        os.startfile(a[1])
-
-    def open_right(self, ev=None):
-        if not self.current: return
-        _, b = self.current
-        os.startfile(b[1])
+        # Counters
+        self.counters_text.configure(text=self._counters_block(a, b))
 
 
-    def toggle_video(self, which: str):
-        """Toggle in-app playback for the given side ('a' or 'b').
-
-        Only applies when that side is currently a video. Playback is frames-only (muted)
-        and starts paused on the first frame.
-        """
-        widget = self.left_panel if which == "a" else self.right_panel
-        vp = getattr(widget, "_video_player", None)
-
-        if vp is None:
-            if not self.current:
-                return
-            row = self.current[0] if which == "a" else self.current[1]
-            path = row[1]
-            if Path(path).suffix.lower() not in VIDEO_EXTS:
-                return
-            if imageio is None:
-                return
-
-            self.root.update_idletasks()
-            w = max(1, widget.winfo_width())
-            h = max(1, widget.winfo_height())
-            target = (max(100, w - 12), max(100, h - 12))
-
-            vp = VideoPlayer(self.root, widget, path, target)
-            if not vp.show_first_frame():
-                return
-            widget._video_player = vp
-
+    def _update_info_bars(self, a: tuple, b: tuple):
+        """Populate the top overlay info bars for left/right panels."""
+        def fmt(row: tuple) -> str:
+            folder = Path(row[2]).name if row and len(row) > 2 else "(unknown)"
+            p = Path(row[1]) if row and len(row) > 1 else Path("")
+            ext = p.suffix.lower().lstrip(".")
+            score = float(row[6]) if row and len(row) > 6 else 0.0
+            duels = int(row[3]) if row and len(row) > 3 else 0
+            w = int(row[4]) if row and len(row) > 4 else 0
+            l = int(row[5]) if row and len(row) > 5 else 0
+            return f"{folder}   •  {ext.upper()}  •  {score:.1f}  •  W{w} L{l}  •  shown {duels}"
         try:
-            vp.toggle()
+            self.left_info_text.configure(text=fmt(a))
+            self.right_info_text.configure(text=fmt(b))
         except Exception:
             pass
 
+    def _counters_block(self, a: tuple, b: tuple) -> str:
+        # per-image
+        def img_line(prefix: str, row: tuple) -> str:
+            return (f"{prefix}: duels={row[3]:>4}  W={row[4]:>4}  L={row[5]:>4}  score={row[6]:7.2f}")
+
+        # per-artist
+        def artist_totals(folder: str) -> Tuple[int, int, int, int]:
+            # (images, shown, wins, losses)
+            res = self.conn.execute("""
+                SELECT COUNT(*), COALESCE(SUM(duels),0), COALESCE(SUM(wins),0), COALESCE(SUM(losses),0)
+                FROM images WHERE folder=?
+            """, (folder,)).fetchone()
+            imgs, shown, w, l = (int(res[0]), int(res[1]), int(res[2]), int(res[3])) if res else (0, 0, 0, 0)
+            return imgs, shown, w, l
+
+        la = Path(a[2]).name
+        ra = Path(b[2]).name
+        la_imgs, la_shown, la_w, la_l = artist_totals(a[2])
+        ra_imgs, ra_shown, ra_w, ra_l = artist_totals(b[2])
+
+        return "\n".join([
+            img_line("LeftImg ", a),
+            img_line("RightImg", b),
+            f"LeftArt : {la}  imgs={la_imgs}  shown={la_shown}  decisions={la_w+la_l}  W={la_w} L={la_l}",
+            f"RightArt: {ra}  imgs={ra_imgs}  shown={ra_shown}  decisions={ra_w+ra_l}  W={ra_w} L={ra_l}",
+        ])
+
+    def _keybind_text(self) -> str:
+        return "\n".join([
+            "L-Click:   Pick LEFT",
+            "R-Click:   Pick RIGHT",
+            "R-Click(3):Downvote (both)",
+            "0 / Space: Skip / tie",
+            "",
+            "M-Click:   Hide side (replace only that side)",
+            "X / M:     Hide LEFT / Hide RIGHT",
+            "",
+            "Dbl-Click: Open image/video",
+            "O / P:     Open LEFT / Open RIGHT",
+            "Shift+O/P: Reveal LEFT/RIGHT folder",
+            "",
+            "[ / PgUp:  Prev leaderboard page",
+            "] / PgDn:  Next leaderboard page",
+            "T:         Toggle leaderboard metric",
+            "G:         Export e621 links",
+            "V:         View/open e621 links",
+            "I:         DB stats",
+            "",
+            "Ctrl+1/2:  Play/Pause LEFT/RIGHT video",
+            "Ctrl+Shift+1/2: Mute/Unmute LEFT/RIGHT",
+            "Ctrl+Click: Play/Pause hovered side",
+            "",
+            "Ctrl+B:    Toggle sidebar (focus mode)",
+            "Q:         Quit",
+        ])
+
+    # -------------------- file open / reveal --------------------
+
+    def toggle_sidebar(self):
+        """Toggle the right sidebar (focus mode)."""
+        if getattr(self, "sidebar_visible", True):
+            try:
+                self.sidebar.pack_forget()
+            except Exception:
+                pass
+            self.sidebar_visible = False
+            try:
+                self.sidebar_restore_btn.place(relx=1.0, x=-10, y=10, anchor="ne")
+            except Exception:
+                pass
+        else:
+            try:
+                self.sidebar_restore_btn.place_forget()
+            except Exception:
+                pass
+            try:
+                self.sidebar.pack(**getattr(self, "_sidebar_pack_opts", dict(side="right", fill="y", padx=(0, 6), pady=6)))
+            except Exception:
+                self.sidebar.pack(side="right", fill="y", padx=(0, 6), pady=6)
+            self.sidebar_visible = True
+
+        try:
+            self.keys_text.configure(text=self._keybind_text())
+        except Exception:
+            pass
+
+    def open_left(self, ev=None):
+        if not self.current:
+            return
+        os.startfile(self.current[0][1])
+
+    def open_right(self, ev=None):
+        if not self.current:
+            return
+        os.startfile(self.current[1][1])
 
     def reveal_left_folder(self, ev=None):
-        if not self.current: return
-        a, _ = self.current
-        os.startfile(str(Path(a[1]).parent))
+        if not self.current:
+            return
+        os.startfile(str(Path(self.current[0][1]).parent))
 
     def reveal_right_folder(self, ev=None):
-        if not self.current: return
-        _, b = self.current
-        os.startfile(str(Path(b[1]).parent))
+        if not self.current:
+            return
+        os.startfile(str(Path(self.current[1][1]).parent))
 
-    def quit(self):
-        print("[quit] closing UI")
-        self.root.quit()
-
-
-    def show_db_stats(self):
-        """Show summary statistics to help verify whether the DB has been reset."""
-        try:
-            images_total = int(self.conn.execute("SELECT COUNT(*) FROM images").fetchone()[0] or 0)
-            visible_total = int(self.conn.execute("SELECT COUNT(*) FROM images WHERE hidden=0").fetchone()[0] or 0)
-            comps_total = int(self.conn.execute("SELECT COUNT(*) FROM comparisons").fetchone()[0] or 0)
-            min_ts, max_ts = self.conn.execute("SELECT MIN(ts), MAX(ts) FROM comparisons").fetchone()
-            sum_duels, sum_wins, sum_losses = self.conn.execute(
-                "SELECT COALESCE(SUM(duels),0), COALESCE(SUM(wins),0), COALESCE(SUM(losses),0) FROM images"
-            ).fetchone()
-
-            sum_duels = int(sum_duels or 0)
-            sum_wins = int(sum_wins or 0)
-            sum_losses = int(sum_losses or 0)
-
-            expected_sum_duels = comps_total * 2
-            delta = sum_duels - expected_sum_duels
-
-            def fmt_ts(ts):
-                if not ts:
-                    return "n/a"
-                try:
-                    return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M:%S")
-                except Exception:
-                    return str(ts)
-
-            db_mtime = "n/a"
+    def _open_url(self, url: str):
+        if url and url.startswith("http"):
             try:
-                db_mtime = datetime.fromtimestamp(DB_PATH.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                webbrowser.open(url)
             except Exception:
                 pass
 
-            msg = (
-                f"DB file: {DB_PATH}\n"
-                f"DB modified: {db_mtime}\n\n"
-                f"Images: {images_total} (visible: {visible_total})\n"
-                f"Comparisons (duels): {comps_total}\n"
-                f"First duel: {fmt_ts(min_ts)}\n"
-                f"Last duel:  {fmt_ts(max_ts)}\n\n"
-                f"Image counters total:\n"
-                f"  shown (SUM duels): {sum_duels}\n"
-                f"  decisions (SUM wins+losses): {sum_wins + sum_losses}  [W={sum_wins}, L={sum_losses}]\n\n"
-                f"Consistency check:\n"
-                f"  expected SUM duels ≈ comparisons*2 = {expected_sum_duels}\n"
-                f"  actual   SUM duels = {sum_duels}\n"
-                f"  delta           = {delta}\n\n"
-                "Notes:\n"
-                "• If 'Comparisons' is near 0 and you expected lots of history, the DB was likely replaced/reset.\n"
-                "• 'shown' increases even on skips; 'decisions' only increases on wins/losses (including downvotes)."
-            )
-            try:
-                messagebox.showinfo("DB stats", msg)
-            except Exception:
-                print(msg)
-        except Exception as e:
-            try:
-                messagebox.showerror("DB stats failed", str(e))
-            except Exception:
-                print("[db] stats failed:", e)
-
-
-
-    # ---------- e621 link export ----------
-    def _parse_common_tags(self) -> list[str]:
-        """Parse the common tags entry into a list of tags."""
-        raw = self.common_tags_entry.get().strip() if hasattr(self, "common_tags_entry") else ""
+    # -------------------- e621 link generation --------------------
+    def _parse_common_tags(self) -> List[str]:
+        raw = (self.common_tags_entry.get() or "").strip()
+        if not raw:
+            return []
         return [t for t in raw.split() if t.strip()]
 
-    def _ranked_artist_tags(self) -> list[str]:
-        """
-        Best-effort artist tag source:
-        - uses folder leaderboard order
-        - converts folder leaf to a tag-like token (spaces -> underscores)
-        """
+    def _ranked_artist_tags(self) -> List[str]:
         leader = folder_leaderboard(self.conn, metric=self.metric)
-        out: list[str] = []
+        tags: List[str] = []
         seen = set()
         for row in leader:
-            folder = row.get("folder", "")
-            leaf = Path(folder).name.strip()
+            leaf = Path(row["folder"]).name.strip()
             if not leaf:
                 continue
-            tag = leaf.replace(" ", "_").strip()
-            if tag.startswith("~"):
-                tag = tag[1:]
-            if not tag:
+            leaf = re.sub(r"\s+", "_", leaf)
+            if leaf in seen:
                 continue
-            tag_norm = tag.lower()
-            if tag_norm in seen:
-                continue
-            seen.add(tag_norm)
-            out.append(tag_norm)
-        return out
+            seen.add(leaf)
+            tags.append(leaf)
+        return tags
 
-    def _build_e621_urls(self, common_tags: list[str], artist_tags: list[str]) -> list[str]:
-        """Build a list of e621 URLs respecting the 40-tag max."""
-        max_total = 40
-        max_artist = max_total - len(common_tags)
-        if max_artist < 1:
-            raise ValueError(f"Common tags use {len(common_tags)} tags; e621 max is {max_total}. Remove some common tags.")
-
-        total = len(artist_tags)
-        if total == 0:
+    def _build_e621_urls(self, common_tags: List[str], artist_tags: List[str]) -> List[str]:
+        max_artist = E621_MAX_TAGS - len(common_tags)
+        if max_artist <= 0:
+            raise ValueError(f"Common tags already use {len(common_tags)} tags; e621 max is {E621_MAX_TAGS}.")
+        total_items = len(artist_tags)
+        if total_items <= 0:
             return []
 
-        # Match your Excel logic: balanced groups, highest-ranked first
-        num_groups = max(1, math.ceil(total / max_artist))
-        items_per_group = max(1, math.ceil(total / num_groups))
+        # Spread evenly similar to your Excel LET logic
+        num_rows = max(1, math.ceil(total_items / min(37, max_artist)))
+        items_per_row = max(1, math.ceil(total_items / num_rows))
 
-        urls: list[str] = []
-        for g in range(num_groups):
-            chunk = artist_tags[g * items_per_group:(g + 1) * items_per_group]
+        urls: List[str] = []
+        for row in range(num_rows):
+            start = row * items_per_row
+            end = min(start + items_per_row, total_items)
+            chunk = artist_tags[start:end]
             if not chunk:
                 continue
-
             tags = list(common_tags) + [f"~{t}" for t in chunk[:max_artist]]
             tag_str = " ".join(tags)
             encoded = quote_plus(tag_str, safe="~()_-.'")
             urls.append(f"https://e621.net/posts?tags={encoded}")
-
         return urls
 
+    def _get_e621_urls(self) -> Tuple[List[str], List[str], List[str]]:
+        common = self._parse_common_tags()
+        artists = self._ranked_artist_tags()
+        urls = self._build_e621_urls(common, artists)
+        return urls, common, artists
+
     def export_e621_links(self):
-        """Write ranked e621 search URLs to e621_links.txt and copy to clipboard."""
         try:
-            urls, common, artists = self._get_e621_urls()
+            urls, _, _ = self._get_e621_urls()
         except Exception as e:
             msg = f"Export failed: {e}"
-            print("[e621] " + msg)
-            if hasattr(self, "export_status"):
-                self.export_status.configure(text=msg)
+            self.export_status.configure(text=msg)
             return
-
         if not urls:
-            msg = "No artist tags found to export."
-            print("[e621] " + msg)
-            if hasattr(self, "export_status"):
-                self.export_status.configure(text=msg)
+            self.export_status.configure(text="No artist tags found to export.")
             return
 
         out_path = SCRIPT_DIR / "e621_links.txt"
         try:
             out_path.write_text("\n".join(urls) + "\n", encoding="utf-8")
         except Exception as e:
-            msg = f"Export failed writing file: {e}"
-            print("[e621] " + msg)
-            if hasattr(self, "export_status"):
-                self.export_status.configure(text=msg)
+            self.export_status.configure(text=f"Export failed writing file: {e}")
             return
 
-        clip_msg = ""
+        # copy to clipboard
         try:
             self.root.clipboard_clear()
             self.root.clipboard_append("\n".join(urls))
             self.root.update()
-            clip_msg = "Copied to clipboard; "
         except Exception:
             pass
 
-        msg = f"{clip_msg}wrote {len(urls)} link(s) to {out_path.name} (max 40 tags/search)."
-        print("[e621] " + msg)
-        if hasattr(self, "export_status"):
-            self.export_status.configure(text=msg)
+        self.export_status.configure(text=f"Wrote {len(urls)} link(s) to {out_path.name} and clipboard.")
 
-
-    def _get_e621_urls(self):
-        """Return (urls, common_tags, artist_tags) for the current settings."""
-        common = self._parse_common_tags()
-        artists = self._ranked_artist_tags()
-        urls = self._build_e621_urls(common, artists)
-        return urls, common, artists
-
+    # ---- links viewer window ----
     def show_links_view(self):
-        """Open a window that shows the generated e621 links and allows opening them."""
         try:
             urls, common, artists = self._get_e621_urls()
         except Exception as e:
-            msg = f"Link generation failed: {e}"
-            print("[e621] " + msg)
-            if hasattr(self, "export_status"):
-                self.export_status.configure(text=msg)
-            try:
-                messagebox.showerror("e621 link generation failed", msg)
-            except Exception:
-                pass
+            messagebox.showerror("e621 link generation failed", str(e))
             return
 
-        if self._links_window and self._links_window.winfo_exists():
-            try:
-                self._links_window.deiconify()
-                self._links_window.lift()
-                self._links_window.focus_force()
-            except Exception:
-                pass
+        if hasattr(self, "_links_window") and self._links_window and self._links_window.winfo_exists():
+            self._links_window.deiconify()
+            self._links_window.lift()
+            self._links_window.focus_force()
         else:
             self._create_links_window()
 
-        self._links_view_set_data(urls, common, len(artists))
+        self._links_set_data(urls, common, len(artists))
 
     def _create_links_window(self):
+        self._links_open_cancel = False
+
         win = tk.Toplevel(self.root)
         win.title("e621 search links")
         win.geometry("1000x650")
@@ -1415,137 +2069,92 @@ class App:
                 win.destroy()
             except Exception:
                 pass
-            self._links_window = None
-            self._links_listbox = None
-            self._links_count_label = None
-            self._links_common_label = None
-            self._links_status_label = None
 
         win.protocol("WM_DELETE_WINDOW", on_close)
 
         info_frame = tk.Frame(win, bg=DARK_BG)
         info_frame.pack(fill="x", padx=10, pady=(10, 6))
 
-        self._links_count_label = tk.Label(
-            info_frame, text="Links: 0", font=("Segoe UI", 10, "bold"),
-            fg=ACCENT, bg=DARK_BG, anchor="w"
-        )
+        self._links_count_label = tk.Label(info_frame, text="Links: 0", font=("Segoe UI", 10, "bold"),
+                                           fg=ACCENT, bg=DARK_BG, anchor="w")
         self._links_count_label.pack(side="left", fill="x", expand=True)
 
-        self._links_common_label = tk.Label(
-            info_frame, text="", font=("Consolas", 9),
-            fg=TEXT_COLOR, bg=DARK_BG, anchor="e", justify="right"
-        )
+        self._links_common_label = tk.Label(info_frame, text="", font=("Consolas", 9),
+                                            fg=TEXT_COLOR, bg=DARK_BG, anchor="e", justify="right")
         self._links_common_label.pack(side="right")
 
         btn_frame = tk.Frame(win, bg=DARK_BG)
         btn_frame.pack(fill="x", padx=10, pady=(0, 8))
 
-        btn_refresh = tk.Button(
-            btn_frame, text="Refresh", command=self._links_view_refresh,
-            bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat"
-        )
-        btn_copy = tk.Button(
-            btn_frame, text="Copy all", command=self._links_view_copy_all,
-            bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat"
-        )
-        btn_open_sel = tk.Button(
-            btn_frame, text="Open selected", command=self._links_view_open_selected,
-            bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat"
-        )
-        btn_open_all = tk.Button(
-            btn_frame, text="Open all", command=self._links_view_open_all,
-            bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat"
-        )
-        btn_stop = tk.Button(
-            btn_frame, text="Stop opening", command=self._links_view_stop_opening,
-            bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat"
-        )
-        btn_open_file = tk.Button(
-            btn_frame, text="Open links file", command=self._links_view_open_file,
-            bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat"
-        )
-
-        for b in (btn_refresh, btn_copy, btn_open_sel, btn_open_all, btn_stop, btn_open_file):
-            b.pack(side="left", padx=(0, 8))
+        tk.Button(btn_frame, text="Refresh", command=self._links_refresh,
+                  bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat").pack(side="left", padx=(0, 8))
+        tk.Button(btn_frame, text="Copy all", command=self._links_copy_all,
+                  bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat").pack(side="left", padx=(0, 8))
+        tk.Button(btn_frame, text="Open selected", command=self._links_open_selected,
+                  bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat").pack(side="left", padx=(0, 8))
+        tk.Button(btn_frame, text="Open all", command=self._links_open_all,
+                  bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat").pack(side="left", padx=(0, 8))
+        tk.Button(btn_frame, text="Stop opening", command=self._links_stop_opening,
+                  bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat").pack(side="left", padx=(0, 8))
+        tk.Button(btn_frame, text="Open links file", command=self._links_open_file,
+                  bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat").pack(side="left")
 
         list_frame = tk.Frame(win, bg=DARK_BG)
         list_frame.pack(fill="both", expand=True, padx=10, pady=(0, 8))
 
-        # Use grid here so the horizontal scrollbar spans the full width and behaves reliably.
+        # Use grid to avoid broken horizontal scrollbar
         list_frame.grid_rowconfigure(0, weight=1)
         list_frame.grid_columnconfigure(0, weight=1)
 
         yscroll = tk.Scrollbar(list_frame, orient="vertical")
         xscroll = tk.Scrollbar(list_frame, orient="horizontal")
 
-        lb = tk.Listbox(
-            list_frame, font=("Consolas", 9),
-            bg=DARK_PANEL, fg=TEXT_COLOR, selectbackground=ACCENT,
-            activestyle="none",
-            yscrollcommand=yscroll.set, xscrollcommand=xscroll.set
-        )
+        lb = tk.Listbox(list_frame, font=("Consolas", 9),
+                        bg=DARK_PANEL, fg=TEXT_COLOR, selectbackground=ACCENT,
+                        activestyle="none",
+                        yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
         yscroll.config(command=lb.yview)
         xscroll.config(command=lb.xview)
 
         lb.grid(row=0, column=0, sticky="nsew")
         yscroll.grid(row=0, column=1, sticky="ns")
-        xscroll.grid(row=1, column=0, sticky="we")
+        xscroll.grid(row=1, column=0, sticky="ew")
 
-        lb.bind("<Double-Button-1>", lambda e: self._links_view_open_selected())
-
+        lb.bind("<Double-Button-1>", lambda e: self._links_open_selected())
         self._links_listbox = lb
 
-        self._links_status_label = tk.Label(
-            win, text="", font=("Segoe UI", 9),
-            fg=TEXT_COLOR, bg=DARK_BG, anchor="w", justify="left"
-        )
+        self._links_status_label = tk.Label(win, text="", font=("Segoe UI", 9),
+                                            fg=TEXT_COLOR, bg=DARK_BG, anchor="w")
         self._links_status_label.pack(fill="x", padx=10, pady=(0, 10))
 
-    def _links_view_set_data(self, urls: list[str], common_tags: list[str], artist_count: int):
-        if not (self._links_window and self._links_window.winfo_exists() and self._links_listbox):
-            return
-
+    def _links_set_data(self, urls: List[str], common_tags: List[str], artist_count: int):
         self._links_listbox.delete(0, "end")
         for u in urls:
             self._links_listbox.insert("end", u)
-
-        # Ensure the view starts at the left/top after refresh (helps when long URLs are present).
         try:
-            self._links_listbox.yview_moveto(0.0)
-            self._links_listbox.xview_moveto(0.0)
+            self._links_listbox.xview_moveto(0)
+            self._links_listbox.yview_moveto(0)
         except Exception:
             pass
 
-        if self._links_count_label:
-            self._links_count_label.configure(text=f"Links: {len(urls)}   (artists: {artist_count})")
-
+        self._links_count_label.configure(text=f"Links: {len(urls)}   (artists: {artist_count})")
         common_str = " ".join(common_tags) if common_tags else "(none)"
-        common_display = (common_str[:137] + "...") if len(common_str) > 140 else common_str
-        if self._links_common_label:
-            self._links_common_label.configure(text=f"Common tags: {common_display}")
+        if len(common_str) > 140:
+            common_str = common_str[:137] + "..."
+        self._links_common_label.configure(text=f"Common tags: {common_str}")
+        self._links_status_label.configure(text="")
 
-        if self._links_status_label:
-            self._links_status_label.configure(text="")
-
-    def _links_view_refresh(self):
+    def _links_refresh(self):
         try:
             urls, common, artists = self._get_e621_urls()
-            self._links_view_set_data(urls, common, len(artists))
+            self._links_set_data(urls, common, len(artists))
         except Exception as e:
-            try:
-                messagebox.showerror("Refresh failed", str(e))
-            except Exception:
-                pass
+            messagebox.showerror("Refresh failed", str(e))
 
-    def _links_view_get_urls(self) -> list[str]:
-        if not self._links_listbox:
-            return []
+    def _links_get_urls(self) -> List[str]:
         return [self._links_listbox.get(i) for i in range(self._links_listbox.size())]
 
-    def _links_view_get_selected_urls(self) -> list[str]:
-        if not self._links_listbox:
-            return []
+    def _links_get_selected_urls(self) -> List[str]:
         sel = list(self._links_listbox.curselection())
         if not sel:
             try:
@@ -1556,38 +2165,7 @@ class App:
                 sel = []
         return [self._links_listbox.get(i) for i in sel]
 
-    def _links_view_open_selected(self):
-        urls = self._links_view_get_selected_urls()
-        if not urls:
-            try:
-                messagebox.showinfo("Open selected", "Select a link first.")
-            except Exception:
-                pass
-            return
-        self._open_urls_staggered(urls)
-
-    def _links_view_open_all(self):
-        urls = self._links_view_get_urls()
-        if not urls:
-            try:
-                messagebox.showinfo("Open all", "No links to open.")
-            except Exception:
-                pass
-            return
-        try:
-            ok = messagebox.askyesno("Open all links", f"This will open {len(urls)} browser tab(s). Continue?")
-        except Exception:
-            ok = True
-        if not ok:
-            return
-        self._open_urls_staggered(urls)
-
-    def _links_view_stop_opening(self):
-        self._links_open_cancel = True
-        if self._links_status_label:
-            self._links_status_label.configure(text="Stopped.")
-
-    def _open_urls_staggered(self, urls: list[str], delay_ms: int = 150):
+    def _open_urls_staggered(self, urls: List[str], delay_ms: int = 150):
         self._links_open_cancel = False
         total = len(urls)
 
@@ -1595,40 +2173,50 @@ class App:
             if self._links_open_cancel:
                 return
             if i >= total:
-                if self._links_status_label:
-                    self._links_status_label.configure(text=f"Opened {total} link(s).")
+                self._links_status_label.configure(text=f"Opened {total} link(s).")
                 return
-
-            url = urls[i]
             try:
-                webbrowser.open(url)
-            except Exception as e:
-                print("[link] open failed:", e)
-
-            if self._links_status_label:
-                self._links_status_label.configure(text=f"Opening {i+1}/{total}...")
-
+                webbrowser.open(urls[i])
+            except Exception:
+                pass
+            self._links_status_label.configure(text=f"Opening {i+1}/{total}...")
             self.root.after(delay_ms, lambda: step(i + 1))
 
         step(0)
 
-    def _links_view_copy_all(self):
-        urls = self._links_view_get_urls()
+    def _links_open_selected(self):
+        urls = self._links_get_selected_urls()
+        if not urls:
+            messagebox.showinfo("Open selected", "Select a link first.")
+            return
+        self._open_urls_staggered(urls)
+
+    def _links_open_all(self):
+        urls = self._links_get_urls()
+        if not urls:
+            messagebox.showinfo("Open all", "No links to open.")
+            return
+        ok = messagebox.askyesno("Open all links", f"This will open {len(urls)} browser tab(s). Continue?")
+        if ok:
+            self._open_urls_staggered(urls)
+
+    def _links_stop_opening(self):
+        self._links_open_cancel = True
+        self._links_status_label.configure(text="Stopped.")
+
+    def _links_copy_all(self):
+        urls = self._links_get_urls()
         if not urls:
             return
         try:
             self.root.clipboard_clear()
             self.root.clipboard_append("\n".join(urls))
             self.root.update()
-            if self._links_status_label:
-                self._links_status_label.configure(text=f"Copied {len(urls)} link(s) to clipboard.")
+            self._links_status_label.configure(text=f"Copied {len(urls)} link(s) to clipboard.")
         except Exception as e:
-            try:
-                messagebox.showerror("Copy failed", str(e))
-            except Exception:
-                pass
+            messagebox.showerror("Copy failed", str(e))
 
-    def _links_view_open_file(self):
+    def _links_open_file(self):
         out_path = SCRIPT_DIR / "e621_links.txt"
         try:
             if not out_path.exists():
@@ -1636,14 +2224,66 @@ class App:
                 out_path.write_text("\n".join(urls) + "\n", encoding="utf-8")
             os.startfile(str(out_path))
         except Exception as e:
-            try:
-                messagebox.showerror("Open file failed", str(e))
-            except Exception:
-                pass
+            messagebox.showerror("Open file failed", str(e))
 
+    # -------------------- DB stats --------------------
+    def show_db_stats(self):
+        n_images = self.conn.execute("SELECT COUNT(*) FROM images").fetchone()[0]
+        n_hidden = self.conn.execute("SELECT COUNT(*) FROM images WHERE hidden=1").fetchone()[0]
+        n_comp = self.conn.execute("SELECT COUNT(*) FROM comparisons").fetchone()[0]
+        mn_mx = self.conn.execute("SELECT MIN(ts), MAX(ts) FROM comparisons").fetchone()
+        tmin, tmax = mn_mx[0], mn_mx[1]
+        fmt = lambda t: "n/a" if t is None else datetime.fromtimestamp(int(t)).strftime("%Y-%m-%d %H:%M:%S")
+
+        sums = self.conn.execute("SELECT COALESCE(SUM(duels),0), COALESCE(SUM(wins),0), COALESCE(SUM(losses),0) FROM images").fetchone()
+        sum_duels, sum_wins, sum_losses = int(sums[0]), int(sums[1]), int(sums[2])
+
+        msg = "\n".join([
+            f"Images: {n_images} (hidden: {n_hidden})",
+            f"Comparisons: {n_comp}",
+            f"First duel: {fmt(tmin)}",
+            f"Last duel:  {fmt(tmax)}",
+            "",
+            f"SUM(images.duels)   = {sum_duels}",
+            f"SUM(images.wins)    = {sum_wins}",
+            f"SUM(images.losses)  = {sum_losses}",
+            f"Comparisons * 2     = {n_comp * 2}",
+            "",
+            "A reset usually shows as: comparisons near 0 and first/last duel very recent.",
+        ])
+        messagebox.showinfo("DB stats", msg)
+
+    # -------------------- refresh visuals only --------------------
+    def _refresh_visuals_only(self):
+        # Only rerender still images/gifs, avoid touching VLC players.
+        for side in ("a", "b"):
+            st = self._side[side]
+            row = st.get("row")
+            if not row:
+                continue
+            kind = self._media_kind(row[1])
+            if kind == "video":
+                # do nothing; VLC output is independent of Tk size changes
+                continue
+            panel = self.left_panel if side == "a" else self.right_panel
+            self._cancel_animation(side)
+            self._render_image_or_gif(side, panel, row[1])
+
+    # -------------------- quit --------------------
+    def quit(self):
+        try:
+            self._stop_video("a")
+            self._stop_video("b")
+        except Exception:
+            pass
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+        self.root.quit()
 
 # -------------------- Report on quit --------------------
-def export_csv(conn, path: Path):
+def export_csv(conn: sqlite3.Connection, path: Path) -> None:
     import csv
     rows = conn.execute("""
         SELECT path, folder, score, wins, losses, duels, last_seen, hidden
@@ -1651,24 +2291,23 @@ def export_csv(conn, path: Path):
     """).fetchall()
     with path.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["path","folder","score","wins","losses","duels","last_seen_iso","hidden"])
+        w.writerow(["path", "folder", "score", "wins", "losses", "duels", "last_seen_iso", "hidden"])
         for p, folder, score, wins, losses, duels, last_seen, hidden in rows:
-            iso = datetime.utcfromtimestamp(last_seen).isoformat()+"Z" if last_seen else ""
+            iso = datetime.utcfromtimestamp(last_seen).isoformat() + "Z" if last_seen else ""
             w.writerow([p, folder, f"{score:.2f}", wins, losses, duels, iso, hidden])
 
-def show_folder_chart(conn):
+def show_folder_chart(conn: sqlite3.Connection) -> None:
     if not plt:
-        print("[report] matplotlib not available, skipping chart")
         return
-    rows = folder_leaderboard(conn)[:20]
+    rows = folder_leaderboard(conn, metric=LEADERBOARD_METRIC_DEFAULT)[:20]
     if not rows:
         return
-    names = [Path(r['folder']).name or r['folder'] for r in rows]
-    scores = [r['score'] for r in rows]
+    names = [Path(r["folder"]).name or r["folder"] for r in rows]
+    scores = [r["score"] for r in rows]
     plt.figure(figsize=(10, 6))
     plt.barh(list(reversed(names)), list(reversed(scores)))
     plt.xlabel("Folder ranking score")
-    plt.title("Top folders (metric: {})".format(rows[0]['metric'] if rows else LEADERBOARD_METRIC_DEFAULT))
+    plt.title(f"Top folders (metric: {rows[0]['metric']})")
     plt.tight_layout()
     plt.show()
 
@@ -1679,13 +2318,18 @@ def run():
     root = tk.Tk()
     app = App(root, conn)
     root.mainloop()
-    csv_path = Path(ROOT_DIR) / "image_duel_report.csv"
-    export_csv(conn, csv_path)
-    print(f"[report] CSV written: {csv_path}")
+
+    # optional report
+    try:
+        csv_path = Path(ROOT_DIR) / "image_duel_report.csv"
+        export_csv(conn, csv_path)
+        print(f"[report] CSV written: {csv_path}")
+    except Exception:
+        pass
     try:
         show_folder_chart(conn)
-    except Exception as e:
-        print("[report] chart skipped:", e)
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     run()
