@@ -30,6 +30,13 @@ try:
 except Exception:
     piexif = None
 
+
+# Optional: in-app video preview (requires: imageio + imageio-ffmpeg)
+try:
+    import imageio.v2 as imageio
+except Exception:
+    imageio = None
+
 # -------------------- THEME (Dark Mode) --------------------
 DARK_BG    = "#1e1e1e"
 DARK_PANEL = "#252526"
@@ -271,6 +278,149 @@ def e621_url_for_path(path: str) -> Optional[str]:
     return f"https://e621.net/posts/{pid}"
 
 # -------------------- UI --------------------
+
+class VideoPlayer:
+    """Tkinter video playback (frames only, no audio).
+
+    - Starts paused on the first frame.
+    - Uses imageio (ffmpeg backend) if available.
+    - Playback is best-effort; if decoding fails, falls back to a placeholder.
+    """
+
+    def __init__(self, root: tk.Tk, widget: tk.Label, path: str, target_size: tuple[int, int]):
+        self.root = root
+        self.widget = widget
+        self.path = path
+        self.target_size = target_size
+
+        self.reader = None
+        self.iter = None
+        self.fps = 24.0
+        self.delay_ms = 42
+
+        self.after_job = None
+        self.paused = True
+        self.ended = False
+
+    def _open(self) -> bool:
+        if imageio is None:
+            return False
+        try:
+            self.reader = imageio.get_reader(self.path)
+            meta = {}
+            try:
+                meta = self.reader.get_meta_data() or {}
+            except Exception:
+                meta = {}
+            fps = meta.get("fps")
+            if isinstance(fps, (int, float)) and fps and fps > 0:
+                self.fps = float(fps)
+            self.fps = max(5.0, min(60.0, self.fps))
+            self.delay_ms = int(1000.0 / self.fps)
+            self.iter = self.reader.iter_data()
+            self.ended = False
+            return True
+        except Exception:
+            self.reader = None
+            self.iter = None
+            return False
+
+    def close(self):
+        self._cancel()
+        try:
+            if self.reader:
+                self.reader.close()
+        except Exception:
+            pass
+        self.reader = None
+        self.iter = None
+        self.paused = True
+        self.ended = False
+
+    def _cancel(self):
+        if self.after_job:
+            try:
+                self.root.after_cancel(self.after_job)
+            except Exception:
+                pass
+            self.after_job = None
+
+    def _display_frame(self, frame) -> bool:
+        try:
+            im = Image.fromarray(frame)
+        except Exception:
+            return False
+        if im.mode not in ("RGB", "RGBA"):
+            im = im.convert("RGB")
+        im.thumbnail(self.target_size, Image.Resampling.LANCZOS)
+        tk_im = ImageTk.PhotoImage(im)
+        self.widget.configure(image=tk_im, text="", bg=DARK_PANEL, borderwidth=0, highlightthickness=0)
+        self.widget.image = tk_im
+        return True
+
+    def show_first_frame(self) -> bool:
+        # Always reopen to guarantee frame 0 and reset end-state
+        self.close()
+        if not self._open():
+            return False
+        try:
+            frame = next(self.iter)
+        except Exception:
+            self.close()
+            return False
+        ok = self._display_frame(frame)
+        self.paused = True
+        return ok
+
+    def toggle(self):
+        if self.reader is None or self.iter is None:
+            if not self.show_first_frame():
+                return
+
+        if self.ended:
+            # restart from beginning on next play
+            if not self.show_first_frame():
+                return
+            self.ended = False
+
+        if self.paused:
+            self.paused = False
+            self._schedule(0)
+        else:
+            self.paused = True
+            self._cancel()
+
+    def _schedule(self, delay_ms: int):
+        self._cancel()
+        self.after_job = self.root.after(delay_ms, self.step)
+
+    def step(self):
+        if self.paused:
+            return
+        if self.reader is None or self.iter is None:
+            self.paused = True
+            return
+        try:
+            frame = next(self.iter)
+        except StopIteration:
+            self.paused = True
+            self.ended = True
+            self._cancel()
+            return
+        except Exception:
+            self.paused = True
+            self.ended = True
+            self._cancel()
+            return
+
+        if not self._display_frame(frame):
+            self.paused = True
+            self.ended = True
+            self._cancel()
+            return
+
+        self._schedule(self.delay_ms)
+
 class App:
     def __init__(self, root, conn):
         self.root = root
@@ -323,6 +473,8 @@ class App:
         # -------------------- Mouse controls --------------------
         self.left_panel.bind("<Button-1>",  lambda e: self.choose("a"))
         self.right_panel.bind("<Button-1>", lambda e: self.choose("b"))
+        self.left_panel.bind("<Control-Button-1>",  lambda e: (self.toggle_video("a") or "break"))
+        self.right_panel.bind("<Control-Button-1>", lambda e: (self.toggle_video("b") or "break"))
         self.left_panel.bind("<Double-Button-1>", self.open_left)
         self.right_panel.bind("<Double-Button-1>", self.open_right)
         self.left_panel.bind("<Button-3>",  lambda e: self.choose("downvote"))
@@ -413,6 +565,8 @@ class App:
         # keybinds
         root.bind("1", lambda e: self.choose("a"))
         root.bind("2", lambda e: self.choose("b"))
+        root.bind("<Control-Key-1>", lambda e: self.toggle_video("a"))
+        root.bind("<Control-Key-2>", lambda e: self.toggle_video("b"))
         root.bind("3", lambda e: self.choose("downvote"))
         root.bind("x", lambda e: self.hide("a"))
         root.bind("m", lambda e: self.hide("b"))
@@ -542,26 +696,72 @@ class App:
 
     # ---------- image display (with GIF support) ----------
     def _render_media(self, widget, path):
+        # Stop any prior GIF animation
+        if hasattr(widget, "_anim_job") and widget._anim_job:
+            try:
+                self.root.after_cancel(widget._anim_job)
+            except Exception:
+                pass
+            widget._anim_job = None
+
+        # Stop any prior video playback
+        if hasattr(widget, "_video_player") and widget._video_player:
+            try:
+                widget._video_player.close()
+            except Exception:
+                pass
+            widget._video_player = None
+
+        self.root.update_idletasks()
+        w = max(1, widget.winfo_width())
+        h = max(1, widget.winfo_height())
+        if w <= 5 or h <= 5:
+            self.root.after(50, lambda: self._render_media(widget, path))
+            return
+
+        target = (max(100, w - 12), max(100, h - 12))
         ext = Path(path).suffix.lower()
+
+        # --- Videos: show first frame (paused), allow play/pause ---
         if ext in VIDEO_EXTS:
-            # Stop any prior animation
-            if hasattr(widget, "_anim_job") and widget._anim_job:
-                try:
-                    self.root.after_cancel(widget._anim_job)
-                except Exception:
-                    pass
-                widget._anim_job = None
-            # Placeholder (video preview is intentionally lightweight)
-            self.root.update_idletasks()
-            w = max(1, widget.winfo_width())
             wrap = max(100, w - 24)
             name = Path(path).name
-            widget.configure(image="", text=f"[VIDEO]\n{name}\n\n(Double-click to open)",
-                             fg=TEXT_COLOR, bg=DARK_PANEL, justify="center",
-                             font=("Consolas", 12), wraplength=wrap,
-                             borderwidth=0, highlightthickness=0)
+
+            if imageio is None:
+                widget.configure(
+                    image="",
+                    text=f"[VIDEO]\n{name}\n\n(Install for preview)\npy -m pip install imageio imageio-ffmpeg",
+                    fg=TEXT_COLOR,
+                    bg=DARK_PANEL,
+                    justify="center",
+                    font=("Consolas", 11),
+                    wraplength=wrap,
+                    borderwidth=0,
+                    highlightthickness=0,
+                )
+                widget.image = None
+                return
+
+            vp = VideoPlayer(self.root, widget, path, target)
+            if vp.show_first_frame():
+                widget._video_player = vp
+                return
+
+            # Fallback placeholder if decode fails
+            widget.configure(
+                image="",
+                text=f"[VIDEO]\n{name}\n\n(Preview unavailable)\n(Double-click to open)",
+                fg=TEXT_COLOR,
+                bg=DARK_PANEL,
+                justify="center",
+                font=("Consolas", 11),
+                wraplength=wrap,
+                borderwidth=0,
+                highlightthickness=0,
+            )
             widget.image = None
             return
+
         # Images / GIFs
         try:
             widget.configure(text="")
@@ -727,6 +927,7 @@ class App:
             ("M-Click image",    "Hide clicked",        "3",        "Downvote both"),
             ("Dbl-Click image",  "Open clicked",        "X",        "Hide LEFT"),
             ("0 / Space",        "Skip/tie",            "M",        "Hide RIGHT"),
+            ("Ctrl+1",           "Play/Pause video LEFT", "Ctrl+2",   "Play/Pause video RIGHT"),
             ("O",                "Open LEFT image",     "P",        "Open RIGHT image"),
             ("Shift+O",          "Reveal LEFT folder",  "Shift+P",  "Reveal RIGHT folder"),
             ("[ / PgUp",         "Prev page",           "] / PgDn", "Next page"),
@@ -950,6 +1151,42 @@ class App:
         if not self.current: return
         _, b = self.current
         os.startfile(b[1])
+
+
+    def toggle_video(self, which: str):
+        """Toggle in-app playback for the given side ('a' or 'b').
+
+        Only applies when that side is currently a video. Playback is frames-only (muted)
+        and starts paused on the first frame.
+        """
+        widget = self.left_panel if which == "a" else self.right_panel
+        vp = getattr(widget, "_video_player", None)
+
+        if vp is None:
+            if not self.current:
+                return
+            row = self.current[0] if which == "a" else self.current[1]
+            path = row[1]
+            if Path(path).suffix.lower() not in VIDEO_EXTS:
+                return
+            if imageio is None:
+                return
+
+            self.root.update_idletasks()
+            w = max(1, widget.winfo_width())
+            h = max(1, widget.winfo_height())
+            target = (max(100, w - 12), max(100, h - 12))
+
+            vp = VideoPlayer(self.root, widget, path, target)
+            if not vp.show_first_frame():
+                return
+            widget._video_player = vp
+
+        try:
+            vp.toggle()
+        except Exception:
+            pass
+
 
     def reveal_left_folder(self, ev=None):
         if not self.current: return
