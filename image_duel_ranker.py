@@ -27,7 +27,7 @@ import tkinter.ttk as ttk
 import tkinter.font as tkfont
 import tkinter.messagebox as messagebox
 
-from PIL import Image, ImageTk, ImageSequence
+from PIL import Image, ImageTk, ImageSequence, ImageFilter
 
 # Optional chart (only used on exit)
 try:
@@ -98,7 +98,7 @@ LCB_Z = 1.0
 E621_MAX_TAGS = 40
 DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
-BUILD_STAMP = '2026-01-14d (video controls revamp: seek ±5s, speed, fullscreen, waveform)'
+BUILD_STAMP = '2026-01-14e (waveform visibility, progress track, tooltip)'
 
 # -------------------- DB --------------------
 def init_db() -> sqlite3.Connection:
@@ -1182,7 +1182,7 @@ class App:
         mute_btn = tk.Button(bar, text="Mute", width=7, command=lambda: self.toggle_mute(side), **btn_opts)
 
         # Waveform / seek bar (Canvas)
-        wave = tk.Canvas(bar, height=18, bg=DARK_BG, highlightthickness=0, bd=0, relief="flat")
+        wave = tk.Canvas(bar, height=22, bg=DARK_BG, highlightthickness=0, bd=0, relief="flat")
         time_lbl = tk.Label(bar, text="00:00 / 00:00", bg=DARK_PANEL, fg=TEXT_COLOR, font=("Consolas", 9))
 
         speed_var = tk.StringVar(value="1.0x")
@@ -1197,14 +1197,14 @@ class App:
 
         # Grid layout
         bar.columnconfigure(4, weight=1)  # waveform expands
-        play_btn.grid(row=0, column=0, padx=(8, 6), pady=8, sticky="w")
-        back_btn.grid(row=0, column=1, padx=(0, 6), pady=8, sticky="w")
-        fwd_btn.grid(row=0, column=2, padx=(0, 10), pady=8, sticky="w")
-        mute_btn.grid(row=0, column=3, padx=(0, 10), pady=8, sticky="w")
-        wave.grid(row=0, column=4, padx=(0, 10), pady=8, sticky="ew")
-        time_lbl.grid(row=0, column=5, padx=(0, 10), pady=8, sticky="e")
-        speed_box.grid(row=0, column=6, padx=(0, 10), pady=8, sticky="e")
-        fs_btn.grid(row=0, column=7, padx=(0, 8), pady=8, sticky="e")
+        play_btn.grid(row=0, column=0, padx=(8, 6), pady=6, sticky="w")
+        back_btn.grid(row=0, column=1, padx=(0, 6), pady=6, sticky="w")
+        fwd_btn.grid(row=0, column=2, padx=(0, 10), pady=6, sticky="w")
+        mute_btn.grid(row=0, column=3, padx=(0, 10), pady=6, sticky="w")
+        wave.grid(row=0, column=4, padx=(0, 10), pady=6, sticky="ew")
+        time_lbl.grid(row=0, column=5, padx=(0, 10), pady=6, sticky="e")
+        speed_box.grid(row=0, column=6, padx=(0, 10), pady=6, sticky="e")
+        fs_btn.grid(row=0, column=7, padx=(0, 8), pady=6, sticky="e")
 
         # Save UI handles
         st = self._side[side]
@@ -1250,6 +1250,8 @@ class App:
         wave.bind("<ButtonPress-1>", lambda e: self._wave_press(side, e))
         wave.bind("<B1-Motion>", lambda e: self._wave_drag(side, e))
         wave.bind("<ButtonRelease-1>", lambda e: self._wave_release(side, e))
+        wave.bind("<Motion>", lambda e: self._wave_motion(side, e))
+        wave.bind("<Leave>", lambda e: self._hide_wave_tooltip())
         wave.bind("<Configure>", lambda e: self._redraw_waveform(side))
 
         # Speed changes
@@ -1612,8 +1614,17 @@ class App:
                         if len(hx) == 3:
                             hx = "".join([c*2 for c in hx])
                         r0, g0, b0 = int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16)
-                        alpha = gray.point(lambda p: 0 if p < 8 else min(255, int(p * 1.6)))
-                        col = Image.new("RGBA", img.size, (r0, g0, b0, 0))
+                        alpha = gray.point(lambda p: 0 if p < 10 else min(255, int((p - 10) * 5)))
+                        # Thicken + smooth for better readability at small UI heights.
+                        try:
+                            alpha = alpha.filter(ImageFilter.MaxFilter(5))
+                        except Exception:
+                            pass
+                        try:
+                            alpha = alpha.filter(ImageFilter.GaussianBlur(0.6))
+                        except Exception:
+                            pass
+                        col = Image.new("RGBA", img.size, (r0, g0, b0, 255))
                         col.putalpha(alpha)
                         img = col
                 except Exception:
@@ -1728,7 +1739,14 @@ class App:
         frac = 0.0 if total_ms <= 0 else max(0.0, min(1.0, float(cur_ms) / float(total_ms)))
         x = int(frac * w)
         try:
+            # Track + progress line (YouTube-like)
+            track_y = max(1, h - 2)
+            c.create_line(0, track_y, w, track_y, fill="#40454d", width=2, tags="playhead")
+            c.create_line(0, track_y, x, track_y, fill=ACCENT, width=2, tags="playhead")
+            # Playhead
             c.create_line(x, 0, x, h, fill=ACCENT, width=2, tags="playhead")
+            # Small handle near the track
+            c.create_rectangle(max(0, x - 2), max(0, track_y - 4), min(w, x + 2), min(h, track_y + 4), fill=ACCENT, outline="", tags="playhead")
         except Exception:
             pass
 
@@ -1755,6 +1773,7 @@ class App:
         st["pending_seek_frac"] = frac
         total = int(st.get("vlc_total_ms") or 0)
         self._update_playhead(side, int(frac * total) if total > 0 else 0, total)
+        self._wave_motion(side, event)
 
     def _wave_drag(self, side: str, event):
         st = self._side[side]
@@ -1775,6 +1794,52 @@ class App:
         if frac is not None:
             st["pending_seek_frac"] = frac
         self._end_scrub(side)
+
+    def _ensure_wave_tooltip(self):
+        if getattr(self, "_wave_tip", None) is None:
+            self._wave_tip = tk.Label(
+                self.root,
+                text="",
+                bg="#111111",
+                fg=TEXT_COLOR,
+                font=("Segoe UI", 8),
+                bd=1,
+                relief="solid",
+                padx=6,
+                pady=2,
+            )
+            self._wave_tip.place_forget()
+
+    def _show_wave_tooltip(self, x_root: int, y_root: int, text: str):
+        self._ensure_wave_tooltip()
+        self._wave_tip.configure(text=text)
+        # Keep within window bounds a bit
+        rx = self.root.winfo_rootx()
+        ry = self.root.winfo_rooty()
+        rw = self.root.winfo_width()
+        rh = self.root.winfo_height()
+        x = (x_root - rx) + 10
+        y = (y_root - ry) - 28
+        x = max(6, min(rw - 80, x))
+        y = max(6, min(rh - 30, y))
+        self._wave_tip.place(x=x, y=y)
+
+    def _hide_wave_tooltip(self):
+        tip = getattr(self, "_wave_tip", None)
+        if tip is not None:
+            tip.place_forget()
+
+    def _wave_motion(self, side: str, event):
+        st = self._side.get(side)
+        if not st:
+            return
+        frac = self._wave_event_fraction(side, event)
+        total = int(st.get("vlc_total_ms") or 0)
+        if frac is None or total <= 0:
+            self._hide_wave_tooltip()
+            return
+        target = int(frac * total)
+        self._show_wave_tooltip(event.x_root, event.y_root, self._format_mmss(target))
 
     def _metric_human(self) -> str:
         return {
