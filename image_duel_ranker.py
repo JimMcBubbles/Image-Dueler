@@ -1,6 +1,6 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Build: 2026-01-14d (video controls revamp: seek ±5s, speed, fullscreen, waveform)
+# Build: 2026-01-14f (waveform: +~18% height for clearer peaks)
 
 import os
 import sys
@@ -98,7 +98,7 @@ LCB_Z = 1.0
 E621_MAX_TAGS = 40
 DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
-BUILD_STAMP = '2026-01-14e (waveform visibility, progress track, tooltip)'
+BUILD_STAMP = '2026-01-14f (waveform: +~18% height for clearer peaks)'
 
 # -------------------- DB --------------------
 def init_db() -> sqlite3.Connection:
@@ -1182,7 +1182,7 @@ class App:
         mute_btn = tk.Button(bar, text="Mute", width=7, command=lambda: self.toggle_mute(side), **btn_opts)
 
         # Waveform / seek bar (Canvas)
-        wave = tk.Canvas(bar, height=22, bg=DARK_BG, highlightthickness=0, bd=0, relief="flat")
+        wave = tk.Canvas(bar, height=26, bg=DARK_BG, highlightthickness=0, bd=0, relief="flat")
         time_lbl = tk.Label(bar, text="00:00 / 00:00", bg=DARK_PANEL, fg=TEXT_COLOR, font=("Consolas", 9))
 
         speed_var = tk.StringVar(value="1.0x")
