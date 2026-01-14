@@ -20,6 +20,7 @@ import webbrowser
 import subprocess
 import shutil
 import tempfile
+import threading
 import hashlib
 import tkinter as tk
 import tkinter.ttk as ttk
@@ -97,7 +98,7 @@ LCB_Z = 1.0
 E621_MAX_TAGS = 40
 DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
-BUILD_STAMP = '2026-01-14c (UI polish: focus mode, info bars, separators)'
+BUILD_STAMP = '2026-01-14d (video controls revamp: seek ±5s, speed, fullscreen, waveform)'
 
 # -------------------- DB --------------------
 def init_db() -> sqlite3.Connection:
@@ -292,7 +293,7 @@ def record_result(conn: sqlite3.Connection, a: tuple, b: tuple, winner: Optional
 
     # Sidecars (async-ish, but safe in a short thread)
     try:
-        import threading
+        # import threading (moved to top-level)
         threading.Thread(target=update_image_metadata, args=(Path(a_path), float(new_a)), daemon=True).start()
         threading.Thread(target=update_image_metadata, args=(Path(b_path), float(new_b)), daemon=True).start()
     except Exception:
