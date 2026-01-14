@@ -16,6 +16,7 @@ from urllib.parse import quote_plus
 from PIL import Image, ImageTk, ImageSequence
 import tkinter as tk
 import tkinter.font as tkfont
+import tkinter.messagebox as messagebox
 
 # Optional: folder chart on quit
 try:
@@ -40,6 +41,8 @@ LINK_COLOR = "#4ea1ff"
 # -------------------- CONFIG --------------------
 DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
+POOL_FILTER_OPTIONS = ["All", "Images", "GIFs", "Videos", "Animated", "Hidden"]
+
 ROOT_DIR = r"I:\OneDrive\Discord Downloader Output\+\Grabber"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DB_PATH = SCRIPT_DIR / ".image_ranking.sqlite"
@@ -49,7 +52,10 @@ SIDEcar_DIR.mkdir(parents=True, exist_ok=True)
 EMBED_JPEG_EXIF = False
 WINDOW_SIZE = (1500, 950)
 
-SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+GIF_EXTS = {".gif"}
+VIDEO_EXTS = {".mp4", ".m4v", ".webm", ".mkv", ".avi", ".mov", ".wmv"}
+SUPPORTED_EXTS = IMAGE_EXTS | GIF_EXTS | VIDEO_EXTS
 K_FACTOR   = 32.0
 BASE_SCORE = 1000.0
 
@@ -206,8 +212,8 @@ def update_image_metadata(path: Path, score: float):
             print(f"[warn] EXIF embed failed for {path.name}: {e}")
 
 def record_result(conn, a, b, winner):
-    a_id, a_path, a_folder, a_duels, a_score = a
-    b_id, b_path, b_folder, b_duels, b_score = b
+    a_id, a_path, a_folder, a_duels, a_score, _a_wins_cur, _a_losses_cur = a
+    b_id, b_path, b_folder, b_duels, b_score, _b_wins_cur, _b_losses_cur = b
 
     a_wins = b_wins = 0
     a_losses = b_losses = 0
@@ -240,13 +246,19 @@ def record_result(conn, a, b, winner):
     threading.Thread(target=update_image_metadata, args=(Path(a_path), new_a), daemon=True).start()
     threading.Thread(target=update_image_metadata, args=(Path(b_path), new_b), daemon=True).start()
 
-def hide_image(conn, row):
+def set_image_hidden(conn, row, hidden: int):
     img_id, img_path = row[0], row[1]
-    conn.execute("UPDATE images SET hidden=1, last_seen=? WHERE id=?", (int(time.time()), img_id))
+    conn.execute("UPDATE images SET hidden=?, last_seen=? WHERE id=?", (hidden, int(time.time()), img_id))
     conn.commit()
-    print(f"[hide] removed from pool: {img_path}")
+    action = "unhide" if hidden == 0 else "hide"
+    print(f"[{action}] set hidden={hidden}: {img_path}")
 
-# -------------------- e621 link helper --------------------
+def hide_image(conn, row):
+    set_image_hidden(conn, row, 1)
+
+def unhide_image(conn, row):
+    set_image_hidden(conn, row, 0)
+
 def e621_url_for_path(path: str) -> Optional[str]:
     stem = Path(path).stem
     m = re.search(r"(\d+)$", stem) or re.search(r"(\d+)", stem)
@@ -291,6 +303,23 @@ class App:
         # right: sidebar (fixed width)
         self.sidebar = tk.Frame(self.container, bg=DARK_BG, bd=0, highlightthickness=0)
 
+        # ---- Pool filter ----
+        self.pool_filter_var = tk.StringVar(value="All")
+        self.pool_filter_row = tk.Frame(self.sidebar, bg=DARK_BG)
+        self.pool_filter_label = tk.Label(self.pool_filter_row, text="Pool:", font=("Segoe UI", 9),
+                                          fg=TEXT_COLOR, bg=DARK_BG)
+        self.pool_filter_label.pack(side="left")
+        self.pool_filter_menu = tk.OptionMenu(self.pool_filter_row, self.pool_filter_var, *POOL_FILTER_OPTIONS,
+                                             command=self.on_pool_filter_change)
+        self.pool_filter_menu.configure(bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT,
+                                        relief="flat", highlightthickness=0)
+        try:
+            self.pool_filter_menu["menu"].configure(bg=DARK_PANEL, fg=TEXT_COLOR)
+        except Exception:
+            pass
+        self.pool_filter_menu.pack(side="right", fill="x", expand=True, padx=(8, 0))
+
+
         # -------------------- Mouse controls --------------------
         self.left_panel.bind("<Button-1>",  lambda e: self.choose("a"))
         self.right_panel.bind("<Button-1>", lambda e: self.choose("b"))
@@ -329,6 +358,12 @@ class App:
         self.now = tk.Label(self.sidebar, text="", justify="left", font=("Segoe UI", 10),
                             fg=TEXT_COLOR, bg=DARK_BG)
 
+
+        self.stats_header = tk.Label(self.sidebar, text="Counters",
+                                     font=("Segoe UI", 11, "bold"), fg=ACCENT, bg=DARK_BG)
+        self.stats = tk.Label(self.sidebar, text="", justify="left", font=("Consolas", 9),
+                              fg=TEXT_COLOR, bg=DARK_BG)
+
         self.links_header = tk.Label(self.sidebar, text="Links",
                                      font=("Segoe UI", 11, "bold"), fg=ACCENT, bg=DARK_BG)
         self.link_left = tk.Label(self.sidebar, text="Left e621: (n/a)", fg=LINK_COLOR,
@@ -353,8 +388,25 @@ class App:
                                           bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT,
                                           relief="flat")
 
+        self.view_links_btn = tk.Button(self.sidebar, text="View/open e621 links",
+                                        command=self.show_links_view,
+                                        bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT,
+                                        relief="flat")
+
+        # Links viewer window state
+        self._links_window = None
+        self._links_listbox = None
+        self._links_count_label = None
+        self._links_common_label = None
+        self._links_status_label = None
+        self._links_open_cancel = False
         self.export_status = tk.Label(self.sidebar, text="", font=("Segoe UI", 9),
                                       fg=TEXT_COLOR, bg=DARK_BG)
+
+        self.db_stats_btn = tk.Button(self.sidebar, text="DB stats",
+                                     command=self.show_db_stats,
+                                     bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT,
+                                     relief="flat")
 
         self.keys_table = tk.Frame(self.sidebar, bg=DARK_PANEL, bd=1, relief="solid")
 
@@ -380,6 +432,10 @@ class App:
         root.bind("t", lambda e: self.toggle_metric())
         root.bind("g", lambda e: self.export_e621_links())
         root.bind("G", lambda e: self.export_e621_links())
+        root.bind("v", lambda e: self.show_links_view())
+        root.bind("V", lambda e: self.show_links_view())
+        root.bind("i", lambda e: self.show_db_stats())
+        root.bind("I", lambda e: self.show_db_stats())
 
         root.bind("<Configure>", self._on_configure)
 
@@ -395,11 +451,67 @@ class App:
         self._resize_job = self.root.after(120, self._refresh_images)
 
     # ---------- core flow ----------
-    def _visible_rows(self):
-        return list(self.conn.execute("SELECT id, path, folder, duels, score FROM images WHERE hidden=0"))
+
+    def on_pool_filter_change(self, value=None):
+        # When filter changes, start a fresh duel from the new pool.
+        try:
+            self.page = 0
+        except Exception:
+            pass
+        # Clear any export status noise
+        try:
+            self.export_status.configure(text="")
+        except Exception:
+            pass
+        self.load_duel()
+
+    def _media_kind(self, path: str) -> str:
+        ext = Path(path).suffix.lower()
+        if ext in VIDEO_EXTS:
+            return "video"
+        if ext in GIF_EXTS:
+            return "gif"
+        if ext in IMAGE_EXTS:
+            return "image"
+        return "other"
+
+    def _row_matches_filter(self, row) -> bool:
+        # row: (id, path, folder, duels, score, wins, losses)
+        kind = self._media_kind(row[1])
+        f = (self.pool_filter_var.get() or "All").strip()
+        if f == "All":
+            return kind in ("image", "gif", "video")
+        if f == "Images":
+            return kind == "image"
+        if f == "GIFs":
+            return kind == "gif"
+        if f == "Videos":
+            return kind == "video"
+        if f == "Animated":
+            return kind in ("gif", "video")
+        if f == "Hidden":
+            return kind in ("image", "gif", "video")
+        return kind in ("image", "gif", "video")
+
+    def _pool_rows(self):
+        f = (self.pool_filter_var.get() or "All").strip()
+        if f == "Hidden":
+            q = "SELECT id, path, folder, duels, score, wins, losses FROM images WHERE hidden=1"
+        else:
+            q = "SELECT id, path, folder, duels, score, wins, losses FROM images WHERE hidden=0"
+        rows = list(self.conn.execute(q))
+        rows = [r for r in rows if self._row_matches_filter(r)]
+        return rows
+
+    def pick_one(self, exclude_ids=None):
+        exclude_ids = set(exclude_ids or [])
+        rows = [r for r in self._pool_rows() if r[0] not in exclude_ids]
+        if not rows:
+            return None
+        return random.choice(rows)
 
     def pick_two(self):
-        rows = self._visible_rows()
+        rows = self._pool_rows()
         if len(rows) < 2:
             return None, None
         a = random.choice(rows)
@@ -407,7 +519,6 @@ class App:
         while b[0] == a[0]:
             b = random.choice(rows)
         return a, b
-
     def load_duel(self):
         a, b = self.pick_two()
         if not a or not b:
@@ -420,16 +531,44 @@ class App:
         self.prev_artists.appendleft(b[2])
 
         print("[duel] showing:")
-        print("  LEFT: ", a[1], f"(score={a[4]:.2f}, duels={a[3]})")
-        print("  RIGHT:", b[1], f"(score={b[4]:.2f}, duels={b[3]})")
+        print("  LEFT: ", a[1], f"(score={a[4]:.2f}, duels={a[3]}, W={a[5]}, L={a[6]})")
+        print("  RIGHT:", b[1], f"(score={b[4]:.2f}, duels={b[3]}, W={b[5]}, L={b[6]})")
 
-        self._render_img(self.left_panel, a[1])
-        self._render_img(self.right_panel, b[1])
+        self._render_media(self.left_panel, a[1])
+        self._render_media(self.right_panel, b[1])
 
         self.update_sidebar(a[2], b[2])
         self.root.after(50, self._refresh_images)
 
     # ---------- image display (with GIF support) ----------
+    def _render_media(self, widget, path):
+        ext = Path(path).suffix.lower()
+        if ext in VIDEO_EXTS:
+            # Stop any prior animation
+            if hasattr(widget, "_anim_job") and widget._anim_job:
+                try:
+                    self.root.after_cancel(widget._anim_job)
+                except Exception:
+                    pass
+                widget._anim_job = None
+            # Placeholder (video preview is intentionally lightweight)
+            self.root.update_idletasks()
+            w = max(1, widget.winfo_width())
+            wrap = max(100, w - 24)
+            name = Path(path).name
+            widget.configure(image="", text=f"[VIDEO]\n{name}\n\n(Double-click to open)",
+                             fg=TEXT_COLOR, bg=DARK_PANEL, justify="center",
+                             font=("Consolas", 12), wraplength=wrap,
+                             borderwidth=0, highlightthickness=0)
+            widget.image = None
+            return
+        # Images / GIFs
+        try:
+            widget.configure(text="")
+        except Exception:
+            pass
+        self._render_img(widget, path)
+
     def _render_img(self, widget, path):
         if hasattr(widget, "_anim_job") and widget._anim_job:
             try:
@@ -497,8 +636,8 @@ class App:
     def _refresh_images(self):
         if self.current:
             a, b = self.current
-            self._render_img(self.left_panel, a[1])
-            self._render_img(self.right_panel, b[1])
+            self._render_media(self.left_panel, a[1])
+            self._render_media(self.right_panel, b[1])
 
     # ---------- sidebar ----------
     def _metric_human(self):
@@ -565,38 +704,55 @@ class App:
         for w in self.keys_table.winfo_children():
             w.destroy()
 
-        hdr_font  = ("Segoe UI", 10, "bold")
-        key_font  = ("Consolas", 9)
-        bind_font = ("Segoe UI Emoji", 10)
+        hdr_font    = ("Segoe UI", 9, "bold")
+        key_font    = ("Consolas", 9)
+        action_font = ("Segoe UI", 9)
 
-        def H(c, text):
-            tk.Label(self.keys_table, text=text, font=hdr_font, fg=ACCENT, bg=DARK_PANEL, anchor="w") \
-              .grid(row=0, column=c, sticky="we", padx=(8 if c in (0, 2) else 6), pady=(6, 3))
+        def header(col, text):
+            lbl = tk.Label(
+                self.keys_table,
+                text=text,
+                font=hdr_font,
+                fg=ACCENT,
+                bg=DARK_PANEL,
+                anchor="w",
+            )
+            lbl.grid(row=0, column=col, sticky="we", padx=(8 if col in (0, 2) else 6), pady=(6, 3))
 
-        H(0, "Key"); H(1, "Bind"); H(2, "Key"); H(3, "Bind")
+        header(0, "Key"); header(1, "Action"); header(2, "Key"); header(3, "Action")
 
-        # ICON-ONLY binds (custom)
         rows = [
-            ("L_Mouse",  "🔺",  "R_Mouse, 3", "🔻"),
-            ("1, 2",     "🔺",  "0, Space",   "↺"),
-            ("M_Mouse",  "✖",  "X/M",        "✖"),
-            ("O/P",      "🖼",  "⇪O/⇪P",      "📂"),
-            ("Q",        "🚪",  "T",          "⚙"),
+            ("L-Click image",    "Pick clicked",        "1",        "Pick LEFT"),
+            ("R-Click image",    "Downvote both",       "2",        "Pick RIGHT"),
+            ("M-Click image",    "Hide clicked",        "3",        "Downvote both"),
+            ("Dbl-Click image",  "Open clicked",        "X",        "Hide LEFT"),
+            ("0 / Space",        "Skip/tie",            "M",        "Hide RIGHT"),
+            ("O",                "Open LEFT image",     "P",        "Open RIGHT image"),
+            ("Shift+O",          "Reveal LEFT folder",  "Shift+P",  "Reveal RIGHT folder"),
+            ("[ / PgUp",         "Prev page",           "] / PgDn", "Next page"),
+            ("T",                "Toggle metric",       "G",        "Export e621 links"),
+            ("V",                "Links viewer",        "I",        "DB stats"),
+            ("Q",                "Quit",                "",         ""),
         ]
 
-        for r, (k1, b1, k2, b2) in enumerate(rows, start=1):
-            tk.Label(self.keys_table, text=k1, font=key_font,  fg=TEXT_COLOR, bg=DARK_PANEL, anchor="w") \
-              .grid(row=r, column=0, sticky="we", padx=(8, 6))
-            tk.Label(self.keys_table, text=b1, font=bind_font, fg=TEXT_COLOR, bg=DARK_PANEL, anchor="w") \
-              .grid(row=r, column=1, sticky="we", padx=(6, 12))
-            tk.Label(self.keys_table, text=k2, font=key_font,  fg=TEXT_COLOR, bg=DARK_PANEL, anchor="e") \
-              .grid(row=r, column=2, sticky="we", padx=(8, 6))
-            tk.Label(self.keys_table, text=b2, font=bind_font, fg=TEXT_COLOR, bg=DARK_PANEL, anchor="e") \
-              .grid(row=r, column=3, sticky="we", padx=(6, 8))
+        for r, (k1, a1, k2, a2) in enumerate(rows, start=1):
+            lbl_k1 = tk.Label(self.keys_table, text=k1, font=key_font, fg=TEXT_COLOR, bg=DARK_PANEL, anchor="w")
+            lbl_k1.grid(row=r, column=0, sticky="we", padx=(8, 6))
 
-        # stretch columns evenly across the frame width
-        for c in range(4):
-            self.keys_table.grid_columnconfigure(c, weight=1, uniform="keys")
+            lbl_a1 = tk.Label(self.keys_table, text=a1, font=action_font, fg=TEXT_COLOR, bg=DARK_PANEL, anchor="w")
+            lbl_a1.grid(row=r, column=1, sticky="we", padx=(6, 12))
+
+            lbl_k2 = tk.Label(self.keys_table, text=k2, font=key_font, fg=TEXT_COLOR, bg=DARK_PANEL, anchor="w")
+            lbl_k2.grid(row=r, column=2, sticky="we", padx=(8, 6))
+
+            lbl_a2 = tk.Label(self.keys_table, text=a2, font=action_font, fg=TEXT_COLOR, bg=DARK_PANEL, anchor="w")
+            lbl_a2.grid(row=r, column=3, sticky="we", padx=(6, 8))
+
+        # Compact layout: keep keys tight; let action columns expand
+        self.keys_table.grid_columnconfigure(0, weight=0)
+        self.keys_table.grid_columnconfigure(1, weight=1)
+        self.keys_table.grid_columnconfigure(2, weight=0)
+        self.keys_table.grid_columnconfigure(3, weight=1)
 
     def update_sidebar(self, folder_left, folder_right):
         leader = folder_leaderboard(self.conn, metric=self.metric)
@@ -610,13 +766,18 @@ class App:
         self._ensure_sidebar_width(lines_all)
 
         for w in (self.leader_header, self.metric_label, self.page_label,
+                  self.pool_filter_row,
                   self.board, self.nav_row, self.now_header, self.now,
-                  self.links_header, self.link_left, self.link_right, self.search_header, self.common_tags_entry, self.export_links_btn, self.export_status, self.keys_table):
+                  self.stats_header, self.stats,
+                  self.links_header, self.link_left, self.link_right,
+                  self.search_header, self.common_tags_entry, self.export_links_btn,
+                  self.view_links_btn, self.export_status, self.db_stats_btn, self.keys_table):
             w.pack_forget()
 
         self.leader_header.pack(anchor="w")
         self.metric_label.configure(text=f"[Metric: {self._metric_human()}]")
         self.metric_label.pack(anchor="w")
+        self.pool_filter_row.pack(fill="x", pady=(2, 4))
         self.page_label.configure(text=f"Page {self.page+1}/{total_pages}  (total {total})")
         self.page_label.pack(anchor="e", pady=(0,4))
 
@@ -670,6 +831,40 @@ class App:
         self.now.configure(text="\n".join([l_line, r_line] + prev_display))
         self.now.pack(anchor="w", pady=(2, 6))
 
+        # Counters (helps verify whether the DB has meaningful history)
+        if self.current:
+            a, b = self.current
+
+            def folder_totals(folder: str):
+                row = self.conn.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(duels),0), COALESCE(SUM(wins),0), COALESCE(SUM(losses),0) "
+                    "FROM images WHERE folder=?",
+                    (folder,),
+                ).fetchone()
+                n = int(row[0] or 0)
+                shown = int(row[1] or 0)
+                wins = int(row[2] or 0)
+                losses = int(row[3] or 0)
+                return n, shown, wins, losses
+
+            ln, lshown, lw, ll = folder_totals(folder_left)
+            rn, rshown, rw, rl = folder_totals(folder_right)
+            ldec = lw + ll
+            rdec = rw + rl
+
+            stats_lines = [
+                f"L img: shown={a[3]}  W={a[5]}  L={a[6]}  score={a[4]:.1f}",
+                f"R img: shown={b[3]}  W={b[5]}  L={b[6]}  score={b[4]:.1f}",
+                f"L artist: imgs={ln}  shown={lshown}  decisions={ldec}  (W={lw} L={ll})",
+                f"R artist: imgs={rn}  shown={rshown}  decisions={rdec}  (W={rw} L={rl})",
+            ]
+        else:
+            stats_lines = ["(no active duel)"]
+
+        self.stats.configure(text="\n".join(stats_lines))
+        self.stats_header.pack(anchor="w")
+        self.stats.pack(anchor="w", pady=(2, 6))
+
         self.links_header.pack(anchor="w")
         if self.current:
             a, b = self.current
@@ -692,7 +887,9 @@ class App:
         self.search_header.pack(anchor="w")
         self.common_tags_entry.pack(fill="x", pady=(2, 6))
         self.export_links_btn.pack(fill="x", pady=(0, 2))
+        self.view_links_btn.pack(fill="x", pady=(0, 6))
         self.export_status.pack(anchor="w", pady=(0, 6))
+        self.db_stats_btn.pack(fill="x", pady=(0, 10))
 
         # Build keys table and make it match the sidebar width
         self._build_keys_table()
@@ -707,10 +904,37 @@ class App:
         self.load_duel()
 
     def hide(self, which):
-        if not self.current: return
+        if not self.current:
+            return
         a, b = self.current
-        hide_image(self.conn, a if which == "a" else b)
-        self.load_duel()
+        victim = a if which == "a" else b
+        survivor = b if which == "a" else a
+
+        # In Hidden mode, M-click acts as "unhide"; otherwise it hides.
+        f = (self.pool_filter_var.get() or "All").strip()
+        if f == "Hidden":
+            unhide_image(self.conn, victim)
+        else:
+            hide_image(self.conn, victim)
+
+        # Replace only the removed side with a new random item from the current pool.
+        replacement = self.pick_one(exclude_ids=[survivor[0], victim[0]])
+        if not replacement:
+            # Fallback: if we cannot find a replacement, reset the duel.
+            self.load_duel()
+            return
+
+        if which == "a":
+            self.current = (replacement, survivor)
+            self.prev_artists.appendleft(replacement[2])
+            self._render_media(self.left_panel, replacement[1])
+        else:
+            self.current = (survivor, replacement)
+            self.prev_artists.appendleft(replacement[2])
+            self._render_media(self.right_panel, replacement[1])
+
+        self.update_sidebar(self.current[0][2], self.current[1][2])
+        self.root.after(50, self._refresh_images)
 
     def _open_url(self, url):
         if url and url.startswith("http"):
@@ -740,6 +964,68 @@ class App:
     def quit(self):
         print("[quit] closing UI")
         self.root.quit()
+
+
+    def show_db_stats(self):
+        """Show summary statistics to help verify whether the DB has been reset."""
+        try:
+            images_total = int(self.conn.execute("SELECT COUNT(*) FROM images").fetchone()[0] or 0)
+            visible_total = int(self.conn.execute("SELECT COUNT(*) FROM images WHERE hidden=0").fetchone()[0] or 0)
+            comps_total = int(self.conn.execute("SELECT COUNT(*) FROM comparisons").fetchone()[0] or 0)
+            min_ts, max_ts = self.conn.execute("SELECT MIN(ts), MAX(ts) FROM comparisons").fetchone()
+            sum_duels, sum_wins, sum_losses = self.conn.execute(
+                "SELECT COALESCE(SUM(duels),0), COALESCE(SUM(wins),0), COALESCE(SUM(losses),0) FROM images"
+            ).fetchone()
+
+            sum_duels = int(sum_duels or 0)
+            sum_wins = int(sum_wins or 0)
+            sum_losses = int(sum_losses or 0)
+
+            expected_sum_duels = comps_total * 2
+            delta = sum_duels - expected_sum_duels
+
+            def fmt_ts(ts):
+                if not ts:
+                    return "n/a"
+                try:
+                    return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    return str(ts)
+
+            db_mtime = "n/a"
+            try:
+                db_mtime = datetime.fromtimestamp(DB_PATH.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                pass
+
+            msg = (
+                f"DB file: {DB_PATH}\n"
+                f"DB modified: {db_mtime}\n\n"
+                f"Images: {images_total} (visible: {visible_total})\n"
+                f"Comparisons (duels): {comps_total}\n"
+                f"First duel: {fmt_ts(min_ts)}\n"
+                f"Last duel:  {fmt_ts(max_ts)}\n\n"
+                f"Image counters total:\n"
+                f"  shown (SUM duels): {sum_duels}\n"
+                f"  decisions (SUM wins+losses): {sum_wins + sum_losses}  [W={sum_wins}, L={sum_losses}]\n\n"
+                f"Consistency check:\n"
+                f"  expected SUM duels ≈ comparisons*2 = {expected_sum_duels}\n"
+                f"  actual   SUM duels = {sum_duels}\n"
+                f"  delta           = {delta}\n\n"
+                "Notes:\n"
+                "• If 'Comparisons' is near 0 and you expected lots of history, the DB was likely replaced/reset.\n"
+                "• 'shown' increases even on skips; 'decisions' only increases on wins/losses (including downvotes)."
+            )
+            try:
+                messagebox.showinfo("DB stats", msg)
+            except Exception:
+                print(msg)
+        except Exception as e:
+            try:
+                messagebox.showerror("DB stats failed", str(e))
+            except Exception:
+                print("[db] stats failed:", e)
+
 
 
     # ---------- e621 link export ----------
@@ -805,9 +1091,7 @@ class App:
     def export_e621_links(self):
         """Write ranked e621 search URLs to e621_links.txt and copy to clipboard."""
         try:
-            common = self._parse_common_tags()
-            artists = self._ranked_artist_tags()
-            urls = self._build_e621_urls(common, artists)
+            urls, common, artists = self._get_e621_urls()
         except Exception as e:
             msg = f"Export failed: {e}"
             print("[e621] " + msg)
@@ -845,6 +1129,281 @@ class App:
         print("[e621] " + msg)
         if hasattr(self, "export_status"):
             self.export_status.configure(text=msg)
+
+
+    def _get_e621_urls(self):
+        """Return (urls, common_tags, artist_tags) for the current settings."""
+        common = self._parse_common_tags()
+        artists = self._ranked_artist_tags()
+        urls = self._build_e621_urls(common, artists)
+        return urls, common, artists
+
+    def show_links_view(self):
+        """Open a window that shows the generated e621 links and allows opening them."""
+        try:
+            urls, common, artists = self._get_e621_urls()
+        except Exception as e:
+            msg = f"Link generation failed: {e}"
+            print("[e621] " + msg)
+            if hasattr(self, "export_status"):
+                self.export_status.configure(text=msg)
+            try:
+                messagebox.showerror("e621 link generation failed", msg)
+            except Exception:
+                pass
+            return
+
+        if self._links_window and self._links_window.winfo_exists():
+            try:
+                self._links_window.deiconify()
+                self._links_window.lift()
+                self._links_window.focus_force()
+            except Exception:
+                pass
+        else:
+            self._create_links_window()
+
+        self._links_view_set_data(urls, common, len(artists))
+
+    def _create_links_window(self):
+        win = tk.Toplevel(self.root)
+        win.title("e621 search links")
+        win.geometry("1000x650")
+        win.configure(bg=DARK_BG)
+        self._links_window = win
+
+        def on_close():
+            self._links_open_cancel = True
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            self._links_window = None
+            self._links_listbox = None
+            self._links_count_label = None
+            self._links_common_label = None
+            self._links_status_label = None
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
+
+        info_frame = tk.Frame(win, bg=DARK_BG)
+        info_frame.pack(fill="x", padx=10, pady=(10, 6))
+
+        self._links_count_label = tk.Label(
+            info_frame, text="Links: 0", font=("Segoe UI", 10, "bold"),
+            fg=ACCENT, bg=DARK_BG, anchor="w"
+        )
+        self._links_count_label.pack(side="left", fill="x", expand=True)
+
+        self._links_common_label = tk.Label(
+            info_frame, text="", font=("Consolas", 9),
+            fg=TEXT_COLOR, bg=DARK_BG, anchor="e", justify="right"
+        )
+        self._links_common_label.pack(side="right")
+
+        btn_frame = tk.Frame(win, bg=DARK_BG)
+        btn_frame.pack(fill="x", padx=10, pady=(0, 8))
+
+        btn_refresh = tk.Button(
+            btn_frame, text="Refresh", command=self._links_view_refresh,
+            bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat"
+        )
+        btn_copy = tk.Button(
+            btn_frame, text="Copy all", command=self._links_view_copy_all,
+            bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat"
+        )
+        btn_open_sel = tk.Button(
+            btn_frame, text="Open selected", command=self._links_view_open_selected,
+            bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat"
+        )
+        btn_open_all = tk.Button(
+            btn_frame, text="Open all", command=self._links_view_open_all,
+            bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat"
+        )
+        btn_stop = tk.Button(
+            btn_frame, text="Stop opening", command=self._links_view_stop_opening,
+            bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat"
+        )
+        btn_open_file = tk.Button(
+            btn_frame, text="Open links file", command=self._links_view_open_file,
+            bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat"
+        )
+
+        for b in (btn_refresh, btn_copy, btn_open_sel, btn_open_all, btn_stop, btn_open_file):
+            b.pack(side="left", padx=(0, 8))
+
+        list_frame = tk.Frame(win, bg=DARK_BG)
+        list_frame.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+
+        # Use grid here so the horizontal scrollbar spans the full width and behaves reliably.
+        list_frame.grid_rowconfigure(0, weight=1)
+        list_frame.grid_columnconfigure(0, weight=1)
+
+        yscroll = tk.Scrollbar(list_frame, orient="vertical")
+        xscroll = tk.Scrollbar(list_frame, orient="horizontal")
+
+        lb = tk.Listbox(
+            list_frame, font=("Consolas", 9),
+            bg=DARK_PANEL, fg=TEXT_COLOR, selectbackground=ACCENT,
+            activestyle="none",
+            yscrollcommand=yscroll.set, xscrollcommand=xscroll.set
+        )
+        yscroll.config(command=lb.yview)
+        xscroll.config(command=lb.xview)
+
+        lb.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="we")
+
+        lb.bind("<Double-Button-1>", lambda e: self._links_view_open_selected())
+
+        self._links_listbox = lb
+
+        self._links_status_label = tk.Label(
+            win, text="", font=("Segoe UI", 9),
+            fg=TEXT_COLOR, bg=DARK_BG, anchor="w", justify="left"
+        )
+        self._links_status_label.pack(fill="x", padx=10, pady=(0, 10))
+
+    def _links_view_set_data(self, urls: list[str], common_tags: list[str], artist_count: int):
+        if not (self._links_window and self._links_window.winfo_exists() and self._links_listbox):
+            return
+
+        self._links_listbox.delete(0, "end")
+        for u in urls:
+            self._links_listbox.insert("end", u)
+
+        # Ensure the view starts at the left/top after refresh (helps when long URLs are present).
+        try:
+            self._links_listbox.yview_moveto(0.0)
+            self._links_listbox.xview_moveto(0.0)
+        except Exception:
+            pass
+
+        if self._links_count_label:
+            self._links_count_label.configure(text=f"Links: {len(urls)}   (artists: {artist_count})")
+
+        common_str = " ".join(common_tags) if common_tags else "(none)"
+        common_display = (common_str[:137] + "...") if len(common_str) > 140 else common_str
+        if self._links_common_label:
+            self._links_common_label.configure(text=f"Common tags: {common_display}")
+
+        if self._links_status_label:
+            self._links_status_label.configure(text="")
+
+    def _links_view_refresh(self):
+        try:
+            urls, common, artists = self._get_e621_urls()
+            self._links_view_set_data(urls, common, len(artists))
+        except Exception as e:
+            try:
+                messagebox.showerror("Refresh failed", str(e))
+            except Exception:
+                pass
+
+    def _links_view_get_urls(self) -> list[str]:
+        if not self._links_listbox:
+            return []
+        return [self._links_listbox.get(i) for i in range(self._links_listbox.size())]
+
+    def _links_view_get_selected_urls(self) -> list[str]:
+        if not self._links_listbox:
+            return []
+        sel = list(self._links_listbox.curselection())
+        if not sel:
+            try:
+                idx = int(self._links_listbox.index("active"))
+                if 0 <= idx < self._links_listbox.size():
+                    sel = [idx]
+            except Exception:
+                sel = []
+        return [self._links_listbox.get(i) for i in sel]
+
+    def _links_view_open_selected(self):
+        urls = self._links_view_get_selected_urls()
+        if not urls:
+            try:
+                messagebox.showinfo("Open selected", "Select a link first.")
+            except Exception:
+                pass
+            return
+        self._open_urls_staggered(urls)
+
+    def _links_view_open_all(self):
+        urls = self._links_view_get_urls()
+        if not urls:
+            try:
+                messagebox.showinfo("Open all", "No links to open.")
+            except Exception:
+                pass
+            return
+        try:
+            ok = messagebox.askyesno("Open all links", f"This will open {len(urls)} browser tab(s). Continue?")
+        except Exception:
+            ok = True
+        if not ok:
+            return
+        self._open_urls_staggered(urls)
+
+    def _links_view_stop_opening(self):
+        self._links_open_cancel = True
+        if self._links_status_label:
+            self._links_status_label.configure(text="Stopped.")
+
+    def _open_urls_staggered(self, urls: list[str], delay_ms: int = 150):
+        self._links_open_cancel = False
+        total = len(urls)
+
+        def step(i: int):
+            if self._links_open_cancel:
+                return
+            if i >= total:
+                if self._links_status_label:
+                    self._links_status_label.configure(text=f"Opened {total} link(s).")
+                return
+
+            url = urls[i]
+            try:
+                webbrowser.open(url)
+            except Exception as e:
+                print("[link] open failed:", e)
+
+            if self._links_status_label:
+                self._links_status_label.configure(text=f"Opening {i+1}/{total}...")
+
+            self.root.after(delay_ms, lambda: step(i + 1))
+
+        step(0)
+
+    def _links_view_copy_all(self):
+        urls = self._links_view_get_urls()
+        if not urls:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append("\n".join(urls))
+            self.root.update()
+            if self._links_status_label:
+                self._links_status_label.configure(text=f"Copied {len(urls)} link(s) to clipboard.")
+        except Exception as e:
+            try:
+                messagebox.showerror("Copy failed", str(e))
+            except Exception:
+                pass
+
+    def _links_view_open_file(self):
+        out_path = SCRIPT_DIR / "e621_links.txt"
+        try:
+            if not out_path.exists():
+                urls, _, _ = self._get_e621_urls()
+                out_path.write_text("\n".join(urls) + "\n", encoding="utf-8")
+            os.startfile(str(out_path))
+        except Exception as e:
+            try:
+                messagebox.showerror("Open file failed", str(e))
+            except Exception:
+                pass
+
 
 # -------------------- Report on quit --------------------
 def export_csv(conn, path: Path):
