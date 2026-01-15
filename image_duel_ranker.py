@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-01-15f
-# Update: Short-circuit audio-video scanning once a tagged audio video is found.
-# Build: 2026-01-15f (short-circuit audio-video scanning once a tagged audio video is found)
+# Version: 2026-01-15g
+# Update: Scan until two audio-tagged videos are available for the audio filter.
+# Build: 2026-01-15g (scan until two audio-tagged videos are available for the audio filter)
 
 import os
 import sys
@@ -100,7 +100,7 @@ LCB_Z = 1.0
 E621_MAX_TAGS = 40
 DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
-BUILD_STAMP = '2026-01-15f (short-circuit audio-video scanning once a tagged audio video is found)'
+BUILD_STAMP = '2026-01-15g (scan until two audio-tagged videos are available for the audio filter)'
 
 # -------------------- DB --------------------
 def init_db() -> sqlite3.Connection:
@@ -805,12 +805,12 @@ class App:
                 tagged.append(row)
             elif tag is None:
                 untagged.append(row)
-        if tagged:
-            return tagged
-        for row in untagged:
-            if self._video_has_audio(row[1]):
-                tagged.append(row)
-                break
+        if len(tagged) < 2:
+            for row in untagged:
+                if self._video_has_audio(row[1]):
+                    tagged.append(row)
+                    if len(tagged) >= 2:
+                        break
         return tagged
 
     def _pool_rows(self) -> List[tuple]:
