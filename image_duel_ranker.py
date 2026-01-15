@@ -1,6 +1,6 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Build: 2026-01-14f (waveform: +~18% height for clearer peaks)
+# Build: 2026-01-15a (filter: videos with audio)
 
 import os
 import sys
@@ -98,7 +98,7 @@ LCB_Z = 1.0
 E621_MAX_TAGS = 40
 DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
-BUILD_STAMP = '2026-01-14f (waveform: +~18% height for clearer peaks)'
+BUILD_STAMP = '2026-01-15a (filter: videos with audio)'
 
 # -------------------- DB --------------------
 def init_db() -> sqlite3.Connection:
@@ -340,6 +340,7 @@ class App:
         self.metric = LEADERBOARD_METRIC_DEFAULT
         self._last_ranks = {r["folder"]: r["rank"] for r in folder_leaderboard(self.conn, metric=self.metric)}
         self._resize_job = None
+        self._audio_cache = {}
 
         # video state per side
         self.vlc_instance = None
@@ -448,7 +449,7 @@ class App:
         self.pool_filter = ttk.Combobox(
             self.pool_filter_row,
             textvariable=self.pool_filter_var,
-            values=["All", "Images", "GIFs", "Videos", "Animated", "Hidden"],
+            values=["All", "Images", "GIFs", "Videos", "Videos (audio)", "Animated", "Hidden"],
             state="readonly",
             width=12,
         )
@@ -667,6 +668,44 @@ class App:
             return "gif"
         return "image"
 
+    def _video_has_audio(self, path: str) -> bool:
+        try:
+            mtime = int(os.path.getmtime(path))
+        except Exception:
+            mtime = 0
+        cache_key = f"{path}|{mtime}"
+        cached = self._audio_cache.get(cache_key)
+        if cached is not None:
+            return bool(cached)
+
+        has_audio = False
+        ffmpeg = self._ffmpeg_exe()
+        if ffmpeg and os.path.exists(path):
+            ffprobe = shutil.which("ffprobe")
+            if ffprobe:
+                cmd = [
+                    ffprobe, "-v", "error",
+                    "-select_streams", "a",
+                    "-show_entries", "stream=index",
+                    "-of", "csv=p=0",
+                    path,
+                ]
+                try:
+                    r = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    has_audio = bool((r.stdout or "").strip())
+                except Exception:
+                    has_audio = False
+            else:
+                cmd = [ffmpeg, "-hide_banner", "-i", path]
+                try:
+                    r = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    has_audio = "audio:" in (r.stderr or "").lower()
+                except Exception:
+                    has_audio = False
+
+        self._audio_cache[cache_key] = bool(has_audio)
+        return bool(has_audio)
+
     def _row_matches_filter(self, row: tuple) -> bool:
         # row: (id, path, folder, duels, wins, losses, score, hidden)
         hidden = int(row[7] or 0)
@@ -686,6 +725,8 @@ class App:
             return kind == "gif"
         if f == "Videos":
             return kind == "video"
+        if f == "Videos (audio)":
+            return kind == "video" and self._video_has_audio(row[1])
         if f == "Animated":
             return kind in ("gif", "video")
         return True
