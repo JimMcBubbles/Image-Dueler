@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-01-15d
-# Update: Persist audio sidecar tags when probing videos for the audio filter.
-# Build: 2026-01-15d (persist audio sidecar tags for audio filter)
+# Version: 2026-01-15e
+# Update: Log audio sidecar tag updates and accept more audio tag values for filtering.
+# Build: 2026-01-15e (log audio sidecar tag updates and accept more audio tag values for filtering)
 
 import os
 import sys
@@ -100,7 +100,7 @@ LCB_Z = 1.0
 E621_MAX_TAGS = 40
 DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
-BUILD_STAMP = '2026-01-15d (persist audio sidecar tags for audio filter)'
+BUILD_STAMP = '2026-01-15e (log audio sidecar tag updates and accept more audio tag values for filtering)'
 
 # -------------------- DB --------------------
 def init_db() -> sqlite3.Connection:
@@ -735,10 +735,13 @@ class App:
             data = json.loads(sidecar_path.read_text(encoding="utf-8"))
         except Exception:
             return None
-        tag = str(data.get("audio", "")).strip().upper()
-        if tag == "Y":
+        raw_tag = data.get("audio", "")
+        if isinstance(raw_tag, bool):
+            return raw_tag
+        tag = str(raw_tag).strip().upper()
+        if tag in {"Y", "YES", "TRUE", "1"}:
             return True
-        if tag == "N":
+        if tag in {"N", "NO", "FALSE", "0"}:
             return False
         return None
 
@@ -756,6 +759,7 @@ class App:
                 json.dumps(data, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            print(f"[audio] {Path(path).name} -> {data['audio']} ({sidecar_path})")
         except Exception:
             pass
 
