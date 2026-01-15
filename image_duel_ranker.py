@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-01-15e
-# Update: Log audio sidecar tag updates and accept more audio tag values for filtering.
-# Build: 2026-01-15e (log audio sidecar tag updates and accept more audio tag values for filtering)
+# Version: 2026-01-15f
+# Update: Short-circuit audio-video scanning once a tagged audio video is found.
+# Build: 2026-01-15f (short-circuit audio-video scanning once a tagged audio video is found)
 
 import os
 import sys
@@ -100,7 +100,7 @@ LCB_Z = 1.0
 E621_MAX_TAGS = 40
 DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
-BUILD_STAMP = '2026-01-15e (log audio sidecar tag updates and accept more audio tag values for filtering)'
+BUILD_STAMP = '2026-01-15f (short-circuit audio-video scanning once a tagged audio video is found)'
 
 # -------------------- DB --------------------
 def init_db() -> sqlite3.Connection:
@@ -793,11 +793,33 @@ class App:
             return kind in ("gif", "video")
         return True
 
+    def _pool_rows_videos_with_audio(self, rows: List[tuple]) -> List[tuple]:
+        tagged: List[tuple] = []
+        untagged: List[tuple] = []
+        for row in rows:
+            hidden = int(row[7] or 0)
+            if hidden == 1 or self._media_kind(row[1]) != "video":
+                continue
+            tag = self._sidecar_audio_tag(row[1])
+            if tag is True:
+                tagged.append(row)
+            elif tag is None:
+                untagged.append(row)
+        if tagged:
+            return tagged
+        for row in untagged:
+            if self._video_has_audio(row[1]):
+                tagged.append(row)
+                break
+        return tagged
+
     def _pool_rows(self) -> List[tuple]:
         rows = list(self.conn.execute("""
             SELECT id, path, folder, duels, wins, losses, score, hidden
             FROM images
         """))
+        if self.pool_filter_var.get() == "Videos (audio)":
+            return self._pool_rows_videos_with_audio(rows)
         rows = [r for r in rows if self._row_matches_filter(r)]
         return rows
 
