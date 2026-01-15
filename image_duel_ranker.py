@@ -1,6 +1,6 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Build: 2026-01-14f (waveform: +~18% height for clearer peaks)
+# Build: 2026-01-15b (video audio filter async probe)
 
 import os
 import sys
@@ -98,7 +98,7 @@ LCB_Z = 1.0
 E621_MAX_TAGS = 40
 DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
-BUILD_STAMP = '2026-01-14f (waveform: +~18% height for clearer peaks)'
+BUILD_STAMP = '2026-01-15b (video audio filter async probe)'
 
 # -------------------- DB --------------------
 def init_db() -> sqlite3.Connection:
@@ -340,6 +340,8 @@ class App:
         self.metric = LEADERBOARD_METRIC_DEFAULT
         self._last_ranks = {r["folder"]: r["rank"] for r in folder_leaderboard(self.conn, metric=self.metric)}
         self._resize_job = None
+        self._audio_cache = {}
+        self._audio_jobs = {}
 
         # video state per side
         self.vlc_instance = None
@@ -448,7 +450,7 @@ class App:
         self.pool_filter = ttk.Combobox(
             self.pool_filter_row,
             textvariable=self.pool_filter_var,
-            values=["All", "Images", "GIFs", "Videos", "Animated", "Hidden"],
+            values=["All", "Images", "GIFs", "Videos", "Videos (audio)", "Animated", "Hidden"],
             state="readonly",
             width=12,
         )
@@ -667,6 +669,64 @@ class App:
             return "gif"
         return "image"
 
+    def _audio_cache_key(self, path: str) -> str:
+        try:
+            mtime = int(os.path.getmtime(path))
+        except Exception:
+            mtime = 0
+        return f"{path}|{mtime}"
+
+    def _video_has_audio(self, path: str) -> Optional[bool]:
+        cache_key = self._audio_cache_key(path)
+        cached = self._audio_cache.get(cache_key)
+        if cached is not None:
+            return bool(cached)
+
+        if cache_key not in self._audio_jobs:
+            t = threading.Thread(target=self._probe_audio_worker, args=(path, cache_key), daemon=True)
+            self._audio_jobs[cache_key] = t
+            t.start()
+        return None
+
+    def _probe_audio_worker(self, path: str, cache_key: str) -> None:
+        has_audio = False
+        ffmpeg = self._ffmpeg_exe()
+        if ffmpeg and os.path.exists(path):
+            ffprobe = shutil.which("ffprobe")
+            if ffprobe:
+                cmd = [
+                    ffprobe, "-v", "error",
+                    "-select_streams", "a",
+                    "-show_entries", "stream=index",
+                    "-of", "csv=p=0",
+                    path,
+                ]
+                try:
+                    r = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    has_audio = bool((r.stdout or b"").strip())
+                except Exception:
+                    has_audio = False
+            else:
+                cmd = [ffmpeg, "-hide_banner", "-i", path]
+                try:
+                    r = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    err = (r.stderr or b"").decode("utf-8", errors="ignore").lower()
+                    has_audio = "audio:" in err
+                except Exception:
+                    has_audio = False
+
+        def done() -> None:
+            if cache_key in self._audio_jobs:
+                self._audio_jobs.pop(cache_key, None)
+            self._audio_cache[cache_key] = bool(has_audio)
+            if self.pool_filter_var.get() == "Videos (audio)":
+                self.on_pool_filter_change()
+
+        try:
+            self.root.after(0, done)
+        except Exception:
+            done()
+
     def _row_matches_filter(self, row: tuple) -> bool:
         # row: (id, path, folder, duels, wins, losses, score, hidden)
         hidden = int(row[7] or 0)
@@ -686,6 +746,9 @@ class App:
             return kind == "gif"
         if f == "Videos":
             return kind == "video"
+        if f == "Videos (audio)":
+            has_audio = self._video_has_audio(row[1])
+            return kind == "video" and bool(has_audio)
         if f == "Animated":
             return kind in ("gif", "video")
         return True
