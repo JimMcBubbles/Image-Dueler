@@ -1606,7 +1606,17 @@ class App:
                 try:
                     gray = img.convert("L")
                     mx = int(gray.getextrema()[1] or 0)
-                    if mx < 8:
+                    hist = gray.histogram()
+                    total = sum(hist) or 1
+                    cutoff = int(total * 0.95)
+                    acc = 0
+                    p95 = 0
+                    for i, count in enumerate(hist):
+                        acc += count
+                        if acc >= cutoff:
+                            p95 = i
+                            break
+                    if mx < 8 or p95 < 8:
                         img = None
                         status = "no-audio"
                     else:
@@ -1614,7 +1624,8 @@ class App:
                         if len(hx) == 3:
                             hx = "".join([c*2 for c in hx])
                         r0, g0, b0 = int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16)
-                        alpha = gray.point(lambda p: 0 if p < 10 else min(255, int((p - 10) * 5)))
+                        noise_floor = max(10, int(p95 * 0.25))
+                        alpha = gray.point(lambda p: 0 if p <= noise_floor else min(255, int((p - noise_floor) * 5)))
                         # Thicken + smooth for better readability at small UI heights.
                         try:
                             alpha = alpha.filter(ImageFilter.MaxFilter(5))
@@ -1624,9 +1635,16 @@ class App:
                             alpha = alpha.filter(ImageFilter.GaussianBlur(0.6))
                         except Exception:
                             pass
-                        col = Image.new("RGBA", img.size, (r0, g0, b0, 255))
-                        col.putalpha(alpha)
-                        img = col
+                        try:
+                            if int(alpha.getextrema()[1] or 0) == 0:
+                                img = None
+                                status = "no-audio"
+                        except Exception:
+                            pass
+                        if status != "no-audio":
+                            col = Image.new("RGBA", img.size, (r0, g0, b0, 255))
+                            col.putalpha(alpha)
+                            img = col
                 except Exception:
                     pass
 
