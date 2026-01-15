@@ -1,6 +1,6 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Build: 2026-01-15a (filter: videos with audio)
+# Build: 2026-01-15b (filter: videos with audio)
 
 import os
 import sys
@@ -98,7 +98,7 @@ LCB_Z = 1.0
 E621_MAX_TAGS = 40
 DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
-BUILD_STAMP = '2026-01-15a (filter: videos with audio)'
+BUILD_STAMP = '2026-01-15b (filter: videos with audio)'
 
 # -------------------- DB --------------------
 def init_db() -> sqlite3.Connection:
@@ -691,14 +691,30 @@ class App:
                     path,
                 ]
                 try:
-                    r = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    r = subprocess.run(
+                        cmd,
+                        check=False,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
                     has_audio = bool((r.stdout or "").strip())
                 except Exception:
                     has_audio = False
             else:
                 cmd = [ffmpeg, "-hide_banner", "-i", path]
                 try:
-                    r = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    r = subprocess.run(
+                        cmd,
+                        check=False,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
                     has_audio = "audio:" in (r.stderr or "").lower()
                 except Exception:
                     has_audio = False
