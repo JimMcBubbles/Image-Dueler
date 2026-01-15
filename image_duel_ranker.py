@@ -1,6 +1,6 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Build: 2026-01-15b (filter: videos with audio)
+# Build: 2026-01-15c (video audio filter honors sidecar tag)
 
 import os
 import sys
@@ -98,7 +98,7 @@ LCB_Z = 1.0
 E621_MAX_TAGS = 40
 DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
-BUILD_STAMP = '2026-01-15b (filter: videos with audio)'
+BUILD_STAMP = '2026-01-15c (video audio filter honors sidecar tag)'
 
 # -------------------- DB --------------------
 def init_db() -> sqlite3.Connection:
@@ -722,6 +722,21 @@ class App:
         self._audio_cache[cache_key] = bool(has_audio)
         return bool(has_audio)
 
+    def _sidecar_audio_tag(self, path: str) -> Optional[bool]:
+        sidecar_path = SIDECAR_DIR / (Path(path).name + ".json")
+        if not sidecar_path.exists():
+            return None
+        try:
+            data = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        tag = str(data.get("audio", "")).strip().upper()
+        if tag == "Y":
+            return True
+        if tag == "N":
+            return False
+        return None
+
     def _row_matches_filter(self, row: tuple) -> bool:
         # row: (id, path, folder, duels, wins, losses, score, hidden)
         hidden = int(row[7] or 0)
@@ -742,7 +757,12 @@ class App:
         if f == "Videos":
             return kind == "video"
         if f == "Videos (audio)":
-            return kind == "video" and self._video_has_audio(row[1])
+            if kind != "video":
+                return False
+            tag = self._sidecar_audio_tag(row[1])
+            if tag is not None:
+                return tag
+            return self._video_has_audio(row[1])
         if f == "Animated":
             return kind in ("gif", "video")
         return True
