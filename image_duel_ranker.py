@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-01-15i
-# Update: Randomize pool scan order when selecting audio-filter videos.
-# Build: 2026-01-15i (randomize pool scan order when selecting audio-filter videos)
+# Version: 2026-01-15j
+# Update: Match duels by media type (images vs GIFs vs videos).
+# Build: 2026-01-15j (match duels by media type)
 
 import os
 import sys
@@ -100,7 +100,7 @@ LCB_Z = 1.0
 E621_MAX_TAGS = 40
 DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
-BUILD_STAMP = '2026-01-15i (randomize pool scan order when selecting audio-filter videos)'
+BUILD_STAMP = '2026-01-15j (match duels by media type)'
 
 # -------------------- DB --------------------
 def init_db() -> sqlite3.Connection:
@@ -829,41 +829,77 @@ class App:
         ids = {r[0] for r in pool}
         changed = False
         if a[0] not in ids:
-            na = self.pick_one(exclude_id=b[0], pool=pool)
+            a = None
+        if b[0] not in ids:
+            b = None
+
+        if a and b and self._media_kind(a[1]) != self._media_kind(b[1]):
+            a = None
+            b = None
+
+        if a is None and b is not None:
+            na = self.pick_one(
+                exclude_id=b[0],
+                pool=pool,
+                required_kind=self._media_kind(b[1]),
+            )
             if na:
                 a = na
                 changed = True
-        if b[0] not in ids:
-            nb = self.pick_one(exclude_id=a[0], pool=pool)
+        if b is None and a is not None:
+            nb = self.pick_one(
+                exclude_id=a[0],
+                pool=pool,
+                required_kind=self._media_kind(a[1]),
+            )
             if nb:
                 b = nb
                 changed = True
+
+        if not a or not b:
+            self.load_duel()
+            return
+
         if changed:
             self._set_current(a, b)
             self._render_side("a")
             self._render_side("b")
-            self.update_sidebar()
-        else:
-            self.update_sidebar()
+        self.update_sidebar()
 
     # -------------------- picking --------------------
-    def pick_one(self, exclude_id: Optional[int], pool: List[tuple]) -> Optional[tuple]:
+    def pick_one(
+        self,
+        exclude_id: Optional[int],
+        pool: List[tuple],
+        required_kind: Optional[str] = None,
+    ) -> Optional[tuple]:
         if not pool:
             return None
-        tries = 0
-        while tries < 200:
-            r = random.choice(pool)
-            if exclude_id is None or r[0] != exclude_id:
-                return r
-            tries += 1
-        return None
+        candidates = pool
+        if required_kind is not None:
+            candidates = [r for r in candidates if self._media_kind(r[1]) == required_kind]
+        if exclude_id is not None:
+            candidates = [r for r in candidates if r[0] != exclude_id]
+        if not candidates:
+            return None
+        return random.choice(candidates)
 
     def pick_two(self) -> Tuple[Optional[tuple], Optional[tuple]]:
         pool = self._pool_rows()
         if len(pool) < 2:
             return None, None
-        a = self.pick_one(exclude_id=None, pool=pool)
-        b = self.pick_one(exclude_id=a[0] if a else None, pool=pool)
+        pool_by_kind = {"image": [], "gif": [], "video": []}
+        for row in pool:
+            pool_by_kind[self._media_kind(row[1])].append(row)
+        eligible_kinds = [kind for kind, rows in pool_by_kind.items() if len(rows) >= 2]
+        if not eligible_kinds:
+            return None, None
+        chosen_kind = random.choice(eligible_kinds)
+        kind_pool = pool_by_kind[chosen_kind]
+        a = self.pick_one(exclude_id=None, pool=kind_pool)
+        if not a:
+            return None, None
+        b = self.pick_one(exclude_id=a[0], pool=kind_pool)
         return a, b
 
     # -------------------- duel flow --------------------
@@ -932,7 +968,11 @@ class App:
             hide_image(self.conn, target)
 
         pool = self._pool_rows()  # respects current filter
-        replacement = self.pick_one(exclude_id=other[0], pool=pool)
+        replacement = self.pick_one(
+            exclude_id=other[0],
+            pool=pool,
+            required_kind=self._media_kind(other[1]),
+        )
         if not replacement:
             # if no replacement in pool, just reload duel
             self.load_duel()
