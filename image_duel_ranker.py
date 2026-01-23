@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-01-15j
+# Version: 2026-01-23
 # Update: Match duels by media type (images vs GIFs vs videos).
-# Build: 2026-01-15j (match duels by media type)
+# Build: 2026-01-23 (match duels by media type)
 
 import os
 import sys
@@ -100,7 +100,7 @@ LCB_Z = 1.0
 E621_MAX_TAGS = 40
 DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
-BUILD_STAMP = '2026-01-15j (match duels by media type)'
+BUILD_STAMP = '2026-01-23 (match duels by media type)'
 
 # -------------------- DB --------------------
 def init_db() -> sqlite3.Connection:
