@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-01-23
-# Update: Match duels by media type (images vs GIFs vs videos).
-# Build: 2026-01-23 (match duels by media type)
+# Version: 2026-01-23c
+# Update: Fix VLC loop playback to restart reliably.
+# Build: 2026-01-23c (fix VLC loop restart)
 
 import os
 import sys
@@ -100,7 +100,7 @@ LCB_Z = 1.0
 E621_MAX_TAGS = 40
 DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
-BUILD_STAMP = '2026-01-23 (match duels by media type)'
+BUILD_STAMP = '2026-01-23c (fix VLC loop restart)'
 
 # -------------------- DB --------------------
 def init_db() -> sqlite3.Connection:
@@ -649,6 +649,9 @@ class App:
             "vlc_play_pending": False,
             "vlc_was_playing_before_seek": False,
             "vlc_total_ms": None,
+            "vlc_loop": True,
+            "vlc_event_mgr": None,
+            "vlc_loop_cb": None,
 
             "scrubbing": False,
         }
@@ -1130,6 +1133,8 @@ class App:
         st["vlc_ready"] = False
         st["vlc_play_pending"] = False
         st["vlc_total_ms"] = None
+        st["vlc_event_mgr"] = None
+        st["vlc_loop_cb"] = None
 
         try:
             self.root.update_idletasks()
@@ -1187,6 +1192,49 @@ class App:
             self._update_video_controls_state()
 
         st["vlc_init_job"] = self.root.after(180, finalize)
+        self._attach_vlc_events(side)
+
+    def _attach_vlc_events(self, side: str):
+        st = self._side[side]
+        player = st.get("vlc_player")
+        if not player or not HAVE_VLC:
+            return
+        try:
+            mgr = player.event_manager()
+            def _on_end(_evt, s=side):
+                self.root.after(0, lambda: self._on_video_end(s))
+            mgr.event_attach(vlc.EventType.MediaPlayerEndReached, _on_end)
+            st["vlc_event_mgr"] = mgr
+            st["vlc_loop_cb"] = _on_end
+        except Exception:
+            st["vlc_event_mgr"] = None
+            st["vlc_loop_cb"] = None
+
+    def _on_video_end(self, side: str):
+        st = self._side[side]
+        player = st.get("vlc_player")
+        if not player or not st.get("vlc_ready"):
+            return
+        if not bool(st.get("vlc_loop", True)):
+            return
+        try:
+            player.stop()
+            player.play()
+        except Exception:
+            pass
+        def finalize():
+            st2 = self._side[side]
+            if st2.get("vlc_player") is not player:
+                return
+            try:
+                player.set_position(0.0)
+            except Exception:
+                try:
+                    player.set_time(0)
+                except Exception:
+                    pass
+        self.root.after(60, finalize)
+        self._update_video_controls_state()
 
     def _show_video_placeholder(self, video_frame: tk.Frame, path: str, reason: str):
         # Clear any existing children
@@ -1218,6 +1266,8 @@ class App:
         st["vlc_ready"] = False
         st["vlc_play_pending"] = False
         st["vlc_total_ms"] = None
+        st["vlc_event_mgr"] = None
+        st["vlc_loop_cb"] = None
         st["scrubbing"] = False
 
     def toggle_video(self, side: str):
@@ -1266,6 +1316,11 @@ class App:
                 player.audio_set_volume(0)
         except Exception:
             pass
+        self._update_video_controls_state()
+
+    def toggle_loop(self, side: str):
+        st = self._side[side]
+        st["vlc_loop"] = not bool(st.get("vlc_loop", True))
         self._update_video_controls_state()
 
     def _format_mmss(self, ms: int) -> str:
@@ -1330,7 +1385,7 @@ class App:
         Bottom video controls that appear on hover.
 
         Layout (left -> right):
-        Play/Pause | -5s | +5s | Mute | Waveform/Seek Bar | Time | Speed | Fullscreen
+        Play/Pause | -5s | +5s | Mute | Loop | Waveform/Seek Bar | Time | Speed | Fullscreen
         """
         bar = tk.Frame(container, bg=DARK_PANEL, bd=1, relief="solid")
         bar.place_forget()
@@ -1341,6 +1396,7 @@ class App:
         back_btn = tk.Button(bar, text="-5s", width=5, command=lambda: self.seek_relative(side, -5000), **btn_opts)
         fwd_btn  = tk.Button(bar, text="+5s", width=5, command=lambda: self.seek_relative(side, +5000), **btn_opts)
         mute_btn = tk.Button(bar, text="Mute", width=7, command=lambda: self.toggle_mute(side), **btn_opts)
+        loop_btn = tk.Button(bar, text="Loop On", width=8, command=lambda: self.toggle_loop(side), **btn_opts)
 
         # Waveform / seek bar (Canvas)
         wave = tk.Canvas(bar, height=26, bg=DARK_BG, highlightthickness=0, bd=0, relief="flat")
@@ -1357,15 +1413,16 @@ class App:
         fs_btn = tk.Button(bar, text="Full", width=6, command=lambda: self.toggle_fullscreen(side), **btn_opts)
 
         # Grid layout
-        bar.columnconfigure(4, weight=1)  # waveform expands
+        bar.columnconfigure(5, weight=1)  # waveform expands
         play_btn.grid(row=0, column=0, padx=(8, 6), pady=6, sticky="w")
         back_btn.grid(row=0, column=1, padx=(0, 6), pady=6, sticky="w")
         fwd_btn.grid(row=0, column=2, padx=(0, 10), pady=6, sticky="w")
         mute_btn.grid(row=0, column=3, padx=(0, 10), pady=6, sticky="w")
-        wave.grid(row=0, column=4, padx=(0, 10), pady=6, sticky="ew")
-        time_lbl.grid(row=0, column=5, padx=(0, 10), pady=6, sticky="e")
-        speed_box.grid(row=0, column=6, padx=(0, 10), pady=6, sticky="e")
-        fs_btn.grid(row=0, column=7, padx=(0, 8), pady=6, sticky="e")
+        loop_btn.grid(row=0, column=4, padx=(0, 10), pady=6, sticky="w")
+        wave.grid(row=0, column=5, padx=(0, 10), pady=6, sticky="ew")
+        time_lbl.grid(row=0, column=6, padx=(0, 10), pady=6, sticky="e")
+        speed_box.grid(row=0, column=7, padx=(0, 10), pady=6, sticky="e")
+        fs_btn.grid(row=0, column=8, padx=(0, 8), pady=6, sticky="e")
 
         # Save UI handles
         st = self._side[side]
@@ -1373,6 +1430,7 @@ class App:
             "bar": bar,
             "play": play_btn,
             "mute": mute_btn,
+            "loop": loop_btn,
             "back": back_btn,
             "fwd": fwd_btn,
             "wave": wave,
@@ -1494,7 +1552,7 @@ class App:
             # Enable/disable controls
             ui["play"].configure(state=("normal" if is_video else "disabled"))
             state_ready = ("normal" if (is_video and player and ready) else "disabled")
-            for k in ("mute", "back", "fwd", "speed", "fs"):
+            for k in ("mute", "loop", "back", "fwd", "speed", "fs"):
                 try:
                     ui[k].configure(state=state_ready)
                 except Exception:
@@ -1523,6 +1581,10 @@ class App:
                 ui["mute"].configure(text=("Unmute" if muted else "Mute"))
             else:
                 ui["mute"].configure(text="Mute")
+
+            # Loop label
+            loop_on = bool(st.get("vlc_loop", True))
+            ui["loop"].configure(text=("Loop On" if loop_on else "Loop Off"))
 
             # Speed label (sync from player if possible)
             if player and ready:
