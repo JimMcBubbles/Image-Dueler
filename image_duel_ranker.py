@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-01-23b
-# Update: Add looping toggle for videos (default on).
-# Build: 2026-01-23b (video loop toggle default on)
+# Version: 2026-01-24
+# Update: Randomize first pick, match second by media kind; improve video loop restart.
+# Build: 2026-01-24 (random first pick + loop restart)
 
 import os
 import sys
@@ -100,7 +100,7 @@ LCB_Z = 1.0
 E621_MAX_TAGS = 40
 DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
-BUILD_STAMP = '2026-01-23b (video loop toggle default on)'
+BUILD_STAMP = '2026-01-24 (random first pick + loop restart)'
 
 # -------------------- DB --------------------
 def init_db() -> sqlite3.Connection:
@@ -893,15 +893,17 @@ class App:
         pool_by_kind = {"image": [], "gif": [], "video": []}
         for row in pool:
             pool_by_kind[self._media_kind(row[1])].append(row)
-        eligible_kinds = [kind for kind, rows in pool_by_kind.items() if len(rows) >= 2]
-        if not eligible_kinds:
+        eligible_rows = []
+        for rows in pool_by_kind.values():
+            if len(rows) >= 2:
+                eligible_rows.extend(rows)
+        if len(eligible_rows) < 2:
             return None, None
-        chosen_kind = random.choice(eligible_kinds)
-        kind_pool = pool_by_kind[chosen_kind]
-        a = self.pick_one(exclude_id=None, pool=kind_pool)
+        a = self.pick_one(exclude_id=None, pool=eligible_rows)
         if not a:
             return None, None
-        b = self.pick_one(exclude_id=a[0], pool=kind_pool)
+        required_kind = self._media_kind(a[1])
+        b = self.pick_one(exclude_id=a[0], pool=pool, required_kind=required_kind)
         return a, b
 
     # -------------------- duel flow --------------------
@@ -1214,12 +1216,27 @@ class App:
             return
         if not bool(st.get("vlc_loop", True)):
             return
+
+        def restart():
+            st2 = self._side[side]
+            player2 = st2.get("vlc_player")
+            if not player2 or not st2.get("vlc_ready"):
+                return
+            try:
+                player2.stop()
+            except Exception:
+                pass
+            try:
+                player2.play()
+                player2.set_time(0)
+            except Exception:
+                pass
+            self._update_video_controls_state()
+
         try:
-            player.set_time(0)
-            player.play()
+            self.root.after(0, restart)
         except Exception:
-            pass
-        self._update_video_controls_state()
+            restart()
 
     def _show_video_placeholder(self, video_frame: tk.Frame, path: str, reason: str):
         # Clear any existing children
