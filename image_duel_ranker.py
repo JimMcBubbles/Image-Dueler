@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-01-15j
-# Update: Treat silent audio tracks as no-audio using ffmpeg volumedetect; invalidate old audio sidecar tags.
-# Build: 2026-01-15j (meaningful audio detection + sidecar invalidation)
+# Version: 2026-01-23
+# Update: Match duels by media type (images vs GIFs vs videos).
+# Build: 2026-01-23 (match duels by media type)
 
 import os
 import sys
@@ -67,12 +67,6 @@ DB_PATH = SCRIPT_DIR / ".image_ranking.sqlite"
 SIDECAR_DIR = SCRIPT_DIR / ".image_duel_sidecars"
 SIDECAR_DIR.mkdir(parents=True, exist_ok=True)
 
-# Audio tagging / detection
-AUDIO_TAG_SCHEMA_VERSION = "2026-01-15j"  # bump to force re-probe when logic changes
-AUDIO_SAMPLE_SECONDS = 6.0
-AUDIO_MAX_DB_SILENCE_THRESHOLD = -60.0  # peak <= this is treated as effectively silent
-
-
 EMBED_JPEG_EXIF = False
 WINDOW_SIZE = (1500, 950)
 
@@ -106,7 +100,7 @@ LCB_Z = 1.0
 E621_MAX_TAGS = 40
 DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
-BUILD_STAMP = '2026-01-15i (randomize pool scan order when selecting audio-filter videos)'
+BUILD_STAMP = '2026-01-23 (match duels by media type)'
 
 # -------------------- DB --------------------
 def init_db() -> sqlite3.Connection:
@@ -677,42 +671,19 @@ class App:
         return "image"
 
     def _video_has_audio(self, path: str) -> bool:
-        """
-        Determine whether a video contains *meaningful* audio.
-
-        Important nuance: many files have a valid audio stream that is entirely silent.
-        We treat those as "no audio" for filtering purposes.
-
-        Strategy:
-          1) Fast check: does any audio stream exist?
-          2) If yes and ffmpeg is available, run a short volumedetect sample and reject near-silence.
-          3) Cache per (path, mtime, schema-version) and persist to sidecar with probe metadata.
-        """
         try:
             mtime = int(os.path.getmtime(path))
         except Exception:
             mtime = 0
-
-        cache_key = f"{path}|{mtime}|{AUDIO_TAG_SCHEMA_VERSION}"
+        cache_key = f"{path}|{mtime}"
         cached = self._audio_cache.get(cache_key)
         if cached is not None:
             return bool(cached)
 
-        # Trust sidecar only if it matches the current tag schema + file mtime.
-        sidecar_tag = self._sidecar_audio_tag(path)
-        if sidecar_tag is not None:
-            self._audio_cache[cache_key] = bool(sidecar_tag)
-            return bool(sidecar_tag)
-
         has_audio = False
-        peak_db: Optional[float] = None
-        mean_db: Optional[float] = None
-
         ffmpeg = self._ffmpeg_exe()
-        ffprobe = self._ffprobe_exe(ffmpeg)
-
-        stream_exists = False
-        if os.path.exists(path):
+        if ffmpeg and os.path.exists(path):
+            ffprobe = shutil.which("ffprobe")
             if ffprobe:
                 cmd = [
                     ffprobe, "-v", "error",
@@ -731,11 +702,10 @@ class App:
                         encoding="utf-8",
                         errors="replace",
                     )
-                    stream_exists = bool((r.stdout or "").strip())
+                    has_audio = bool((r.stdout or "").strip())
                 except Exception:
-                    stream_exists = False
-            elif ffmpeg:
-                # Crude fallback: ffmpeg prints stream info to stderr for -i.
+                    has_audio = False
+            else:
                 cmd = [ffmpeg, "-hide_banner", "-i", path]
                 try:
                     r = subprocess.run(
@@ -747,188 +717,24 @@ class App:
                         encoding="utf-8",
                         errors="replace",
                     )
-                    stream_exists = "audio:" in (r.stderr or "").lower()
+                    has_audio = "audio:" in (r.stderr or "").lower()
                 except Exception:
-                    stream_exists = False
-
-        if stream_exists and ffmpeg:
-            try:
-                has_audio, peak_db, mean_db = self._probe_meaningful_audio(path, ffmpeg=ffmpeg, ffprobe=ffprobe)
-            except Exception:
-                # If probing fails, fall back to stream existence.
-                has_audio = True
-        else:
-            has_audio = bool(stream_exists)
+                    has_audio = False
 
         self._audio_cache[cache_key] = bool(has_audio)
-
-        # Persist probe result to sidecar so future runs don't need to probe.
-        self._write_sidecar_audio_tag(
-            path,
-            bool(has_audio),
-            mtime=mtime,
-            peak_db=peak_db,
-            mean_db=mean_db,
-        )
+        existing_tag = self._sidecar_audio_tag(path)
+        if existing_tag is None or existing_tag != bool(has_audio):
+            self._write_sidecar_audio_tag(path, bool(has_audio))
         return bool(has_audio)
 
-    def _probe_meaningful_audio(
-        self,
-        path: str,
-        *,
-        ffmpeg: str,
-        ffprobe: Optional[str],
-    ) -> Tuple[bool, Optional[float], Optional[float]]:
-        """
-        Returns: (has_meaningful_audio, peak_db, mean_db)
-
-        We use ffmpeg's `volumedetect` on a few short samples. If the peak stays below
-        AUDIO_MAX_DB_SILENCE_THRESHOLD across samples, we treat the track as effectively silent.
-        """
-        # Determine duration if ffprobe is available (for better sampling).
-        duration_s: Optional[float] = None
-        if ffprobe:
-            cmd = [
-                ffprobe, "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "default=nk=1:nw=1",
-                path,
-            ]
-            try:
-                r = subprocess.run(
-                    cmd,
-                    check=False,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                )
-                out = (r.stdout or "").strip()
-                if out:
-                    duration_s = float(out)
-            except Exception:
-                duration_s = None
-
-        sample = float(AUDIO_SAMPLE_SECONDS)
-        starts: List[float] = [0.0]
-        if duration_s and duration_s > (sample * 3.0 + 6.0):
-            # Start, middle, near-end sampling.
-            starts = [
-                0.0,
-                max(0.0, duration_s / 2.0 - sample / 2.0),
-                max(0.0, duration_s - sample - 1.0),
-            ]
-        elif duration_s and duration_s > (sample * 2.0 + 4.0):
-            starts = [
-                0.0,
-                max(0.0, duration_s / 2.0 - sample / 2.0),
-            ]
-
-        mean_re = re.compile(r"mean_volume:\s*([-\w\.]+)\s*dB", re.IGNORECASE)
-        max_re = re.compile(r"max_volume:\s*([-\w\.]+)\s*dB", re.IGNORECASE)
-
-        best_peak: Optional[float] = None
-        best_mean: Optional[float] = None
-        parsed_any = False
-
-        def _parse_db(s: str) -> Optional[float]:
-            s2 = (s or "").strip().lower()
-            if not s2:
-                return None
-            if s2 == "-inf" or s2 == "inf":
-                return float("-inf")
-            try:
-                return float(s2)
-            except Exception:
-                return None
-
-        for ss in starts:
-            cmd = [
-                ffmpeg,
-                "-hide_banner",
-                "-nostats",
-                "-loglevel", "info",
-                "-ss", f"{ss}",
-                "-t", f"{sample}",
-                "-i", path,
-                "-vn", "-sn", "-dn",
-                "-map", "0:a:0?",
-                "-af", "volumedetect",
-                "-f", "null",
-                "-",
-            ]
-            try:
-                r = subprocess.run(
-                    cmd,
-                    check=False,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                )
-                log = (r.stderr or "") + "\n" + (r.stdout or "")
-            except Exception:
-                continue
-
-            m1 = mean_re.search(log)
-            m2 = max_re.search(log)
-            if not m1 and not m2:
-                continue
-
-            parsed_any = True
-            seg_mean = _parse_db(m1.group(1) if m1 else "")
-            seg_peak = _parse_db(m2.group(1) if m2 else "")
-
-            # Track "best" values for diagnostics.
-            if seg_peak is not None:
-                if best_peak is None or seg_peak > best_peak:
-                    best_peak = seg_peak
-            if seg_mean is not None:
-                if best_mean is None or seg_mean > best_mean:
-                    best_mean = seg_mean
-
-            # Main decision: if we ever see a peak above the silence threshold, treat as meaningful audio.
-            if seg_peak is not None and seg_peak != float("-inf") and seg_peak > float(AUDIO_MAX_DB_SILENCE_THRESHOLD):
-                return True, best_peak, best_mean
-
-        # If we successfully parsed at least one sample and never saw a peak above threshold, treat as silent.
-        if parsed_any:
-            return False, best_peak, best_mean
-
-        # If we couldn't parse volumedetect output at all, fall back to "stream exists" semantics.
-        return True, best_peak, best_mean
     def _sidecar_audio_tag(self, path: str) -> Optional[bool]:
         sidecar_path = SIDECAR_DIR / (Path(path).name + ".json")
         if not sidecar_path.exists():
             return None
-
         try:
             data = json.loads(sidecar_path.read_text(encoding="utf-8"))
         except Exception:
             return None
-
-        # Invalidate old tags automatically when the audio detection logic changes or the file changes.
-        try:
-            cur_mtime = int(os.path.getmtime(path))
-        except Exception:
-            cur_mtime = None
-
-        probe_ver = str(data.get("audio_probe_version", "") or "").strip()
-        probe_mtime = data.get("audio_probe_mtime", None)
-
-        if probe_ver != AUDIO_TAG_SCHEMA_VERSION:
-            return None
-        if cur_mtime is None:
-            return None
-        try:
-            probe_mtime_int = int(probe_mtime)
-        except Exception:
-            return None
-        if probe_mtime_int != int(cur_mtime):
-            return None
-
         raw_tag = data.get("audio", "")
         if isinstance(raw_tag, bool):
             return raw_tag
@@ -938,15 +744,8 @@ class App:
         if tag in {"N", "NO", "FALSE", "0"}:
             return False
         return None
-    def _write_sidecar_audio_tag(
-        self,
-        path: str,
-        has_audio: bool,
-        *,
-        mtime: int = 0,
-        peak_db: Optional[float] = None,
-        mean_db: Optional[float] = None,
-    ) -> None:
+
+    def _write_sidecar_audio_tag(self, path: str, has_audio: bool) -> None:
         sidecar_path = SIDECAR_DIR / (Path(path).name + ".json")
         data: dict = {}
         if sidecar_path.exists():
@@ -954,22 +753,7 @@ class App:
                 data = json.loads(sidecar_path.read_text(encoding="utf-8"))
             except Exception:
                 data = {}
-
         data["audio"] = "Y" if has_audio else "N"
-        data["audio_probe_version"] = AUDIO_TAG_SCHEMA_VERSION
-        data["audio_probe_mtime"] = int(mtime or 0)
-
-        # Optional diagnostics (useful for debugging "silent track" scenarios).
-        if peak_db is not None:
-            data["audio_probe_max_db"] = peak_db
-        else:
-            data.pop("audio_probe_max_db", None)
-
-        if mean_db is not None:
-            data["audio_probe_mean_db"] = mean_db
-        else:
-            data.pop("audio_probe_mean_db", None)
-
         try:
             sidecar_path.write_text(
                 json.dumps(data, ensure_ascii=False, indent=2),
@@ -978,6 +762,7 @@ class App:
             print(f"[audio] {Path(path).name} -> {data['audio']} ({sidecar_path})")
         except Exception:
             pass
+
     def _row_matches_filter(self, row: tuple) -> bool:
         # row: (id, path, folder, duels, wins, losses, score, hidden)
         hidden = int(row[7] or 0)
@@ -1044,41 +829,77 @@ class App:
         ids = {r[0] for r in pool}
         changed = False
         if a[0] not in ids:
-            na = self.pick_one(exclude_id=b[0], pool=pool)
+            a = None
+        if b[0] not in ids:
+            b = None
+
+        if a and b and self._media_kind(a[1]) != self._media_kind(b[1]):
+            a = None
+            b = None
+
+        if a is None and b is not None:
+            na = self.pick_one(
+                exclude_id=b[0],
+                pool=pool,
+                required_kind=self._media_kind(b[1]),
+            )
             if na:
                 a = na
                 changed = True
-        if b[0] not in ids:
-            nb = self.pick_one(exclude_id=a[0], pool=pool)
+        if b is None and a is not None:
+            nb = self.pick_one(
+                exclude_id=a[0],
+                pool=pool,
+                required_kind=self._media_kind(a[1]),
+            )
             if nb:
                 b = nb
                 changed = True
+
+        if not a or not b:
+            self.load_duel()
+            return
+
         if changed:
             self._set_current(a, b)
             self._render_side("a")
             self._render_side("b")
-            self.update_sidebar()
-        else:
-            self.update_sidebar()
+        self.update_sidebar()
 
     # -------------------- picking --------------------
-    def pick_one(self, exclude_id: Optional[int], pool: List[tuple]) -> Optional[tuple]:
+    def pick_one(
+        self,
+        exclude_id: Optional[int],
+        pool: List[tuple],
+        required_kind: Optional[str] = None,
+    ) -> Optional[tuple]:
         if not pool:
             return None
-        tries = 0
-        while tries < 200:
-            r = random.choice(pool)
-            if exclude_id is None or r[0] != exclude_id:
-                return r
-            tries += 1
-        return None
+        candidates = pool
+        if required_kind is not None:
+            candidates = [r for r in candidates if self._media_kind(r[1]) == required_kind]
+        if exclude_id is not None:
+            candidates = [r for r in candidates if r[0] != exclude_id]
+        if not candidates:
+            return None
+        return random.choice(candidates)
 
     def pick_two(self) -> Tuple[Optional[tuple], Optional[tuple]]:
         pool = self._pool_rows()
         if len(pool) < 2:
             return None, None
-        a = self.pick_one(exclude_id=None, pool=pool)
-        b = self.pick_one(exclude_id=a[0] if a else None, pool=pool)
+        pool_by_kind = {"image": [], "gif": [], "video": []}
+        for row in pool:
+            pool_by_kind[self._media_kind(row[1])].append(row)
+        eligible_kinds = [kind for kind, rows in pool_by_kind.items() if len(rows) >= 2]
+        if not eligible_kinds:
+            return None, None
+        chosen_kind = random.choice(eligible_kinds)
+        kind_pool = pool_by_kind[chosen_kind]
+        a = self.pick_one(exclude_id=None, pool=kind_pool)
+        if not a:
+            return None, None
+        b = self.pick_one(exclude_id=a[0], pool=kind_pool)
         return a, b
 
     # -------------------- duel flow --------------------
@@ -1147,7 +968,11 @@ class App:
             hide_image(self.conn, target)
 
         pool = self._pool_rows()  # respects current filter
-        replacement = self.pick_one(exclude_id=other[0], pool=pool)
+        replacement = self.pick_one(
+            exclude_id=other[0],
+            pool=pool,
+            required_kind=self._media_kind(other[1]),
+        )
         if not replacement:
             # if no replacement in pool, just reload duel
             self.load_duel()
@@ -1867,37 +1692,6 @@ class App:
             pass
         return None
 
-
-    def _ffprobe_exe(self, ffmpeg_exe: Optional[str]) -> Optional[str]:
-        """
-        Best-effort ffprobe discovery.
-
-        - If ffmpeg came from imageio-ffmpeg, ffprobe is often adjacent.
-        - Otherwise, fall back to PATH.
-        """
-        try:
-            exe = shutil.which("ffprobe")
-            if exe and os.path.exists(exe):
-                return exe
-        except Exception:
-            pass
-
-        if ffmpeg_exe:
-            try:
-                p = Path(ffmpeg_exe)
-                name = p.name.lower()
-                if "ffmpeg" in name:
-                    cand = p.with_name(p.name.lower().replace("ffmpeg", "ffprobe"))
-                    if cand.exists():
-                        return str(cand)
-                    # Windows casing
-                    cand2 = p.with_name(p.name.replace("ffmpeg", "ffprobe"))
-                    if cand2.exists():
-                        return str(cand2)
-            except Exception:
-                pass
-
-        return None
     def _maybe_request_waveform(self, side: str):
         st = self._side[side]
         ui = st.get("ui")
