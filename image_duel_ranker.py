@@ -1,7 +1,7 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-07g
-# Update: Scale carousel slots to visible duels and remove empty gaps.
+# Version: 2026-02-07h
+# Update: Expand carousel thumbnails to fill available slot width.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
@@ -694,7 +694,7 @@ class App:
         self.carousel_strip.pack(fill="x", pady=(4, 0))
         self.carousel_slots: List[tk.Button] = []
         self._carousel_slot_map: List[Optional[int]] = []
-        self._carousel_slot_pack_opts = dict(side="left", fill="x", expand=True, padx=1)
+        self._carousel_slot_pack_opts = dict(side="left", fill="x", expand=True, padx=0, pady=0)
         for i in range(self.carousel_size):
             btn = tk.Button(
                 self.carousel_strip,
@@ -705,7 +705,8 @@ class App:
                 activebackground=ACCENT,
                 relief="flat",
                 anchor="center",
-                padx=2,
+                padx=0,
+                pady=0,
                 compound="top",
                 font=("Segoe UI", 8),
             )
@@ -835,13 +836,13 @@ class App:
         self.root.update_idletasks()
         panel_width = max(1, self.carousel_panel.winfo_width())
         controls_h = max(1, self.carousel_controls.winfo_height())
-        strip_padding = 6
+        strip_padding = 2
         strip_height = max(40, self.carousel_height - controls_h - strip_padding)
-        slot_gap = 2
+        slot_gap = 0
         slot_count = max(1, slot_count)
         slot_width = max(80, int(panel_width / slot_count) - slot_gap)
-        thumb_width = max(36, int((slot_width - 4) / 2))
-        thumb_height = max(36, min(strip_height, 80))
+        thumb_width = max(36, int(slot_width / 2) - 1)
+        thumb_height = max(36, min(strip_height - 2, 120))
         new_size = (thumb_width, thumb_height)
         if new_size != self.carousel_thumb_size:
             self.carousel_thumb_size = new_size
