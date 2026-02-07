@@ -1,7 +1,7 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-07d
-# Update: Refine history drawer scaling and add video thumbnails.
+# Version: 2026-02-07e
+# Update: Center the history drawer handle in the footer bar.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
@@ -643,6 +643,17 @@ class App:
             bg=DARK_BG,
         )
         self.carousel_info.pack(side="right")
+        self.carousel_handle_btn = tk.Button(
+            self.carousel_toggle_bar,
+            text="⋮⋮",
+            command=self._toggle_carousel,
+            bg=DARK_PANEL,
+            fg=TEXT_COLOR,
+            activebackground=ACCENT,
+            relief="flat",
+            width=4,
+        )
+        self.carousel_handle_btn.place(relx=0.5, rely=0.5, anchor="center")
 
         self.carousel_panel = tk.Frame(self.carousel_frame, bg=DARK_BG)
         self.carousel_panel.pack(side="bottom", fill="x", padx=6, pady=(0, 6))
@@ -660,17 +671,6 @@ class App:
             width=12,
         )
         self.carousel_prev_btn.pack(side="left")
-        self.carousel_handle_btn = tk.Button(
-            self.carousel_controls,
-            text="⋮⋮",
-            command=self._toggle_carousel,
-            bg=DARK_PANEL,
-            fg=TEXT_COLOR,
-            activebackground=ACCENT,
-            relief="flat",
-            width=4,
-        )
-        self.carousel_handle_btn.pack(side="left", expand=True)
         self.carousel_next_btn = tk.Button(
             self.carousel_controls,
             text="Next up",
