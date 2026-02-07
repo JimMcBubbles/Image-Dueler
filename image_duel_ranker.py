@@ -1,7 +1,7 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-01-25c
-# Update: Align tag dropdowns within info bars to avoid overlap with images.
+# Version: 2026-01-25d
+# Update: Handle tagged image rows when recording duel results.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
@@ -265,8 +265,8 @@ def update_image_metadata(path: Path, score: float) -> None:
 
 # -------------------- Record results --------------------
 def record_result(conn: sqlite3.Connection, a: tuple, b: tuple, winner: Optional[str]) -> None:
-    a_id, a_path, a_folder, a_duels, a_wins, a_losses, a_score, a_hidden = a
-    b_id, b_path, b_folder, b_duels, b_wins, b_losses, b_score, b_hidden = b
+    a_id, a_path, a_folder, a_duels, a_wins, a_losses, a_score, a_hidden = a[:8]
+    b_id, b_path, b_folder, b_duels, b_wins, b_losses, b_score, b_hidden = b[:8]
 
     a_wins_inc = b_wins_inc = 0
     a_losses_inc = b_losses_inc = 0
