@@ -1,7 +1,7 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-07i
-# Update: Allow thumbnails to grow with taller drawer heights.
+# Version: 2026-02-07j
+# Update: Preserve thumbnail labels and disable click-to-hide.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
@@ -650,7 +650,7 @@ class App:
         self.carousel_handle_btn = tk.Button(
             self.carousel_toggle_bar,
             text="⋮⋮",
-            command=self._toggle_carousel,
+            command=None,
             bg=DARK_PANEL,
             fg=TEXT_COLOR,
             activebackground=ACCENT,
@@ -709,6 +709,7 @@ class App:
                 pady=0,
                 compound="top",
                 font=("Segoe UI", 8),
+                wraplength=180,
             )
             btn.pack(**self._carousel_slot_pack_opts)
             self.carousel_slots.append(btn)
@@ -837,12 +838,13 @@ class App:
         panel_width = max(1, self.carousel_panel.winfo_width())
         controls_h = max(1, self.carousel_controls.winfo_height())
         strip_padding = 2
+        label_height = 20
         strip_height = max(40, self.carousel_height - controls_h - strip_padding)
         slot_gap = 0
         slot_count = max(1, slot_count)
         slot_width = max(80, int(panel_width / slot_count) - slot_gap)
         thumb_width = max(36, int(slot_width / 2) - 1)
-        thumb_height = max(36, strip_height - 2)
+        thumb_height = max(36, strip_height - label_height)
         new_size = (thumb_width, thumb_height)
         if new_size != self.carousel_thumb_size:
             self.carousel_thumb_size = new_size
@@ -1101,6 +1103,7 @@ class App:
                 label = f"{idx + 1}. {self._history_label(entry)}"
                 if entry.get("thumb") is None:
                     self._attach_history_thumbs(entry)
+                btn.configure(wraplength=max(120, self.carousel_thumb_size[0] * 2))
                 btn.configure(
                     text=label,
                     state="normal",
