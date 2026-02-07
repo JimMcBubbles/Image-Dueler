@@ -1,10 +1,11 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-07c
-# Update: Add thumbnail carousel with a pull-up history drawer.
+# Version: 2026-02-07d
+# Update: Refine history drawer scaling and add video thumbnails.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
+import io
 import sys
 import re
 import math
@@ -384,9 +385,9 @@ class App:
         self._audio_cache = {}
         self.duel_history: List[dict] = []
         self.history_index: Optional[int] = None
-        self.carousel_size = 5
+        self.carousel_size = 6
         self.carousel_visible = True
-        self.carousel_thumb_size = (120, 72)
+        self.carousel_thumb_size = (96, 54)
 
         # video state per side
         self.vlc_instance = None
@@ -626,17 +627,6 @@ class App:
 
         self.carousel_toggle_bar = tk.Frame(self.carousel_frame, bg=DARK_BG)
         self.carousel_toggle_bar.pack(fill="x", padx=6, pady=(0, 4))
-        self.carousel_toggle_btn = tk.Button(
-            self.carousel_toggle_bar,
-            text="▼",
-            command=self._toggle_carousel,
-            bg=DARK_PANEL,
-            fg=TEXT_COLOR,
-            activebackground=ACCENT,
-            relief="flat",
-            width=3,
-        )
-        self.carousel_toggle_btn.pack(side="left")
         self.carousel_toggle_label = tk.Label(
             self.carousel_toggle_bar,
             text="History",
@@ -644,7 +634,15 @@ class App:
             fg=TEXT_COLOR,
             bg=DARK_BG,
         )
-        self.carousel_toggle_label.pack(side="left", padx=6)
+        self.carousel_toggle_label.pack(side="left")
+        self.carousel_info = tk.Label(
+            self.carousel_toggle_bar,
+            text="History: 0",
+            font=("Segoe UI", 9),
+            fg=TEXT_COLOR,
+            bg=DARK_BG,
+        )
+        self.carousel_info.pack(side="right")
 
         self.carousel_panel = tk.Frame(self.carousel_frame, bg=DARK_BG)
         self.carousel_panel.pack(side="bottom", fill="x", padx=6, pady=(0, 6))
@@ -662,14 +660,17 @@ class App:
             width=12,
         )
         self.carousel_prev_btn.pack(side="left")
-        self.carousel_info = tk.Label(
+        self.carousel_handle_btn = tk.Button(
             self.carousel_controls,
-            text="History: 0",
-            font=("Segoe UI", 9),
+            text="⋮⋮",
+            command=self._toggle_carousel,
+            bg=DARK_PANEL,
             fg=TEXT_COLOR,
-            bg=DARK_BG,
+            activebackground=ACCENT,
+            relief="flat",
+            width=4,
         )
-        self.carousel_info.pack(side="left", padx=8, expand=True)
+        self.carousel_handle_btn.pack(side="left", expand=True)
         self.carousel_next_btn = tk.Button(
             self.carousel_controls,
             text="Next up",
@@ -696,10 +697,11 @@ class App:
                 activebackground=ACCENT,
                 relief="flat",
                 anchor="w",
-                padx=6,
+                padx=2,
                 compound="top",
+                font=("Segoe UI", 8),
             )
-            btn.pack(side="left", fill="x", expand=True, padx=2)
+            btn.pack(side="left", fill="x", expand=True, padx=1)
             self.carousel_slots.append(btn)
             self._carousel_slot_map.append(None)
 
@@ -767,6 +769,7 @@ class App:
         self._tick_job = None
         self._tick()
 
+        self._toggle_carousel()
         self.load_duel()
 
     # -------------------- helpers / state --------------------
@@ -799,10 +802,8 @@ class App:
         self.carousel_visible = not self.carousel_visible
         if self.carousel_visible:
             self.carousel_panel.pack(side="bottom", fill="x", padx=6, pady=(0, 6))
-            self.carousel_toggle_btn.configure(text="▼")
         else:
             self.carousel_panel.pack_forget()
-            self.carousel_toggle_btn.configure(text="▲")
         self._update_carousel()
 
     def _make_thumb_image(self, path: str) -> Image.Image:
@@ -810,6 +811,41 @@ class App:
         try:
             ext = Path(path).suffix.lower()
             if ext in VIDEO_EXTS:
+                ffmpeg = self._ffmpeg_exe()
+                if ffmpeg and os.path.exists(path):
+                    try:
+                        cmd = [
+                            ffmpeg,
+                            "-hide_banner",
+                            "-loglevel",
+                            "error",
+                            "-ss",
+                            "00:00:01",
+                            "-i",
+                            path,
+                            "-frames:v",
+                            "1",
+                            "-f",
+                            "image2pipe",
+                            "-vcodec",
+                            "png",
+                            "-",
+                        ]
+                        r = subprocess.run(
+                            cmd,
+                            check=False,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                        )
+                        if r.stdout:
+                            im = Image.open(io.BytesIO(r.stdout)).convert("RGB")
+                            im.thumbnail((w, h))
+                            canvas = Image.new("RGB", (w, h), "#111111")
+                            offset = ((w - im.width) // 2, (h - im.height) // 2)
+                            canvas.paste(im, offset)
+                            return canvas
+                    except Exception:
+                        pass
                 img = Image.new("RGB", (w, h), "#111111")
                 draw = ImageDraw.Draw(img)
                 draw.text((8, h // 2 - 7), "VIDEO", fill="#d0d0d0")
@@ -833,9 +869,9 @@ class App:
         w, h = self.carousel_thumb_size
         left = self._make_thumb_image(left_path)
         right = self._make_thumb_image(right_path)
-        composite = Image.new("RGB", (w * 2 + 6, h), "#000000")
+        composite = Image.new("RGB", (w * 2 + 2, h), "#000000")
         composite.paste(left, (0, 0))
-        composite.paste(right, (w + 6, 0))
+        composite.paste(right, (w + 2, 0))
         return ImageTk.PhotoImage(composite)
 
     def _attach_history_thumbs(self, entry: dict) -> None:
