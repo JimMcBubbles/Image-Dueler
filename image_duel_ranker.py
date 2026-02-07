@@ -1,7 +1,7 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-07k
-# Update: Replace drawer button with a handle bar.
+# Version: 2026-02-07l
+# Update: Make handle bar responsive and use light color.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
@@ -649,7 +649,7 @@ class App:
         self.carousel_info.pack(side="right")
         self.carousel_handle_bar = tk.Frame(
             self.carousel_toggle_bar,
-            bg=ACCENT,
+            bg="#e4e4e4",
             width=64,
             height=6,
         )
@@ -814,11 +814,15 @@ class App:
         self._update_carousel()
 
     def _on_carousel_drag_start(self, event) -> None:
+        if not self.carousel_visible:
+            self._toggle_carousel()
         self._carousel_drag_start = event.y_root
 
     def _on_carousel_drag(self, event) -> None:
-        if self._carousel_drag_start is None or not self.carousel_visible:
+        if self._carousel_drag_start is None:
             return
+        if not self.carousel_visible:
+            self._toggle_carousel()
         delta = self._carousel_drag_start - event.y_root
         new_height = int(self.carousel_height + delta)
         new_height = max(self.carousel_min_height, min(self.carousel_max_height, new_height))
