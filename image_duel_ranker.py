@@ -1,7 +1,7 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-07j
-# Update: Preserve thumbnail labels and disable click-to-hide.
+# Version: 2026-02-07k
+# Update: Replace drawer button with a handle bar.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
@@ -647,19 +647,16 @@ class App:
             bg=DARK_BG,
         )
         self.carousel_info.pack(side="right")
-        self.carousel_handle_btn = tk.Button(
+        self.carousel_handle_bar = tk.Frame(
             self.carousel_toggle_bar,
-            text="⋮⋮",
-            command=None,
-            bg=DARK_PANEL,
-            fg=TEXT_COLOR,
-            activebackground=ACCENT,
-            relief="flat",
-            width=4,
+            bg=ACCENT,
+            width=64,
+            height=6,
         )
-        self.carousel_handle_btn.place(relx=0.5, rely=0.5, anchor="center")
-        self.carousel_handle_btn.bind("<ButtonPress-1>", self._on_carousel_drag_start)
-        self.carousel_handle_btn.bind("<B1-Motion>", self._on_carousel_drag)
+        self.carousel_handle_bar.place(relx=0.5, rely=0.5, anchor="center")
+        self.carousel_handle_bar.bind("<ButtonPress-1>", self._on_carousel_drag_start)
+        self.carousel_handle_bar.bind("<B1-Motion>", self._on_carousel_drag)
+        self.carousel_handle_bar.configure(cursor="sb_v_double_arrow")
 
         self.carousel_panel = tk.Frame(self.carousel_frame, bg=DARK_BG, height=self.carousel_height)
         self.carousel_panel.pack(side="bottom", fill="x", padx=6, pady=(0, 6))
