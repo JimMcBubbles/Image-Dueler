@@ -1,7 +1,7 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-07l
-# Update: Make handle bar responsive and use light color.
+# Version: 2026-02-07m
+# Update: Fix drawer drag sizing and click-to-open behavior.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
@@ -389,6 +389,7 @@ class App:
         self.carousel_visible = True
         self.carousel_thumb_size = (96, 54)
         self.carousel_height = 140
+        self.carousel_default_height = 140
         self.carousel_min_height = 90
         self.carousel_max_height = 320
         self._carousel_drag_start = None
@@ -655,6 +656,7 @@ class App:
         )
         self.carousel_handle_bar.place(relx=0.5, rely=0.5, anchor="center")
         self.carousel_handle_bar.bind("<ButtonPress-1>", self._on_carousel_drag_start)
+        self.carousel_handle_bar.bind("<Button-1>", self._on_carousel_click)
         self.carousel_handle_bar.bind("<B1-Motion>", self._on_carousel_drag)
         self.carousel_handle_bar.configure(cursor="sb_v_double_arrow")
 
@@ -813,18 +815,31 @@ class App:
             self.carousel_panel.pack_forget()
         self._update_carousel()
 
+    def _show_carousel(self, height: Optional[int] = None) -> None:
+        if height is not None:
+            self.carousel_height = max(self.carousel_min_height, min(self.carousel_max_height, height))
+            self.carousel_panel.configure(height=self.carousel_height)
+        if not self.carousel_visible:
+            self.carousel_visible = True
+            self.carousel_panel.pack(side="bottom", fill="x", padx=6, pady=(0, 6))
+        self._update_carousel()
+
+    def _on_carousel_click(self, event) -> None:
+        self._show_carousel(self.carousel_default_height)
+
     def _on_carousel_drag_start(self, event) -> None:
         if not self.carousel_visible:
-            self._toggle_carousel()
+            self._show_carousel(self.carousel_default_height)
         self._carousel_drag_start = event.y_root
 
     def _on_carousel_drag(self, event) -> None:
         if self._carousel_drag_start is None:
             return
         if not self.carousel_visible:
-            self._toggle_carousel()
-        delta = self._carousel_drag_start - event.y_root
-        new_height = int(self.carousel_height + delta)
+            self._show_carousel(self.carousel_default_height)
+        root_y = self.root.winfo_rooty()
+        root_h = self.root.winfo_height()
+        new_height = int((root_y + root_h) - event.y_root - 6)
         new_height = max(self.carousel_min_height, min(self.carousel_max_height, new_height))
         if new_height != self.carousel_height:
             self.carousel_height = new_height
