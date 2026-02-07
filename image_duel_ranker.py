@@ -1,7 +1,7 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-01-25d
-# Update: Handle tagged image rows when recording duel results.
+# Version: 2026-02-07
+# Update: Auto-play videos when they are selected in a duel.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
@@ -1160,6 +1160,15 @@ class App:
             panel.place_forget()
             vframe.place(relx=0, rely=0, relwidth=1, relheight=1)
             self._render_video(side, vframe, row[1])
+            player = st.get("vlc_player")
+            if player:
+                if st.get("vlc_ready"):
+                    try:
+                        player.play()
+                    except Exception:
+                        pass
+                else:
+                    st["vlc_play_pending"] = True
         else:
             # show image label, hide video frame
             self._stop_video(side)
