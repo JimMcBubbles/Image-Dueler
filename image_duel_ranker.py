@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-01-25
-# Update: Add per-image tag dropdowns with hide sync; keep info overlays visible on videos.
-# Build: 2026-01-25 (tag dropdowns + video overlay lift)
+# Version: 2026-01-25b
+# Update: Place tag dropdowns inline with info bars for each duel panel.
+# Build: 2026-01-25b (inline tag dropdowns)
 
 import os
 import sys
@@ -71,11 +71,10 @@ EMBED_JPEG_EXIF = False
 WINDOW_SIZE = (1500, 950)
 
 # UI polish
-INFO_BAR_HEIGHT = 26
+INFO_BAR_HEIGHT = 28
 INFO_BAR_BG = "#0f0f0f"
 INFO_BAR_FG = "#d0d0d0"
 INFO_BAR_FONT = ("Segoe UI", 10)
-TAG_BAR_HEIGHT = 26
 SEPARATOR_BG = "#242424"
 SIDEBAR_WIDTH = 420
 
@@ -103,7 +102,7 @@ DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
 TAG_OPTIONS = ["SFW", "MEME", "HIDE", "CW"]
 
-BUILD_STAMP = '2026-01-25 (tag dropdowns + video overlay lift)'
+BUILD_STAMP = '2026-01-25b (inline tag dropdowns)'
 
 # -------------------- DB --------------------
 def init_db() -> sqlite3.Connection:
@@ -404,16 +403,11 @@ class App:
         self.left_panel.place(relx=0, rely=0, relwidth=1, relheight=1)
         self.right_panel.place(relx=0, rely=0, relwidth=1, relheight=1)
 
-        # Tag dropdowns + info bars (top overlay) for each side
-        self.left_tag_bar = tk.Frame(self.left_container, bg=INFO_BAR_BG, bd=0, highlightthickness=0)
-        self.right_tag_bar = tk.Frame(self.right_container, bg=INFO_BAR_BG, bd=0, highlightthickness=0)
-        self.left_tag_bar.place(relx=0, rely=0, relwidth=1, height=TAG_BAR_HEIGHT)
-        self.right_tag_bar.place(relx=0, rely=0, relwidth=1, height=TAG_BAR_HEIGHT)
-
+        # Info bars (top overlay) for each side
         self.left_info_bar = tk.Frame(self.left_container, bg=INFO_BAR_BG, bd=0, highlightthickness=0)
         self.right_info_bar = tk.Frame(self.right_container, bg=INFO_BAR_BG, bd=0, highlightthickness=0)
-        self.left_info_bar.place(relx=0, y=TAG_BAR_HEIGHT, relwidth=1, height=INFO_BAR_HEIGHT)
-        self.right_info_bar.place(relx=0, y=TAG_BAR_HEIGHT, relwidth=1, height=INFO_BAR_HEIGHT)
+        self.left_info_bar.place(relx=0, rely=0, relwidth=1, height=INFO_BAR_HEIGHT)
+        self.right_info_bar.place(relx=0, rely=0, relwidth=1, height=INFO_BAR_HEIGHT)
 
         self.left_info_text = tk.Label(self.left_info_bar, text="", font=INFO_BAR_FONT,
                                        fg=INFO_BAR_FG, bg=INFO_BAR_BG, anchor="w")
@@ -422,8 +416,8 @@ class App:
         self.left_info_text.pack(fill="both", expand=True, padx=8)
         self.right_info_text.pack(fill="both", expand=True, padx=8)
 
-        self._build_tag_menu("a", self.left_tag_bar)
-        self._build_tag_menu("b", self.right_tag_bar)
+        self._build_tag_menu("a", self.left_info_bar)
+        self._build_tag_menu("b", self.right_info_bar)
 
         # Make info bars behave like the image/video panel for clicks
         for w in (self.left_info_bar, self.left_info_text):
@@ -688,7 +682,7 @@ class App:
             relief="flat",
             cursor="hand2",
         )
-        button.pack(side="left", padx=6, pady=2)
+        button.pack(side="right", padx=8, pady=2)
         menu = tk.Menu(button, tearoff=0)
         tag_vars: dict = {}
         for tag in TAG_OPTIONS:
@@ -1172,9 +1166,9 @@ class App:
 
     def _lift_side_overlays(self, side: str) -> None:
         if side == "a":
-            bars = (self.left_tag_bar, self.left_info_bar)
+            bars = (self.left_info_bar,)
         else:
-            bars = (self.right_tag_bar, self.right_info_bar)
+            bars = (self.right_info_bar,)
         for bar in bars:
             try:
                 bar.lift()
