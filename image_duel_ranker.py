@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-01-25b
-# Update: Place tag dropdowns inline with info bars for each duel panel.
-# Build: 2026-01-25b (inline tag dropdowns)
+# Version: 2026-01-25c
+# Update: Align tag dropdowns within info bars to avoid overlap with images.
+# Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
 import sys
@@ -102,7 +102,7 @@ DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
 TAG_OPTIONS = ["SFW", "MEME", "HIDE", "CW"]
 
-BUILD_STAMP = '2026-01-25b (inline tag dropdowns)'
+BUILD_STAMP = '2026-01-25c (aligned tag dropdowns)'
 
 # -------------------- DB --------------------
 def init_db() -> sqlite3.Connection:
@@ -409,15 +409,22 @@ class App:
         self.left_info_bar.place(relx=0, rely=0, relwidth=1, height=INFO_BAR_HEIGHT)
         self.right_info_bar.place(relx=0, rely=0, relwidth=1, height=INFO_BAR_HEIGHT)
 
-        self.left_info_text = tk.Label(self.left_info_bar, text="", font=INFO_BAR_FONT,
-                                       fg=INFO_BAR_FG, bg=INFO_BAR_BG, anchor="w")
-        self.right_info_text = tk.Label(self.right_info_bar, text="", font=INFO_BAR_FONT,
-                                        fg=INFO_BAR_FG, bg=INFO_BAR_BG, anchor="w")
-        self.left_info_text.pack(fill="both", expand=True, padx=8)
-        self.right_info_text.pack(fill="both", expand=True, padx=8)
+        self.left_info_row = tk.Frame(self.left_info_bar, bg=INFO_BAR_BG, bd=0, highlightthickness=0)
+        self.right_info_row = tk.Frame(self.right_info_bar, bg=INFO_BAR_BG, bd=0, highlightthickness=0)
+        self.left_info_row.pack(fill="both", expand=True)
+        self.right_info_row.pack(fill="both", expand=True)
 
-        self._build_tag_menu("a", self.left_info_bar)
-        self._build_tag_menu("b", self.right_info_bar)
+        self.left_info_text = tk.Label(self.left_info_row, text="", font=INFO_BAR_FONT,
+                                       fg=INFO_BAR_FG, bg=INFO_BAR_BG, anchor="w")
+        self.right_info_text = tk.Label(self.right_info_row, text="", font=INFO_BAR_FONT,
+                                        fg=INFO_BAR_FG, bg=INFO_BAR_BG, anchor="w")
+        self.left_info_text.grid(row=0, column=0, sticky="w", padx=8)
+        self.right_info_text.grid(row=0, column=0, sticky="w", padx=8)
+
+        self._build_tag_menu("a", self.left_info_row)
+        self._build_tag_menu("b", self.right_info_row)
+        self.left_info_row.columnconfigure(0, weight=1)
+        self.right_info_row.columnconfigure(0, weight=1)
 
         # Make info bars behave like the image/video panel for clicks
         for w in (self.left_info_bar, self.left_info_text):
@@ -682,7 +689,7 @@ class App:
             relief="flat",
             cursor="hand2",
         )
-        button.pack(side="right", padx=8, pady=2)
+        button.grid(row=0, column=1, sticky="e", padx=8, pady=2)
         menu = tk.Menu(button, tearoff=0)
         tag_vars: dict = {}
         for tag in TAG_OPTIONS:
