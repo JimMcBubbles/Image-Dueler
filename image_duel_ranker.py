@@ -1,7 +1,7 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-07e
-# Update: Center the history drawer handle in the footer bar.
+# Version: 2026-02-07f
+# Update: Add draggable history drawer sizing and dynamic thumbnail scaling.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
@@ -388,6 +388,10 @@ class App:
         self.carousel_size = 6
         self.carousel_visible = True
         self.carousel_thumb_size = (96, 54)
+        self.carousel_height = 140
+        self.carousel_min_height = 90
+        self.carousel_max_height = 220
+        self._carousel_drag_start = None
 
         # video state per side
         self.vlc_instance = None
@@ -654,9 +658,12 @@ class App:
             width=4,
         )
         self.carousel_handle_btn.place(relx=0.5, rely=0.5, anchor="center")
+        self.carousel_handle_btn.bind("<ButtonPress-1>", self._on_carousel_drag_start)
+        self.carousel_handle_btn.bind("<B1-Motion>", self._on_carousel_drag)
 
-        self.carousel_panel = tk.Frame(self.carousel_frame, bg=DARK_BG)
+        self.carousel_panel = tk.Frame(self.carousel_frame, bg=DARK_BG, height=self.carousel_height)
         self.carousel_panel.pack(side="bottom", fill="x", padx=6, pady=(0, 6))
+        self.carousel_panel.pack_propagate(False)
 
         self.carousel_controls = tk.Frame(self.carousel_panel, bg=DARK_BG)
         self.carousel_controls.pack(fill="x")
@@ -696,7 +703,7 @@ class App:
                 fg=TEXT_COLOR,
                 activebackground=ACCENT,
                 relief="flat",
-                anchor="w",
+                anchor="center",
                 padx=2,
                 compound="top",
                 font=("Segoe UI", 8),
@@ -805,6 +812,39 @@ class App:
         else:
             self.carousel_panel.pack_forget()
         self._update_carousel()
+
+    def _on_carousel_drag_start(self, event) -> None:
+        self._carousel_drag_start = event.y_root
+
+    def _on_carousel_drag(self, event) -> None:
+        if self._carousel_drag_start is None or not self.carousel_visible:
+            return
+        delta = self._carousel_drag_start - event.y_root
+        new_height = int(self.carousel_height + delta)
+        new_height = max(self.carousel_min_height, min(self.carousel_max_height, new_height))
+        if new_height != self.carousel_height:
+            self.carousel_height = new_height
+            self.carousel_panel.configure(height=self.carousel_height)
+            self._update_carousel()
+        self._carousel_drag_start = event.y_root
+
+    def _update_carousel_layout(self) -> None:
+        if not self.carousel_visible:
+            return
+        self.root.update_idletasks()
+        panel_width = max(1, self.carousel_panel.winfo_width())
+        controls_h = max(1, self.carousel_controls.winfo_height())
+        strip_padding = 6
+        strip_height = max(40, self.carousel_height - controls_h - strip_padding)
+        slot_gap = 2
+        slot_width = max(80, int(panel_width / max(1, self.carousel_size)) - slot_gap)
+        thumb_width = max(36, int((slot_width - 2) / 2))
+        thumb_height = max(36, min(strip_height, 80))
+        new_size = (thumb_width, thumb_height)
+        if new_size != self.carousel_thumb_size:
+            self.carousel_thumb_size = new_size
+            for entry in self.duel_history:
+                entry["thumb"] = None
 
     def _make_thumb_image(self, path: str) -> Image.Image:
         w, h = self.carousel_thumb_size
@@ -1030,6 +1070,7 @@ class App:
 
     def _update_carousel(self) -> None:
         total = len(self.duel_history)
+        self._update_carousel_layout()
         if not self.carousel_visible:
             self.carousel_info.configure(text=f"History: {total} (collapsed)")
             self.carousel_prev_btn.configure(state="disabled")
@@ -3215,6 +3256,7 @@ class App:
             panel = self.left_panel if side == "a" else self.right_panel
             self._cancel_animation(side)
             self._render_image_or_gif(side, panel, row[1])
+        self._update_carousel()
 
     # -------------------- quit --------------------
     def quit(self):
