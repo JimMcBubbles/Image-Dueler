@@ -1,7 +1,7 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-07f
-# Update: Add draggable history drawer sizing and dynamic thumbnail scaling.
+# Version: 2026-02-07g
+# Update: Scale carousel slots to visible duels and remove empty gaps.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
@@ -694,6 +694,7 @@ class App:
         self.carousel_strip.pack(fill="x", pady=(4, 0))
         self.carousel_slots: List[tk.Button] = []
         self._carousel_slot_map: List[Optional[int]] = []
+        self._carousel_slot_pack_opts = dict(side="left", fill="x", expand=True, padx=1)
         for i in range(self.carousel_size):
             btn = tk.Button(
                 self.carousel_strip,
@@ -708,7 +709,7 @@ class App:
                 compound="top",
                 font=("Segoe UI", 8),
             )
-            btn.pack(side="left", fill="x", expand=True, padx=1)
+            btn.pack(**self._carousel_slot_pack_opts)
             self.carousel_slots.append(btn)
             self._carousel_slot_map.append(None)
 
@@ -828,7 +829,7 @@ class App:
             self._update_carousel()
         self._carousel_drag_start = event.y_root
 
-    def _update_carousel_layout(self) -> None:
+    def _update_carousel_layout(self, slot_count: int) -> None:
         if not self.carousel_visible:
             return
         self.root.update_idletasks()
@@ -837,8 +838,9 @@ class App:
         strip_padding = 6
         strip_height = max(40, self.carousel_height - controls_h - strip_padding)
         slot_gap = 2
-        slot_width = max(80, int(panel_width / max(1, self.carousel_size)) - slot_gap)
-        thumb_width = max(36, int((slot_width - 2) / 2))
+        slot_count = max(1, slot_count)
+        slot_width = max(80, int(panel_width / slot_count) - slot_gap)
+        thumb_width = max(36, int((slot_width - 4) / 2))
         thumb_height = max(36, min(strip_height, 80))
         new_size = (thumb_width, thumb_height)
         if new_size != self.carousel_thumb_size:
@@ -1070,7 +1072,6 @@ class App:
 
     def _update_carousel(self) -> None:
         total = len(self.duel_history)
-        self._update_carousel_layout()
         if not self.carousel_visible:
             self.carousel_info.configure(text=f"History: {total} (collapsed)")
             self.carousel_prev_btn.configure(state="disabled")
@@ -1081,6 +1082,7 @@ class App:
             self.carousel_prev_btn.configure(state="disabled")
             self.carousel_next_btn.configure(state="disabled")
             for i, btn in enumerate(self.carousel_slots):
+                btn.pack_forget()
                 btn.configure(text="--", image="", state="disabled", bg=DARK_PANEL)
                 self._carousel_slot_map[i] = None
             return
@@ -1089,6 +1091,7 @@ class App:
         window_end = active_index
         window_start = max(0, window_end - (self.carousel_size - 1))
         indices = list(range(window_start, window_end + 1))
+        self._update_carousel_layout(len(indices))
 
         for i, btn in enumerate(self.carousel_slots):
             if i < len(indices):
@@ -1104,7 +1107,10 @@ class App:
                     image=entry.get("thumb", ""),
                 )
                 self._carousel_slot_map[i] = idx
+                if not btn.winfo_ismapped():
+                    btn.pack(**self._carousel_slot_pack_opts)
             else:
+                btn.pack_forget()
                 btn.configure(text="--", image="", state="disabled", bg=DARK_PANEL)
                 self._carousel_slot_map[i] = None
 
