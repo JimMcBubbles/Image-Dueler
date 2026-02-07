@@ -1,7 +1,7 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-07h
-# Update: Expand carousel thumbnails to fill available slot width.
+# Version: 2026-02-07i
+# Update: Allow thumbnails to grow with taller drawer heights.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
@@ -390,7 +390,7 @@ class App:
         self.carousel_thumb_size = (96, 54)
         self.carousel_height = 140
         self.carousel_min_height = 90
-        self.carousel_max_height = 220
+        self.carousel_max_height = 320
         self._carousel_drag_start = None
 
         # video state per side
@@ -842,7 +842,7 @@ class App:
         slot_count = max(1, slot_count)
         slot_width = max(80, int(panel_width / slot_count) - slot_gap)
         thumb_width = max(36, int(slot_width / 2) - 1)
-        thumb_height = max(36, min(strip_height - 2, 120))
+        thumb_height = max(36, strip_height - 2)
         new_size = (thumb_width, thumb_height)
         if new_size != self.carousel_thumb_size:
             self.carousel_thumb_size = new_size
