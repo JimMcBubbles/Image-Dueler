@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-01-24
-# Update: Randomize first pick, match second by media kind; improve video loop restart.
-# Build: 2026-01-24 (random first pick + loop restart)
+# Version: 2026-01-25
+# Update: Add per-image tag dropdowns with hide sync; keep info overlays visible on videos.
+# Build: 2026-01-25 (tag dropdowns + video overlay lift)
 
 import os
 import sys
@@ -75,6 +75,7 @@ INFO_BAR_HEIGHT = 26
 INFO_BAR_BG = "#0f0f0f"
 INFO_BAR_FG = "#d0d0d0"
 INFO_BAR_FONT = ("Segoe UI", 10)
+TAG_BAR_HEIGHT = 26
 SEPARATOR_BG = "#242424"
 SIDEBAR_WIDTH = 420
 
@@ -100,7 +101,9 @@ LCB_Z = 1.0
 E621_MAX_TAGS = 40
 DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
-BUILD_STAMP = '2026-01-24 (random first pick + loop restart)'
+TAG_OPTIONS = ["SFW", "MEME", "HIDE", "CW"]
+
+BUILD_STAMP = '2026-01-25 (tag dropdowns + video overlay lift)'
 
 # -------------------- DB --------------------
 def init_db() -> sqlite3.Connection:
@@ -117,7 +120,8 @@ def init_db() -> sqlite3.Connection:
             losses INTEGER DEFAULT 0,
             duels INTEGER DEFAULT 0,
             last_seen INTEGER,
-            hidden INTEGER DEFAULT 0
+            hidden INTEGER DEFAULT 0,
+            tags TEXT DEFAULT '[]'
         )
     """)
     conn.execute("""
@@ -140,6 +144,12 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE images ADD COLUMN hidden INTEGER DEFAULT 0")
         conn.commit()
         conn.execute("UPDATE images SET hidden=0 WHERE hidden IS NULL")
+        conn.commit()
+    if "tags" not in cols:
+        print("[migrate] adding 'tags' column to images")
+        conn.execute("ALTER TABLE images ADD COLUMN tags TEXT DEFAULT '[]'")
+        conn.commit()
+        conn.execute("UPDATE images SET tags='[]' WHERE tags IS NULL")
         conn.commit()
 
 def scan_images(conn: sqlite3.Connection) -> None:
@@ -394,11 +404,16 @@ class App:
         self.left_panel.place(relx=0, rely=0, relwidth=1, relheight=1)
         self.right_panel.place(relx=0, rely=0, relwidth=1, relheight=1)
 
-        # Info bars (top overlay) for each side
+        # Tag dropdowns + info bars (top overlay) for each side
+        self.left_tag_bar = tk.Frame(self.left_container, bg=INFO_BAR_BG, bd=0, highlightthickness=0)
+        self.right_tag_bar = tk.Frame(self.right_container, bg=INFO_BAR_BG, bd=0, highlightthickness=0)
+        self.left_tag_bar.place(relx=0, rely=0, relwidth=1, height=TAG_BAR_HEIGHT)
+        self.right_tag_bar.place(relx=0, rely=0, relwidth=1, height=TAG_BAR_HEIGHT)
+
         self.left_info_bar = tk.Frame(self.left_container, bg=INFO_BAR_BG, bd=0, highlightthickness=0)
         self.right_info_bar = tk.Frame(self.right_container, bg=INFO_BAR_BG, bd=0, highlightthickness=0)
-        self.left_info_bar.place(relx=0, rely=0, relwidth=1, height=INFO_BAR_HEIGHT)
-        self.right_info_bar.place(relx=0, rely=0, relwidth=1, height=INFO_BAR_HEIGHT)
+        self.left_info_bar.place(relx=0, y=TAG_BAR_HEIGHT, relwidth=1, height=INFO_BAR_HEIGHT)
+        self.right_info_bar.place(relx=0, y=TAG_BAR_HEIGHT, relwidth=1, height=INFO_BAR_HEIGHT)
 
         self.left_info_text = tk.Label(self.left_info_bar, text="", font=INFO_BAR_FONT,
                                        fg=INFO_BAR_FG, bg=INFO_BAR_BG, anchor="w")
@@ -406,6 +421,9 @@ class App:
                                         fg=INFO_BAR_FG, bg=INFO_BAR_BG, anchor="w")
         self.left_info_text.pack(fill="both", expand=True, padx=8)
         self.right_info_text.pack(fill="both", expand=True, padx=8)
+
+        self._build_tag_menu("a", self.left_tag_bar)
+        self._build_tag_menu("b", self.right_tag_bar)
 
         # Make info bars behave like the image/video panel for clicks
         for w in (self.left_info_bar, self.left_info_text):
@@ -653,7 +671,124 @@ class App:
             "vlc_event_mgr": None,
 
             "scrubbing": False,
+            "tags": [],
+            "tag_vars": {},
+            "tag_button": None,
         }
+
+    def _build_tag_menu(self, side: str, parent: tk.Frame) -> None:
+        button = tk.Menubutton(
+            parent,
+            text="Tags: (none)",
+            font=("Segoe UI", 9),
+            fg=INFO_BAR_FG,
+            bg=INFO_BAR_BG,
+            activebackground=INFO_BAR_BG,
+            activeforeground=INFO_BAR_FG,
+            relief="flat",
+            cursor="hand2",
+        )
+        button.pack(side="left", padx=6, pady=2)
+        menu = tk.Menu(button, tearoff=0)
+        tag_vars: dict = {}
+        for tag in TAG_OPTIONS:
+            var = tk.BooleanVar(value=False)
+            tag_vars[tag] = var
+            menu.add_checkbutton(
+                label=tag,
+                variable=var,
+                command=lambda s=side: self._on_tag_change(s),
+            )
+        button.configure(menu=menu)
+        self._side[side]["tag_vars"] = tag_vars
+        self._side[side]["tag_button"] = button
+
+    def _ordered_tags(self, tags: set) -> List[str]:
+        return [tag for tag in TAG_OPTIONS if tag in tags]
+
+    def _parse_tags(self, raw: str) -> List[str]:
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list):
+                return [str(t).upper() for t in data if str(t).upper() in TAG_OPTIONS]
+        except Exception:
+            pass
+        parts = [p.strip().upper() for p in raw.replace(";", ",").split(",") if p.strip()]
+        return [p for p in parts if p in TAG_OPTIONS]
+
+    def _tags_for_row(self, row: tuple) -> List[str]:
+        raw = row[8] if row and len(row) > 8 else ""
+        tags = set(self._parse_tags(raw))
+        hidden = int(row[7] or 0) if row and len(row) > 7 else 0
+        changed = False
+        if hidden == 1 and "HIDE" not in tags:
+            tags.add("HIDE")
+            changed = True
+        if hidden == 0 and "HIDE" in tags:
+            tags.remove("HIDE")
+            changed = True
+        ordered = self._ordered_tags(tags)
+        if changed and row and len(row) > 0:
+            self._write_tags(row[0], set(ordered), hidden=hidden)
+        return ordered
+
+    def _write_tags(self, image_id: int, tags: set, hidden: Optional[int] = None) -> None:
+        ordered = self._ordered_tags(tags)
+        payload = json.dumps(ordered, ensure_ascii=False)
+        if hidden is None:
+            self.conn.execute("UPDATE images SET tags=? WHERE id=?", (payload, image_id))
+        else:
+            self.conn.execute("UPDATE images SET tags=?, hidden=? WHERE id=?", (payload, int(hidden), image_id))
+        self.conn.commit()
+
+    def _sync_tag_controls(self, side: str) -> None:
+        row = self._side[side].get("row")
+        if not row:
+            return
+        tags = self._tags_for_row(row)
+        tag_vars = self._side[side].get("tag_vars", {})
+        for tag, var in tag_vars.items():
+            var.set(tag in tags)
+        self._side[side]["tags"] = tags
+        self._set_tag_button_label(side)
+
+    def _set_tag_button_label(self, side: str) -> None:
+        button = self._side[side].get("tag_button")
+        if not button:
+            return
+        tags = self._side[side].get("tags", [])
+        label = "Tags: " + (", ".join(tags) if tags else "(none)")
+        button.configure(text=label)
+
+    def _on_tag_change(self, side: str) -> None:
+        row = self._side[side].get("row")
+        if not row:
+            return
+        tag_vars = self._side[side].get("tag_vars", {})
+        tags = {tag for tag, var in tag_vars.items() if var.get()}
+        prev_tags = set(self._side[side].get("tags", []))
+        if tags == prev_tags:
+            return
+        wants_hide = "HIDE" in tags
+        had_hide = "HIDE" in prev_tags
+        if wants_hide != had_hide:
+            if self.pool_filter_var.get() == "Hidden":
+                if wants_hide:
+                    self._write_tags(row[0], tags, hidden=1)
+                else:
+                    self.hide_side(side)
+                    return
+            else:
+                if wants_hide:
+                    self.hide_side(side)
+                    return
+                self._write_tags(row[0], tags, hidden=0)
+        else:
+            self._write_tags(row[0], tags)
+        self._side[side]["tags"] = self._ordered_tags(tags)
+        self._set_tag_button_label(side)
 
     def _on_configure(self, event=None):
         # avoid recreating players on resize; only re-render still images/gifs
@@ -766,7 +901,7 @@ class App:
             pass
 
     def _row_matches_filter(self, row: tuple) -> bool:
-        # row: (id, path, folder, duels, wins, losses, score, hidden)
+        # row: (id, path, folder, duels, wins, losses, score, hidden, tags)
         hidden = int(row[7] or 0)
         f = self.pool_filter_var.get()
         kind = self._media_kind(row[1])
@@ -812,7 +947,7 @@ class App:
 
     def _pool_rows(self) -> List[tuple]:
         rows = list(self.conn.execute("""
-            SELECT id, path, folder, duels, wins, losses, score, hidden
+            SELECT id, path, folder, duels, wins, losses, score, hidden, tags
             FROM images
         """))
         random.shuffle(rows)
@@ -964,12 +1099,18 @@ class App:
 
 
             unhide_image(self.conn, target)
+            tags = set(self._tags_for_row(target))
+            tags.discard("HIDE")
+            self._write_tags(target[0], tags, hidden=0)
 
 
         else:
 
 
             hide_image(self.conn, target)
+            tags = set(self._tags_for_row(target))
+            tags.add("HIDE")
+            self._write_tags(target[0], tags, hidden=1)
 
         pool = self._pool_rows()  # respects current filter
         replacement = self.pick_one(
@@ -1025,7 +1166,20 @@ class App:
             panel.place(relx=0, rely=0, relwidth=1, relheight=1)
             self._render_image_or_gif(side, panel, row[1])
 
+        self._sync_tag_controls(side)
+        self._lift_side_overlays(side)
         self._update_video_controls_state()
+
+    def _lift_side_overlays(self, side: str) -> None:
+        if side == "a":
+            bars = (self.left_tag_bar, self.left_info_bar)
+        else:
+            bars = (self.right_tag_bar, self.right_info_bar)
+        for bar in bars:
+            try:
+                bar.lift()
+            except Exception:
+                pass
 
     def _render_image_or_gif(self, side: str, widget: tk.Label, path: str):
         self.root.update_idletasks()
