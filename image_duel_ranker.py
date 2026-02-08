@@ -1,7 +1,7 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-07n
-# Update: Fix carousel drag handling and thumbnail refresh on resize.
+# Version: 2026-02-07m
+# Update: Fix drawer drag sizing and click-to-open behavior.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
@@ -393,7 +393,6 @@ class App:
         self.carousel_min_height = 90
         self.carousel_max_height = 320
         self._carousel_drag_start = None
-        self._carousel_dragging = False
 
         # video state per side
         self.vlc_instance = None
@@ -657,8 +656,8 @@ class App:
         )
         self.carousel_handle_bar.place(relx=0.5, rely=0.5, anchor="center")
         self.carousel_handle_bar.bind("<ButtonPress-1>", self._on_carousel_drag_start)
+        self.carousel_handle_bar.bind("<Button-1>", self._on_carousel_click)
         self.carousel_handle_bar.bind("<B1-Motion>", self._on_carousel_drag)
-        self.carousel_handle_bar.bind("<ButtonRelease-1>", self._on_carousel_release)
         self.carousel_handle_bar.configure(cursor="sb_v_double_arrow")
 
         self.carousel_panel = tk.Frame(self.carousel_frame, bg=DARK_BG, height=self.carousel_height)
@@ -825,11 +824,13 @@ class App:
             self.carousel_panel.pack(side="bottom", fill="x", padx=6, pady=(0, 6))
         self._update_carousel()
 
+    def _on_carousel_click(self, event) -> None:
+        self._show_carousel(self.carousel_default_height)
+
     def _on_carousel_drag_start(self, event) -> None:
         if not self.carousel_visible:
             self._show_carousel(self.carousel_default_height)
         self._carousel_drag_start = event.y_root
-        self._carousel_dragging = False
 
     def _on_carousel_drag(self, event) -> None:
         if self._carousel_drag_start is None:
@@ -845,15 +846,6 @@ class App:
             self.carousel_panel.configure(height=self.carousel_height)
             self._update_carousel()
         self._carousel_drag_start = event.y_root
-        self._carousel_dragging = True
-
-    def _on_carousel_release(self, event) -> None:
-        if self._carousel_drag_start is None:
-            return
-        if not self._carousel_dragging:
-            self._show_carousel(self.carousel_default_height)
-        self._carousel_drag_start = None
-        self._carousel_dragging = False
 
     def _update_carousel_layout(self, slot_count: int) -> None:
         if not self.carousel_visible:
@@ -872,8 +864,6 @@ class App:
         new_size = (thumb_width, thumb_height)
         if new_size != self.carousel_thumb_size:
             self.carousel_thumb_size = new_size
-            for btn in self.carousel_slots:
-                btn.configure(image="")
             for entry in self.duel_history:
                 entry["thumb"] = None
 
