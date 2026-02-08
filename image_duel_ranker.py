@@ -1,7 +1,7 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-08h
-# Update: Keep VLC blur overlay visible while GIF frames prepare.
+# Version: 2026-02-08i
+# Update: Retry GIF generation when blur overlay isn't animating.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
@@ -823,6 +823,7 @@ class App:
             "video_blur_gif_anim_job": None,
             "video_blur_gif_job": None,
             "video_blur_gif_frame_paths": None,
+            "video_blur_gif_retry": 0,
 
             "scrubbing": False,
             "tags": [],
@@ -1970,6 +1971,7 @@ class App:
         st["video_blur_gif_frames"] = None
         st["video_blur_gif_delays"] = None
         st["video_blur_gif_job"] = None
+        st["video_blur_gif_retry"] = 0
         frame_paths = st.get("video_blur_gif_frame_paths") or []
         for frame_path in frame_paths:
             try:
@@ -3038,6 +3040,7 @@ class App:
         st["video_blur_gif_delays"] = None
         st["video_blur_gif_index"] = 0
         st["video_blur_gif_frame_paths"] = None
+        st["video_blur_gif_retry"] = st.get("video_blur_gif_retry", 0)
         self._cancel_video_blur_gif_animation(side)
 
         t = threading.Thread(
@@ -3060,7 +3063,7 @@ class App:
                 scale_down_w = "max(8,iw/16)"
                 scale_down_h = "max(8,ih/16)"
                 vf = (
-                    f"fps=6,scale={scale_down_w}:{scale_down_h}:flags=neighbor,"
+                    f"fps=8,scale={scale_down_w}:{scale_down_h}:flags=neighbor,"
                     f"scale={size[0]}:{size[1]}:flags=neighbor"
                 )
                 palette = f"{vf},split[p0][p1];[p0]palettegen[p];[p1][p]paletteuse"
@@ -3073,6 +3076,8 @@ class App:
                     path,
                     "-filter_complex",
                     palette,
+                    "-t",
+                    "3",
                     "-loop",
                     "0",
                     "-gifflags",
@@ -3110,6 +3115,25 @@ class App:
                 fr = frame.convert("RGBA") if frame.mode != "RGBA" else frame.copy()
                 frames.append(ImageTk.PhotoImage(fr))
         except Exception:
+            return
+        if len(frames) < 2:
+            try:
+                os.remove(out_gif)
+            except Exception:
+                pass
+            st["video_blur_gif_path"] = None
+            st["video_blur_gif_frames"] = None
+            st["video_blur_gif_delays"] = None
+            retry = int(st.get("video_blur_gif_retry") or 0)
+            if retry < 1:
+                st["video_blur_gif_retry"] = retry + 1
+                retry_path = st.get("vlc_media")
+                if not retry_path:
+                    row = st.get("row")
+                    if row:
+                        retry_path = row[1]
+                if retry_path:
+                    self._ensure_video_blur_gif(side, retry_path, im.size)
             return
         if not frames:
             return
