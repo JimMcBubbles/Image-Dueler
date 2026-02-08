@@ -1,7 +1,7 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-07
-# Update: Auto-play videos when they are selected in a duel.
+# Version: 2026-02-08
+# Update: Restore a visible sidebar drawer handle in focus mode.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
@@ -456,10 +456,19 @@ class App:
         self.sidebar.configure(width=SIDEBAR_WIDTH)
         self.sidebar.pack_propagate(False)
 
-        # Floating restore button when sidebar is hidden
-        self.sidebar_restore_btn = tk.Button(self.root, text="Show sidebar",
-                                             command=self.toggle_sidebar,
-                                             bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat")
+        # Floating restore handle when sidebar is hidden
+        self.sidebar_restore_btn = tk.Button(
+            self.root,
+            text="◀",
+            command=self.toggle_sidebar,
+            bg=DARK_PANEL,
+            fg=TEXT_COLOR,
+            activebackground=ACCENT,
+            relief="flat",
+            width=2,
+            padx=6,
+            pady=2,
+        )
         self.sidebar_restore_btn.place_forget()
 
         # ---- Pool filter ----
@@ -2447,7 +2456,7 @@ class App:
                 pass
             self.sidebar_visible = False
             try:
-                self.sidebar_restore_btn.place(relx=1.0, x=-10, y=10, anchor="ne")
+                self.sidebar_restore_btn.place(relx=1.0, rely=0.5, x=-2, anchor="e")
             except Exception:
                 pass
         else:
