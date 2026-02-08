@@ -1,7 +1,7 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-08d
-# Update: Size video blur overlays to VLC video output.
+# Version: 2026-02-08e
+# Update: Sample multi-frame video blur snapshots at 15 fps for smoother blur.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
@@ -85,6 +85,9 @@ VIDEO_EXTS = {
     ".mp4", ".webm", ".mkv", ".avi", ".mov", ".wmv", ".m4v", ".mpg", ".mpeg"
 }
 SUPPORTED_EXTS = IMAGE_EXTS | GIF_EXTS | VIDEO_EXTS
+
+VIDEO_BLUR_FPS = 15
+VIDEO_BLUR_FRAMES = 15
 
 K_FACTOR = 32.0
 BASE_SCORE = 1000.0
@@ -815,6 +818,8 @@ class App:
             "video_blur_label": None,
             "video_blur_image": None,
             "video_blur_logo_path": None,
+            "video_blur_cache_key": None,
+            "video_blur_cache_image": None,
 
             "scrubbing": False,
             "tags": [],
@@ -3054,6 +3059,44 @@ class App:
                 except Exception:
                     pass
 
+    def _capture_video_blur_snapshot(self, path: str, size: Tuple[int, int]) -> Optional[Image.Image]:
+        if not path or not os.path.exists(path):
+            return None
+        exe = self._ffmpeg_exe()
+        if not exe:
+            return None
+        w, h = size
+        filters = [
+            f"fps={VIDEO_BLUR_FPS}",
+            f"tmix=frames={VIDEO_BLUR_FRAMES}:weights=1",
+        ]
+        if w > 0 and h > 0:
+            filters.append(f"scale={w}:{h}:force_original_aspect_ratio=decrease")
+            filters.append(f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2")
+        filter_chain = ",".join(filters)
+        cmd = [
+            exe,
+            "-hide_banner",
+            "-loglevel", "error",
+            "-ss", "00:00:00.25",
+            "-i", path,
+            "-vf", filter_chain,
+            "-frames:v", "1",
+            "-f", "image2pipe",
+            "-vcodec", "png",
+            "-",
+        ]
+        try:
+            r = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except Exception:
+            return None
+        if not r.stdout:
+            return None
+        try:
+            return Image.open(io.BytesIO(r.stdout)).convert("RGB")
+        except Exception:
+            return None
+
     def _update_video_blur_overlay(self, side: str, video_frame: tk.Frame, path: str) -> None:
         if not self.blur_enabled:
             self._set_video_blur_visible(side, False)
@@ -3076,7 +3119,22 @@ class App:
             target_w, target_h = video_size
         else:
             target_w, target_h = frame_w, frame_h
-        snapshot = self._capture_video_snapshot(side, (target_w, target_h))
+        cache_key = None
+        snapshot = None
+        try:
+            mtime = int(os.path.getmtime(path)) if path else 0
+        except Exception:
+            mtime = 0
+        cache_key = (path, mtime, target_w, target_h, VIDEO_BLUR_FPS, VIDEO_BLUR_FRAMES)
+        if st.get("video_blur_cache_key") == cache_key:
+            snapshot = st.get("video_blur_cache_image")
+        if snapshot is None:
+            snapshot = self._capture_video_blur_snapshot(path, (target_w, target_h))
+            if snapshot is not None:
+                st["video_blur_cache_key"] = cache_key
+                st["video_blur_cache_image"] = snapshot
+        if snapshot is None:
+            snapshot = self._capture_video_snapshot(side, (target_w, target_h))
         if snapshot is None:
             snapshot = Image.effect_noise((target_w, target_h), 64).convert("RGB")
         if snapshot.size != (target_w, target_h):
