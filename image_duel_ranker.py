@@ -1,7 +1,7 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-08f
-# Update: Generate pixelated GIF overlays for blurred videos.
+# Version: 2026-02-08g
+# Update: Animate pixelated blur overlays with VLC-safe GIF frames.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
@@ -822,6 +822,7 @@ class App:
             "video_blur_gif_index": 0,
             "video_blur_gif_anim_job": None,
             "video_blur_gif_job": None,
+            "video_blur_gif_frame_paths": None,
 
             "scrubbing": False,
             "tags": [],
@@ -1969,6 +1970,13 @@ class App:
         st["video_blur_gif_frames"] = None
         st["video_blur_gif_delays"] = None
         st["video_blur_gif_job"] = None
+        frame_paths = st.get("video_blur_gif_frame_paths") or []
+        for frame_path in frame_paths:
+            try:
+                os.remove(frame_path)
+            except Exception:
+                pass
+        st["video_blur_gif_frame_paths"] = None
         self._clear_vlc_blur_logo(side)
         self._set_video_blur_visible(side, False)
 
@@ -3029,6 +3037,7 @@ class App:
         st["video_blur_gif_frames"] = None
         st["video_blur_gif_delays"] = None
         st["video_blur_gif_index"] = 0
+        st["video_blur_gif_frame_paths"] = None
         self._cancel_video_blur_gif_animation(side)
 
         t = threading.Thread(
@@ -3054,6 +3063,7 @@ class App:
                     f"fps=6,scale={scale_down_w}:{scale_down_h}:flags=neighbor,"
                     f"scale={size[0]}:{size[1]}:flags=neighbor"
                 )
+                palette = f"{vf},split[p0][p1];[p0]palettegen[p];[p1][p]paletteuse"
                 cmd = [
                     exe,
                     "-hide_banner",
@@ -3061,8 +3071,12 @@ class App:
                     "error",
                     "-i",
                     path,
-                    "-vf",
-                    vf,
+                    "-filter_complex",
+                    palette,
+                    "-loop",
+                    "0",
+                    "-gifflags",
+                    "+transdiff",
                     "-loop",
                     "0",
                     "-y",
@@ -3103,6 +3117,26 @@ class App:
         st["video_blur_gif_frames"] = frames
         st["video_blur_gif_delays"] = delays
         st["video_blur_gif_index"] = 0
+        frame_paths: List[str] = []
+        if HAVE_VLC and st.get("vlc_player"):
+            out_dir = Path(tempfile.gettempdir()) / "image_duel_ranker_blur_gif_frames"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            frame_paths = st.get("video_blur_gif_frame_paths") or []
+            for frame_path in frame_paths:
+                try:
+                    os.remove(frame_path)
+                except Exception:
+                    pass
+            frame_paths = []
+            try:
+                for idx, frame in enumerate(ImageSequence.Iterator(im)):
+                    fr = frame.convert("RGB")
+                    frame_path = out_dir / f"blur_{hashlib.md5(key.encode('utf-8')).hexdigest()}_{idx}.png"
+                    fr.save(frame_path, format="PNG")
+                    frame_paths.append(str(frame_path))
+            except Exception:
+                frame_paths = []
+        st["video_blur_gif_frame_paths"] = frame_paths or None
         self._start_video_blur_gif_animation(side)
 
     def _start_video_blur_gif_animation(self, side: str) -> None:
@@ -3112,10 +3146,14 @@ class App:
         frames = st.get("video_blur_gif_frames")
         if not frames:
             return
+        player = st.get("vlc_player")
         label = st.get("video_blur_label")
-        if not label:
+        if not label and not player:
             return
-        self._set_video_blur_visible(side, True)
+        if player:
+            self._set_video_blur_visible(side, False)
+        else:
+            self._set_video_blur_visible(side, True)
         self._cancel_video_blur_gif_animation(side)
 
         def step():
@@ -3125,8 +3163,23 @@ class App:
             if not frames2:
                 return
             idx = st2.get("video_blur_gif_index", 0) % len(frames2)
-            label.configure(image=frames2[idx], text="", bg="black")
-            label.image = frames2[idx]
+            player2 = st2.get("vlc_player")
+            if player2 and HAVE_VLC:
+                frame_paths = st2.get("video_blur_gif_frame_paths") or []
+                if frame_paths:
+                    frame_path = frame_paths[idx % len(frame_paths)]
+                    try:
+                        player2.video_set_logo_string(vlc.VideoLogoOption.logo_file, frame_path)
+                        player2.video_set_logo_int(vlc.VideoLogoOption.logo_enable, 1)
+                        player2.video_set_logo_int(vlc.VideoLogoOption.logo_opacity, 255)
+                        player2.video_set_logo_int(vlc.VideoLogoOption.logo_position, 0)
+                        player2.video_set_logo_int(vlc.VideoLogoOption.logo_x, 0)
+                        player2.video_set_logo_int(vlc.VideoLogoOption.logo_y, 0)
+                    except Exception:
+                        pass
+            elif label:
+                label.configure(image=frames2[idx], text="", bg="black")
+                label.image = frames2[idx]
             st2["video_blur_gif_index"] = idx + 1
             delay = max(40, int(delays2[idx] if idx < len(delays2) else 100))
             st2["video_blur_gif_anim_job"] = self.root.after(delay, step)
