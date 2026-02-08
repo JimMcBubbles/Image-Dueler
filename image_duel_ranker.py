@@ -1,10 +1,11 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-07
-# Update: Auto-play videos when they are selected in a duel.
+# Version: 2026-02-07n
+# Update: Fix carousel drag handling and thumbnail refresh on resize.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
+import io
 import sys
 import re
 import math
@@ -29,7 +30,7 @@ import tkinter.ttk as ttk
 import tkinter.font as tkfont
 import tkinter.messagebox as messagebox
 
-from PIL import Image, ImageTk, ImageSequence, ImageFilter
+from PIL import Image, ImageTk, ImageSequence, ImageFilter, ImageDraw
 
 # Optional chart (only used on exit)
 try:
@@ -264,9 +265,27 @@ def update_image_metadata(path: Path, score: float) -> None:
             pass
 
 # -------------------- Record results --------------------
-def record_result(conn: sqlite3.Connection, a: tuple, b: tuple, winner: Optional[str]) -> None:
+def _snapshot_stats(conn: sqlite3.Connection, img_id: int) -> dict:
+    row = conn.execute(
+        "SELECT score, duels, wins, losses, last_seen FROM images WHERE id=?",
+        (img_id,),
+    ).fetchone()
+    if not row:
+        return {"score": BASE_SCORE, "duels": 0, "wins": 0, "losses": 0, "last_seen": 0}
+    return {
+        "score": float(row[0]),
+        "duels": int(row[1]),
+        "wins": int(row[2]),
+        "losses": int(row[3]),
+        "last_seen": int(row[4] or 0),
+    }
+
+def record_result(conn: sqlite3.Connection, a: tuple, b: tuple, winner: Optional[str]) -> dict:
     a_id, a_path, a_folder, a_duels, a_wins, a_losses, a_score, a_hidden = a[:8]
     b_id, b_path, b_folder, b_duels, b_wins, b_losses, b_score, b_hidden = b[:8]
+
+    before_a = _snapshot_stats(conn, a_id)
+    before_b = _snapshot_stats(conn, b_id)
 
     a_wins_inc = b_wins_inc = 0
     a_losses_inc = b_losses_inc = 0
@@ -300,6 +319,7 @@ def record_result(conn: sqlite3.Connection, a: tuple, b: tuple, winner: Optional
         "INSERT INTO comparisons(left_id, right_id, chosen_id, ts) VALUES (?,?,?,?)",
         (a_id, b_id, chosen_id, ts),
     )
+    comparison_id = cur.lastrowid
     conn.commit()
 
     # Sidecars (async-ish, but safe in a short thread)
@@ -309,6 +329,16 @@ def record_result(conn: sqlite3.Connection, a: tuple, b: tuple, winner: Optional
         threading.Thread(target=update_image_metadata, args=(Path(b_path), float(new_b)), daemon=True).start()
     except Exception:
         pass
+    return {
+        "a_id": a_id,
+        "b_id": b_id,
+        "a_path": a_path,
+        "b_path": b_path,
+        "winner": winner,
+        "comparison_id": comparison_id,
+        "before_a": before_a,
+        "before_b": before_b,
+    }
 
 def set_image_hidden(conn: sqlite3.Connection, img_id: int, hidden: int) -> None:
     conn.execute("UPDATE images SET hidden=?, last_seen=? WHERE id=?", (hidden, int(time.time()), img_id))
@@ -346,12 +376,24 @@ class App:
 
         # state
         self.current: Optional[Tuple[tuple, tuple]] = None
+        self.live_current: Optional[Tuple[tuple, tuple]] = None
         self.prev_artists = deque(maxlen=6)
         self.page = 0
         self.metric = LEADERBOARD_METRIC_DEFAULT
         self._last_ranks = {r["folder"]: r["rank"] for r in folder_leaderboard(self.conn, metric=self.metric)}
         self._resize_job = None
         self._audio_cache = {}
+        self.duel_history: List[dict] = []
+        self.history_index: Optional[int] = None
+        self.carousel_size = 6
+        self.carousel_visible = True
+        self.carousel_thumb_size = (96, 54)
+        self.carousel_height = 140
+        self.carousel_default_height = 140
+        self.carousel_min_height = 90
+        self.carousel_max_height = 320
+        self._carousel_drag_start = None
+        self._carousel_dragging = False
 
         # video state per side
         self.vlc_instance = None
@@ -368,7 +410,7 @@ class App:
 
         # ---- Layout containers ----
         self.container = tk.Frame(root, bg=DARK_BG)
-        self.container.pack(fill="both", expand=True)
+        self.container.pack(side="top", fill="both", expand=True)
 
         # Left: duel panels
         self.images_frame = tk.Frame(self.container, bg=DARK_BG)
@@ -585,6 +627,94 @@ class App:
         self.keys_header.pack(anchor="w")
         self.keys_text.pack(anchor="w")
 
+        # ---- Bottom carousel (history) ----
+        self.carousel_frame = tk.Frame(self.root, bg=DARK_BG)
+        self.carousel_frame.pack(side="bottom", fill="x")
+
+        self.carousel_toggle_bar = tk.Frame(self.carousel_frame, bg=DARK_BG)
+        self.carousel_toggle_bar.pack(fill="x", padx=6, pady=(0, 4))
+        self.carousel_toggle_label = tk.Label(
+            self.carousel_toggle_bar,
+            text="History",
+            font=("Segoe UI", 9),
+            fg=TEXT_COLOR,
+            bg=DARK_BG,
+        )
+        self.carousel_toggle_label.pack(side="left")
+        self.carousel_info = tk.Label(
+            self.carousel_toggle_bar,
+            text="History: 0",
+            font=("Segoe UI", 9),
+            fg=TEXT_COLOR,
+            bg=DARK_BG,
+        )
+        self.carousel_info.pack(side="right")
+        self.carousel_handle_bar = tk.Frame(
+            self.carousel_toggle_bar,
+            bg="#e4e4e4",
+            width=64,
+            height=6,
+        )
+        self.carousel_handle_bar.place(relx=0.5, rely=0.5, anchor="center")
+        self.carousel_handle_bar.bind("<ButtonPress-1>", self._on_carousel_drag_start)
+        self.carousel_handle_bar.bind("<B1-Motion>", self._on_carousel_drag)
+        self.carousel_handle_bar.bind("<ButtonRelease-1>", self._on_carousel_release)
+        self.carousel_handle_bar.configure(cursor="sb_v_double_arrow")
+
+        self.carousel_panel = tk.Frame(self.carousel_frame, bg=DARK_BG, height=self.carousel_height)
+        self.carousel_panel.pack(side="bottom", fill="x", padx=6, pady=(0, 6))
+        self.carousel_panel.pack_propagate(False)
+
+        self.carousel_controls = tk.Frame(self.carousel_panel, bg=DARK_BG)
+        self.carousel_controls.pack(fill="x")
+        self.carousel_prev_btn = tk.Button(
+            self.carousel_controls,
+            text="Previous",
+            command=self._on_carousel_prev,
+            bg=DARK_PANEL,
+            fg=TEXT_COLOR,
+            activebackground=ACCENT,
+            relief="flat",
+            width=12,
+        )
+        self.carousel_prev_btn.pack(side="left")
+        self.carousel_next_btn = tk.Button(
+            self.carousel_controls,
+            text="Next up",
+            command=self._on_carousel_next,
+            bg=DARK_PANEL,
+            fg=TEXT_COLOR,
+            activebackground=ACCENT,
+            relief="flat",
+            width=12,
+        )
+        self.carousel_next_btn.pack(side="right")
+
+        self.carousel_strip = tk.Frame(self.carousel_panel, bg=DARK_BG)
+        self.carousel_strip.pack(fill="x", pady=(4, 0))
+        self.carousel_slots: List[tk.Button] = []
+        self._carousel_slot_map: List[Optional[int]] = []
+        self._carousel_slot_pack_opts = dict(side="left", fill="x", expand=True, padx=0, pady=0)
+        for i in range(self.carousel_size):
+            btn = tk.Button(
+                self.carousel_strip,
+                text="--",
+                command=lambda idx=i: self._on_carousel_slot(idx),
+                bg=DARK_PANEL,
+                fg=TEXT_COLOR,
+                activebackground=ACCENT,
+                relief="flat",
+                anchor="center",
+                padx=0,
+                pady=0,
+                compound="top",
+                font=("Segoe UI", 8),
+                wraplength=180,
+            )
+            btn.pack(**self._carousel_slot_pack_opts)
+            self.carousel_slots.append(btn)
+            self._carousel_slot_map.append(None)
+
         # ---- Mouse controls ----
         self.left_panel.bind("<Button-1>", lambda e: self.choose("a"))
         self.right_panel.bind("<Button-1>", lambda e: self.choose("b"))
@@ -649,6 +779,7 @@ class App:
         self._tick_job = None
         self._tick()
 
+        self._toggle_carousel()
         self.load_duel()
 
     # -------------------- helpers / state --------------------
@@ -676,6 +807,353 @@ class App:
             "tag_vars": {},
             "tag_button": None,
         }
+
+    def _toggle_carousel(self) -> None:
+        self.carousel_visible = not self.carousel_visible
+        if self.carousel_visible:
+            self.carousel_panel.pack(side="bottom", fill="x", padx=6, pady=(0, 6))
+        else:
+            self.carousel_panel.pack_forget()
+        self._update_carousel()
+
+    def _show_carousel(self, height: Optional[int] = None) -> None:
+        if height is not None:
+            self.carousel_height = max(self.carousel_min_height, min(self.carousel_max_height, height))
+            self.carousel_panel.configure(height=self.carousel_height)
+        if not self.carousel_visible:
+            self.carousel_visible = True
+            self.carousel_panel.pack(side="bottom", fill="x", padx=6, pady=(0, 6))
+        self._update_carousel()
+
+    def _on_carousel_drag_start(self, event) -> None:
+        if not self.carousel_visible:
+            self._show_carousel(self.carousel_default_height)
+        self._carousel_drag_start = event.y_root
+        self._carousel_dragging = False
+
+    def _on_carousel_drag(self, event) -> None:
+        if self._carousel_drag_start is None:
+            return
+        if not self.carousel_visible:
+            self._show_carousel(self.carousel_default_height)
+        root_y = self.root.winfo_rooty()
+        root_h = self.root.winfo_height()
+        new_height = int((root_y + root_h) - event.y_root - 6)
+        new_height = max(self.carousel_min_height, min(self.carousel_max_height, new_height))
+        if new_height != self.carousel_height:
+            self.carousel_height = new_height
+            self.carousel_panel.configure(height=self.carousel_height)
+            self._update_carousel()
+        self._carousel_drag_start = event.y_root
+        self._carousel_dragging = True
+
+    def _on_carousel_release(self, event) -> None:
+        if self._carousel_drag_start is None:
+            return
+        if not self._carousel_dragging:
+            self._show_carousel(self.carousel_default_height)
+        self._carousel_drag_start = None
+        self._carousel_dragging = False
+
+    def _update_carousel_layout(self, slot_count: int) -> None:
+        if not self.carousel_visible:
+            return
+        self.root.update_idletasks()
+        panel_width = max(1, self.carousel_panel.winfo_width())
+        controls_h = max(1, self.carousel_controls.winfo_height())
+        strip_padding = 2
+        label_height = 20
+        strip_height = max(40, self.carousel_height - controls_h - strip_padding)
+        slot_gap = 0
+        slot_count = max(1, slot_count)
+        slot_width = max(80, int(panel_width / slot_count) - slot_gap)
+        thumb_width = max(36, int(slot_width / 2) - 1)
+        thumb_height = max(36, strip_height - label_height)
+        new_size = (thumb_width, thumb_height)
+        if new_size != self.carousel_thumb_size:
+            self.carousel_thumb_size = new_size
+            for btn in self.carousel_slots:
+                btn.configure(image="")
+            for entry in self.duel_history:
+                entry["thumb"] = None
+
+    def _make_thumb_image(self, path: str) -> Image.Image:
+        w, h = self.carousel_thumb_size
+        try:
+            ext = Path(path).suffix.lower()
+            if ext in VIDEO_EXTS:
+                ffmpeg = self._ffmpeg_exe()
+                if ffmpeg and os.path.exists(path):
+                    try:
+                        cmd = [
+                            ffmpeg,
+                            "-hide_banner",
+                            "-loglevel",
+                            "error",
+                            "-ss",
+                            "00:00:01",
+                            "-i",
+                            path,
+                            "-frames:v",
+                            "1",
+                            "-f",
+                            "image2pipe",
+                            "-vcodec",
+                            "png",
+                            "-",
+                        ]
+                        r = subprocess.run(
+                            cmd,
+                            check=False,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                        )
+                        if r.stdout:
+                            im = Image.open(io.BytesIO(r.stdout)).convert("RGB")
+                            im.thumbnail((w, h))
+                            canvas = Image.new("RGB", (w, h), "#111111")
+                            offset = ((w - im.width) // 2, (h - im.height) // 2)
+                            canvas.paste(im, offset)
+                            return canvas
+                    except Exception:
+                        pass
+                img = Image.new("RGB", (w, h), "#111111")
+                draw = ImageDraw.Draw(img)
+                draw.text((8, h // 2 - 7), "VIDEO", fill="#d0d0d0")
+                return img
+            im = Image.open(path)
+            if ext in GIF_EXTS:
+                im.seek(0)
+            im = im.convert("RGB")
+            im.thumbnail((w, h))
+            canvas = Image.new("RGB", (w, h), "#111111")
+            offset = ((w - im.width) // 2, (h - im.height) // 2)
+            canvas.paste(im, offset)
+            return canvas
+        except Exception:
+            img = Image.new("RGB", (w, h), "#111111")
+            draw = ImageDraw.Draw(img)
+            draw.text((8, h // 2 - 7), "N/A", fill="#d0d0d0")
+            return img
+
+    def _build_duel_thumbnail(self, left_path: str, right_path: str) -> ImageTk.PhotoImage:
+        w, h = self.carousel_thumb_size
+        left = self._make_thumb_image(left_path)
+        right = self._make_thumb_image(right_path)
+        composite = Image.new("RGB", (w * 2 + 2, h), "#000000")
+        composite.paste(left, (0, 0))
+        composite.paste(right, (w + 2, 0))
+        return ImageTk.PhotoImage(composite)
+
+    def _attach_history_thumbs(self, entry: dict) -> None:
+        entry["thumb"] = self._build_duel_thumbnail(entry["a_path"], entry["b_path"])
+
+    def _fetch_row(self, img_id: int) -> Optional[tuple]:
+        row = self.conn.execute("""
+            SELECT id, path, folder, duels, wins, losses, score, hidden, tags
+            FROM images
+            WHERE id=?
+        """, (img_id,)).fetchone()
+        return row
+
+    def _truncate_label(self, text: str, limit: int = 26) -> str:
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 1)].rstrip() + "…"
+
+    def _history_label(self, entry: dict) -> str:
+        left = self._truncate_label(Path(entry["a_path"]).name, 18)
+        right = self._truncate_label(Path(entry["b_path"]).name, 18)
+        return f"{left} vs {right}"
+
+    def _enter_history_mode(self, index: int) -> None:
+        if self.history_index is None:
+            self.live_current = self.current
+        self.history_index = index
+        self._show_history_entry(index)
+
+    def _exit_history_mode(self) -> None:
+        self.history_index = None
+        if self.live_current:
+            a, b = self.live_current
+            self._set_current(a, b)
+            self._update_info_bars(a, b)
+            self._render_side("a")
+            self._render_side("b")
+            self.update_sidebar()
+        self._update_carousel()
+
+    def _show_history_entry(self, index: int) -> None:
+        if index < 0 or index >= len(self.duel_history):
+            return
+        entry = self.duel_history[index]
+        if entry.get("thumb") is None:
+            self._attach_history_thumbs(entry)
+        a = self._fetch_row(entry["a_id"])
+        b = self._fetch_row(entry["b_id"])
+        if not a or not b:
+            return
+        self._stop_video("a")
+        self._stop_video("b")
+        self._set_current(a, b)
+        self._update_info_bars(a, b)
+        self._render_side("a")
+        self._render_side("b")
+        self.update_sidebar()
+        self._update_carousel()
+
+    def _apply_revote(self, index: int, winner: Optional[str]) -> None:
+        if index < 0 or index >= len(self.duel_history):
+            return
+        entry = self.duel_history[index]
+        a_id = entry["a_id"]
+        b_id = entry["b_id"]
+        before_a = entry["before_a"]
+        before_b = entry["before_b"]
+
+        a_wins_inc = b_wins_inc = 0
+        a_losses_inc = b_losses_inc = 0
+        chosen_id = None
+
+        if winner == "a":
+            new_a, new_b = elo_update(before_a["score"], before_b["score"], True)
+            chosen_id = a_id
+            a_wins_inc, b_losses_inc = 1, 1
+        elif winner == "b":
+            new_a, new_b = elo_update(before_a["score"], before_b["score"], False)
+            chosen_id = b_id
+            b_wins_inc, a_losses_inc = 1, 1
+        elif winner == "downvote":
+            new_a, new_b = before_a["score"] - DOWNVOTE_PENALTY, before_b["score"] - DOWNVOTE_PENALTY
+            a_losses_inc, b_losses_inc = 1, 1
+        else:
+            new_a, new_b = elo_update(before_a["score"], before_b["score"], None)
+
+        ts = int(time.time())
+        self.conn.execute(
+            "UPDATE images SET score=?, duels=?, wins=?, losses=?, last_seen=? WHERE id=?",
+            (
+                new_a,
+                before_a["duels"] + 1,
+                before_a["wins"] + a_wins_inc,
+                before_a["losses"] + a_losses_inc,
+                ts,
+                a_id,
+            ),
+        )
+        self.conn.execute(
+            "UPDATE images SET score=?, duels=?, wins=?, losses=?, last_seen=? WHERE id=?",
+            (
+                new_b,
+                before_b["duels"] + 1,
+                before_b["wins"] + b_wins_inc,
+                before_b["losses"] + b_losses_inc,
+                ts,
+                b_id,
+            ),
+        )
+        if entry.get("comparison_id"):
+            self.conn.execute(
+                "UPDATE comparisons SET chosen_id=?, ts=? WHERE id=?",
+                (chosen_id, ts, entry["comparison_id"]),
+            )
+        self.conn.commit()
+        entry["winner"] = winner
+
+        try:
+            threading.Thread(
+                target=update_image_metadata,
+                args=(Path(entry["a_path"]), float(new_a)),
+                daemon=True,
+            ).start()
+            threading.Thread(
+                target=update_image_metadata,
+                args=(Path(entry["b_path"]), float(new_b)),
+                daemon=True,
+            ).start()
+        except Exception:
+            pass
+
+    def _on_carousel_prev(self) -> None:
+        if not self.duel_history:
+            return
+        if self.history_index is None:
+            index = len(self.duel_history) - 1
+        else:
+            index = max(0, self.history_index - 1)
+        self._enter_history_mode(index)
+
+    def _on_carousel_next(self) -> None:
+        if self.history_index is None:
+            return
+        if self.history_index < len(self.duel_history) - 1:
+            self._enter_history_mode(self.history_index + 1)
+        else:
+            self._exit_history_mode()
+
+    def _on_carousel_slot(self, slot_idx: int) -> None:
+        if slot_idx < 0 or slot_idx >= len(self._carousel_slot_map):
+            return
+        history_idx = self._carousel_slot_map[slot_idx]
+        if history_idx is None:
+            return
+        self._enter_history_mode(history_idx)
+
+    def _update_carousel(self) -> None:
+        total = len(self.duel_history)
+        if not self.carousel_visible:
+            self.carousel_info.configure(text=f"History: {total} (collapsed)")
+            self.carousel_prev_btn.configure(state="disabled")
+            self.carousel_next_btn.configure(state="disabled")
+            return
+        if total == 0:
+            self.carousel_info.configure(text="History: 0")
+            self.carousel_prev_btn.configure(state="disabled")
+            self.carousel_next_btn.configure(state="disabled")
+            for i, btn in enumerate(self.carousel_slots):
+                btn.pack_forget()
+                btn.configure(text="--", image="", state="disabled", bg=DARK_PANEL)
+                self._carousel_slot_map[i] = None
+            return
+
+        active_index = total - 1 if self.history_index is None else self.history_index
+        window_end = active_index
+        window_start = max(0, window_end - (self.carousel_size - 1))
+        indices = list(range(window_start, window_end + 1))
+        self._update_carousel_layout(len(indices))
+
+        for i, btn in enumerate(self.carousel_slots):
+            if i < len(indices):
+                idx = indices[i]
+                entry = self.duel_history[idx]
+                label = f"{idx + 1}. {self._history_label(entry)}"
+                if entry.get("thumb") is None:
+                    self._attach_history_thumbs(entry)
+                btn.configure(wraplength=max(120, self.carousel_thumb_size[0] * 2))
+                btn.configure(
+                    text=label,
+                    state="normal",
+                    bg=ACCENT if idx == active_index and self.history_index is not None else DARK_PANEL,
+                    image=entry.get("thumb", ""),
+                )
+                self._carousel_slot_map[i] = idx
+                if not btn.winfo_ismapped():
+                    btn.pack(**self._carousel_slot_pack_opts)
+            else:
+                btn.pack_forget()
+                btn.configure(text="--", image="", state="disabled", bg=DARK_PANEL)
+                self._carousel_slot_map[i] = None
+
+        if self.history_index is None:
+            self.carousel_info.configure(text=f"History: {total} (live duel)")
+            self.carousel_prev_btn.configure(state="normal")
+            self.carousel_next_btn.configure(state="disabled")
+        else:
+            self.carousel_info.configure(
+                text=f"History: {self.history_index + 1}/{total} (edit mode)",
+            )
+            self.carousel_prev_btn.configure(state="normal" if self.history_index > 0 else "disabled")
+            self.carousel_next_btn.configure(state="normal")
 
     def _build_tag_menu(self, side: str, parent: tk.Frame) -> None:
         button = tk.Menubutton(
@@ -1058,6 +1536,7 @@ class App:
             return
 
         self._set_current(a, b)
+        self.live_current = self.current
         self._update_info_bars(a, b)
         self.prev_artists.appendleft(a[2])
         self.prev_artists.appendleft(b[2])
@@ -1069,6 +1548,7 @@ class App:
         self._render_side("a")
         self._render_side("b")
         self.update_sidebar()
+        self._update_carousel()
 
     def choose(self, winner: Optional[str]):
         if not self.current:
@@ -1076,9 +1556,16 @@ class App:
         # snapshot ranks for delta arrows
         prev_ranks = {r["folder"]: r["rank"] for r in folder_leaderboard(self.conn, metric=self.metric)}
 
-        a, b = self.current
-        record_result(self.conn, a, b, winner)
+        if self.history_index is not None:
+            self._apply_revote(self.history_index, winner)
+            self._last_ranks = prev_ranks
+            self._show_history_entry(self.history_index)
+            return
 
+        a, b = self.current
+        entry = record_result(self.conn, a, b, winner)
+        self._attach_history_thumbs(entry)
+        self.duel_history.append(entry)
         self._last_ranks = prev_ranks
 
         # stop video playback when advancing
@@ -2805,6 +3292,7 @@ class App:
             panel = self.left_panel if side == "a" else self.right_panel
             self._cancel_animation(side)
             self._render_image_or_gif(side, panel, row[1])
+        self._update_carousel()
 
     # -------------------- quit --------------------
     def quit(self):
