@@ -1,7 +1,7 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-08b
-# Update: Apply pixelated blur overlay to videos too.
+# Version: 2026-02-08c
+# Update: Ensure video blur overlays render on top of VLC playback.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
@@ -814,6 +814,7 @@ class App:
             "vlc_event_mgr": None,
             "video_blur_label": None,
             "video_blur_image": None,
+            "video_blur_logo_path": None,
 
             "scrubbing": False,
             "tags": [],
@@ -1955,6 +1956,7 @@ class App:
         st["vlc_event_mgr"] = None
         st["scrubbing"] = False
         st["video_blur_image"] = None
+        self._clear_vlc_blur_logo(side)
         self._set_video_blur_visible(side, False)
 
     def toggle_video(self, side: str):
@@ -2981,6 +2983,43 @@ class App:
         else:
             label.place_forget()
 
+    def _clear_vlc_blur_logo(self, side: str) -> None:
+        st = self._side.get(side, {})
+        player = st.get("vlc_player")
+        if player:
+            try:
+                player.video_set_logo_int(vlc.VideoLogoOption.logo_enable, 0)
+            except Exception:
+                pass
+        logo_path = st.get("video_blur_logo_path")
+        if logo_path:
+            try:
+                os.remove(logo_path)
+            except Exception:
+                pass
+        st["video_blur_logo_path"] = None
+
+    def _set_vlc_blur_logo(self, side: str, image: Image.Image) -> None:
+        st = self._side.get(side, {})
+        player = st.get("vlc_player")
+        if not player:
+            return
+        self._clear_vlc_blur_logo(side)
+        try:
+            fd, logo_path = tempfile.mkstemp(suffix=".png")
+            os.close(fd)
+            image.save(logo_path, format="PNG")
+        except Exception:
+            return
+        st["video_blur_logo_path"] = logo_path
+        try:
+            player.video_set_logo_string(vlc.VideoLogoOption.logo_file, logo_path)
+            player.video_set_logo_int(vlc.VideoLogoOption.logo_enable, 1)
+            player.video_set_logo_int(vlc.VideoLogoOption.logo_opacity, 255)
+            player.video_set_logo_int(vlc.VideoLogoOption.logo_position, 0)
+        except Exception:
+            pass
+
     def _capture_video_snapshot(self, side: str, size: Tuple[int, int]) -> Optional[Image.Image]:
         st = self._side.get(side, {})
         player = st.get("vlc_player")
@@ -3016,6 +3055,7 @@ class App:
     def _update_video_blur_overlay(self, side: str, video_frame: tk.Frame, path: str) -> None:
         if not self.blur_enabled:
             self._set_video_blur_visible(side, False)
+            self._clear_vlc_blur_logo(side)
             return
         self.root.update_idletasks()
         w = max(1, video_frame.winfo_width())
@@ -3029,8 +3069,12 @@ class App:
         if snapshot.size != (w, h):
             snapshot = snapshot.resize((w, h), Image.Resampling.LANCZOS)
         snapshot = self._apply_pixelate(snapshot, pixel_size=50)
-        tk_im = ImageTk.PhotoImage(snapshot)
         st = self._side.get(side, {})
+        if HAVE_VLC and st.get("vlc_player"):
+            self._set_video_blur_visible(side, False)
+            self._set_vlc_blur_logo(side, snapshot)
+            return
+        tk_im = ImageTk.PhotoImage(snapshot)
         label = st.get("video_blur_label")
         if not label:
             return
