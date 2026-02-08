@@ -1,7 +1,7 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-08c
-# Update: Ensure video blur overlays render on top of VLC playback.
+# Version: 2026-02-08d
+# Update: Size video blur overlays to VLC video output.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
@@ -3017,6 +3017,8 @@ class App:
             player.video_set_logo_int(vlc.VideoLogoOption.logo_enable, 1)
             player.video_set_logo_int(vlc.VideoLogoOption.logo_opacity, 255)
             player.video_set_logo_int(vlc.VideoLogoOption.logo_position, 0)
+            player.video_set_logo_int(vlc.VideoLogoOption.logo_x, 0)
+            player.video_set_logo_int(vlc.VideoLogoOption.logo_y, 0)
         except Exception:
             pass
 
@@ -3058,18 +3060,28 @@ class App:
             self._clear_vlc_blur_logo(side)
             return
         self.root.update_idletasks()
-        w = max(1, video_frame.winfo_width())
-        h = max(1, video_frame.winfo_height())
-        if w <= 5 or h <= 5:
+        frame_w = max(1, video_frame.winfo_width())
+        frame_h = max(1, video_frame.winfo_height())
+        if frame_w <= 5 or frame_h <= 5:
             self.root.after(50, lambda: self._update_video_blur_overlay(side, video_frame, path))
             return
-        snapshot = self._capture_video_snapshot(side, (w, h))
-        if snapshot is None:
-            snapshot = Image.effect_noise((w, h), 64).convert("RGB")
-        if snapshot.size != (w, h):
-            snapshot = snapshot.resize((w, h), Image.Resampling.LANCZOS)
-        snapshot = self._apply_pixelate(snapshot, pixel_size=50)
         st = self._side.get(side, {})
+        video_size = None
+        if HAVE_VLC and st.get("vlc_player"):
+            try:
+                video_size = st["vlc_player"].video_get_size(0)
+            except Exception:
+                video_size = None
+        if video_size and video_size[0] > 0 and video_size[1] > 0:
+            target_w, target_h = video_size
+        else:
+            target_w, target_h = frame_w, frame_h
+        snapshot = self._capture_video_snapshot(side, (target_w, target_h))
+        if snapshot is None:
+            snapshot = Image.effect_noise((target_w, target_h), 64).convert("RGB")
+        if snapshot.size != (target_w, target_h):
+            snapshot = snapshot.resize((target_w, target_h), Image.Resampling.LANCZOS)
+        snapshot = self._apply_pixelate(snapshot, pixel_size=50)
         if HAVE_VLC and st.get("vlc_player"):
             self._set_video_blur_visible(side, False)
             self._set_vlc_blur_logo(side, snapshot)
