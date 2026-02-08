@@ -1,7 +1,7 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-08d
-# Update: Size video blur overlays to VLC video output.
+# Version: 2026-02-08e
+# Update: Refresh video blur overlays to keep pixelation in sync.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
@@ -815,6 +815,7 @@ class App:
             "video_blur_label": None,
             "video_blur_image": None,
             "video_blur_logo_path": None,
+            "video_blur_job": None,
 
             "scrubbing": False,
             "tags": [],
@@ -1956,6 +1957,7 @@ class App:
         st["vlc_event_mgr"] = None
         st["scrubbing"] = False
         st["video_blur_image"] = None
+        self._cancel_video_blur_job(side)
         self._clear_vlc_blur_logo(side)
         self._set_video_blur_visible(side, False)
 
@@ -2983,6 +2985,26 @@ class App:
         else:
             label.place_forget()
 
+    def _cancel_video_blur_job(self, side: str) -> None:
+        st = self._side.get(side, {})
+        job = st.get("video_blur_job")
+        if job:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+        st["video_blur_job"] = None
+
+    def _schedule_video_blur_overlay(self, side: str, video_frame: tk.Frame, path: str, delay_ms: int = 200) -> None:
+        if not self.blur_enabled:
+            return
+        st = self._side.get(side, {})
+        self._cancel_video_blur_job(side)
+        st["video_blur_job"] = self.root.after(
+            delay_ms,
+            lambda: self._update_video_blur_overlay(side, video_frame, path),
+        )
+
     def _clear_vlc_blur_logo(self, side: str) -> None:
         st = self._side.get(side, {})
         player = st.get("vlc_player")
@@ -3055,7 +3077,10 @@ class App:
                     pass
 
     def _update_video_blur_overlay(self, side: str, video_frame: tk.Frame, path: str) -> None:
+        st = self._side.get(side, {})
+        st["video_blur_job"] = None
         if not self.blur_enabled:
+            self._cancel_video_blur_job(side)
             self._set_video_blur_visible(side, False)
             self._clear_vlc_blur_logo(side)
             return
@@ -3063,9 +3088,8 @@ class App:
         frame_w = max(1, video_frame.winfo_width())
         frame_h = max(1, video_frame.winfo_height())
         if frame_w <= 5 or frame_h <= 5:
-            self.root.after(50, lambda: self._update_video_blur_overlay(side, video_frame, path))
+            self._schedule_video_blur_overlay(side, video_frame, path, delay_ms=50)
             return
-        st = self._side.get(side, {})
         video_size = None
         if HAVE_VLC and st.get("vlc_player"):
             try:
@@ -3085,6 +3109,7 @@ class App:
         if HAVE_VLC and st.get("vlc_player"):
             self._set_video_blur_visible(side, False)
             self._set_vlc_blur_logo(side, snapshot)
+            self._schedule_video_blur_overlay(side, video_frame, path)
             return
         tk_im = ImageTk.PhotoImage(snapshot)
         label = st.get("video_blur_label")
@@ -3094,6 +3119,7 @@ class App:
         label.image = tk_im
         st["video_blur_image"] = tk_im
         self._set_video_blur_visible(side, True)
+        self._schedule_video_blur_overlay(side, video_frame, path)
 
     def toggle_blur(self):
         self.blur_enabled = not getattr(self, "blur_enabled", False)
