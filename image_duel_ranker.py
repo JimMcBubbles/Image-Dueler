@@ -1,7 +1,7 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-08
-# Update: Add pixelated blur toggle for duel images.
+# Version: 2026-02-08b
+# Update: Apply pixelated blur overlay to videos too.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
@@ -487,6 +487,12 @@ class App:
         self.right_video = tk.Frame(self.right_container, bg="black", bd=0, highlightthickness=0)
         self.left_video.place_forget()
         self.right_video.place_forget()
+        self.left_video_blur = tk.Label(self.left_video, bg="black", bd=0, highlightthickness=0)
+        self.right_video_blur = tk.Label(self.right_video, bg="black", bd=0, highlightthickness=0)
+        self.left_video_blur.place_forget()
+        self.right_video_blur.place_forget()
+        self._side["a"]["video_blur_label"] = self.left_video_blur
+        self._side["b"]["video_blur_label"] = self.right_video_blur
 
         # Hover control bars
         self._build_hover_video_controls()
@@ -806,6 +812,8 @@ class App:
             "vlc_total_ms": None,
             "vlc_loop": True,
             "vlc_event_mgr": None,
+            "video_blur_label": None,
+            "video_blur_image": None,
 
             "scrubbing": False,
             "tags": [],
@@ -1785,10 +1793,12 @@ class App:
         # VLC not available -> placeholder
         if not self.vlc_instance:
             self._show_video_placeholder(video_frame, path, reason="Install VLC + python-vlc for in-app playback.")
+            self._update_video_blur_overlay(side, video_frame, path)
             return
 
         # If already playing this path, do nothing (do not reset on refresh)
         if st.get("vlc_player") and st.get("vlc_media") == path:
+            self._update_video_blur_overlay(side, video_frame, path)
             return
 
         self._stop_video(side)
@@ -1825,6 +1835,7 @@ class App:
         except Exception as e:
             self._show_video_placeholder(video_frame, path, reason=f"VLC media set failed: {e}")
             self._stop_video(side)
+            self._update_video_blur_overlay(side, video_frame, path)
             return
 
         # Start muted and "paused on first frame"
@@ -1861,9 +1872,11 @@ class App:
                 except Exception:
                     pass
             self._update_video_controls_state()
+            self._update_video_blur_overlay(side, video_frame, path)
 
         st["vlc_init_job"] = self.root.after(180, finalize)
         self._attach_vlc_events(side)
+        self._update_video_blur_overlay(side, video_frame, path)
 
     def _attach_vlc_events(self, side: str):
         st = self._side[side]
@@ -1941,6 +1954,8 @@ class App:
         st["vlc_total_ms"] = None
         st["vlc_event_mgr"] = None
         st["scrubbing"] = False
+        st["video_blur_image"] = None
+        self._set_video_blur_visible(side, False)
 
     def toggle_video(self, side: str):
         st = self._side[side]
@@ -2952,6 +2967,78 @@ class App:
         except Exception:
             pass
 
+    def _set_video_blur_visible(self, side: str, visible: bool) -> None:
+        st = self._side.get(side, {})
+        label = st.get("video_blur_label")
+        if not label:
+            return
+        if visible:
+            label.place(relx=0, rely=0, relwidth=1, relheight=1)
+            try:
+                label.lift()
+            except Exception:
+                pass
+        else:
+            label.place_forget()
+
+    def _capture_video_snapshot(self, side: str, size: Tuple[int, int]) -> Optional[Image.Image]:
+        st = self._side.get(side, {})
+        player = st.get("vlc_player")
+        if not player:
+            return None
+        tmp_path = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(suffix=".png")
+            os.close(fd)
+            try:
+                player.video_take_snapshot(0, tmp_path, size[0], size[1])
+            except Exception:
+                return None
+            for _ in range(6):
+                try:
+                    if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.05)
+            try:
+                with Image.open(tmp_path) as snap:
+                    return snap.convert("RGB").copy()
+            except Exception:
+                return None
+        finally:
+            if tmp_path:
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+
+    def _update_video_blur_overlay(self, side: str, video_frame: tk.Frame, path: str) -> None:
+        if not self.blur_enabled:
+            self._set_video_blur_visible(side, False)
+            return
+        self.root.update_idletasks()
+        w = max(1, video_frame.winfo_width())
+        h = max(1, video_frame.winfo_height())
+        if w <= 5 or h <= 5:
+            self.root.after(50, lambda: self._update_video_blur_overlay(side, video_frame, path))
+            return
+        snapshot = self._capture_video_snapshot(side, (w, h))
+        if snapshot is None:
+            snapshot = Image.effect_noise((w, h), 64).convert("RGB")
+        if snapshot.size != (w, h):
+            snapshot = snapshot.resize((w, h), Image.Resampling.LANCZOS)
+        snapshot = self._apply_pixelate(snapshot, pixel_size=50)
+        tk_im = ImageTk.PhotoImage(snapshot)
+        st = self._side.get(side, {})
+        label = st.get("video_blur_label")
+        if not label:
+            return
+        label.configure(image=tk_im)
+        label.image = tk_im
+        st["video_blur_image"] = tk_im
+        self._set_video_blur_visible(side, True)
+
     def toggle_blur(self):
         self.blur_enabled = not getattr(self, "blur_enabled", False)
         self._update_blur_toggle_style()
@@ -2959,11 +3046,15 @@ class App:
         for side in ("a", "b"):
             st = self._side.get(side, {})
             row = st.get("row")
-            if not row or st.get("media_kind") == "video":
+            if not row:
                 continue
-            panel = self.left_panel if side == "a" else self.right_panel
-            self._cancel_animation(side)
-            self._render_image_or_gif(side, panel, row[1])
+            if st.get("media_kind") == "video":
+                vframe = self.left_video if side == "a" else self.right_video
+                self._update_video_blur_overlay(side, vframe, row[1])
+            else:
+                panel = self.left_panel if side == "a" else self.right_panel
+                self._cancel_animation(side)
+                self._render_image_or_gif(side, panel, row[1])
 
     def toggle_sidebar(self):
         """Toggle the right sidebar (focus mode)."""
