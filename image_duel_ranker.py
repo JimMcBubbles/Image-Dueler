@@ -1,7 +1,7 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-08d
-# Update: Make the history drawer handlebar always visible.
+# Version: 2026-02-08e
+# Update: Add a high-contrast handlebar with padding for the history drawer.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
@@ -510,9 +510,8 @@ class App:
         self.now_header = tk.Label(self.sidebar, text="Current / Previous",
                                    font=("Segoe UI", 11, "bold"), fg=ACCENT, bg=DARK_BG)
         self.now_frame = tk.Frame(self.sidebar, bg=DARK_PANEL, bd=1, relief="solid")
-        self.now_handle = tk.Frame(self.now_frame, bg=ACCENT, height=6)
-        self.now_handle.pack(fill="x")
-        self.now_handle.pack_propagate(False)
+        self.now_handle = tk.Canvas(self.now_frame, height=6, bg=ACCENT, highlightthickness=0)
+        self.now_handle.pack(fill="x", padx=6, pady=(6, 0))
         self.now = tk.Text(self.now_frame, height=6, wrap="word",
                            font=("Segoe UI", 10), fg=TEXT_COLOR, bg=DARK_PANEL,
                            relief="flat", highlightthickness=0, bd=0)
@@ -520,7 +519,7 @@ class App:
         self.now.bind("<MouseWheel>", self._scroll_now)
         self.now.bind("<Button-4>", self._scroll_now)
         self.now.bind("<Button-5>", self._scroll_now)
-        self.now.pack(fill="x", padx=6, pady=(4, 6))
+        self.now.pack(fill="x", padx=6, pady=(6, 6))
 
         # ---- Links ----
         self.links_header = tk.Label(self.sidebar, text="Links",
