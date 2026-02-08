@@ -1,7 +1,7 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-07
-# Update: Auto-play videos when they are selected in a duel.
+# Version: 2026-02-08
+# Update: Add a draggable history drawer with resize-aware thumbnails.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
@@ -29,7 +29,7 @@ import tkinter.ttk as ttk
 import tkinter.font as tkfont
 import tkinter.messagebox as messagebox
 
-from PIL import Image, ImageTk, ImageSequence, ImageFilter
+from PIL import Image, ImageTk, ImageSequence, ImageFilter, ImageDraw
 
 # Optional chart (only used on exit)
 try:
@@ -77,6 +77,12 @@ INFO_BAR_FG = "#d0d0d0"
 INFO_BAR_FONT = ("Segoe UI", 10)
 SEPARATOR_BG = "#242424"
 SIDEBAR_WIDTH = 420
+
+CAROUSEL_HISTORY_MAX = 18
+CAROUSEL_SLOT_COUNT = 8
+CAROUSEL_MIN_HEIGHT = 40
+CAROUSEL_DEFAULT_HEIGHT = 160
+CAROUSEL_MAX_HEIGHT = 320
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 GIF_EXTS = {".gif"}
@@ -352,6 +358,14 @@ class App:
         self._last_ranks = {r["folder"]: r["rank"] for r in folder_leaderboard(self.conn, metric=self.metric)}
         self._resize_job = None
         self._audio_cache = {}
+        self.carousel_history = deque(maxlen=CAROUSEL_HISTORY_MAX)
+        self.carousel_visible = True
+        self.carousel_min_height = CAROUSEL_MIN_HEIGHT
+        self.carousel_default_height = CAROUSEL_DEFAULT_HEIGHT
+        self.carousel_max_height = CAROUSEL_MAX_HEIGHT
+        self.carousel_height = self.carousel_default_height
+        self._carousel_dragging = False
+        self._thumb_size = None
 
         # video state per side
         self.vlc_instance = None
@@ -585,6 +599,9 @@ class App:
         self.keys_header.pack(anchor="w")
         self.keys_text.pack(anchor="w")
 
+        # ---- Carousel drawer ----
+        self._build_carousel_drawer()
+
         # ---- Mouse controls ----
         self.left_panel.bind("<Button-1>", lambda e: self.choose("a"))
         self.right_panel.bind("<Button-1>", lambda e: self.choose("b"))
@@ -799,6 +816,185 @@ class App:
             except Exception:
                 pass
         self._resize_job = self.root.after(120, self._refresh_visuals_only)
+
+    def _build_carousel_drawer(self) -> None:
+        self.carousel_handle = tk.Frame(
+            self.root,
+            height=8,
+            bg=DARK_BORDER,
+            cursor="sb_v_double_arrow",
+            highlightthickness=0,
+        )
+        self.carousel_handle.pack(side="bottom", fill="x")
+
+        self.carousel_panel = tk.Frame(
+            self.root,
+            height=self.carousel_height,
+            bg=DARK_PANEL,
+            highlightthickness=0,
+        )
+        self.carousel_panel.pack(side="bottom", fill="x")
+        self.carousel_panel.pack_propagate(False)
+
+        self.carousel_status = tk.Label(
+            self.carousel_panel,
+            text="Recent duel history",
+            bg=DARK_PANEL,
+            fg=TEXT_COLOR,
+            font=("Segoe UI", 9),
+            anchor="w",
+        )
+        self.carousel_status.pack(fill="x", padx=10, pady=(6, 2))
+
+        self.carousel_slots_row = tk.Frame(self.carousel_panel, bg=DARK_PANEL)
+        self.carousel_slots_row.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+        self.carousel_slots = []
+        for _ in range(CAROUSEL_SLOT_COUNT):
+            btn = tk.Button(
+                self.carousel_slots_row,
+                image="",
+                text="",
+                bg=DARK_BG,
+                fg=TEXT_COLOR,
+                relief="flat",
+                highlightthickness=1,
+                highlightbackground=DARK_BORDER,
+                activebackground=ACCENT,
+                compound="center",
+            )
+            btn.pack(side="left", expand=True, fill="both", padx=4)
+            self.carousel_slots.append(btn)
+
+        self.carousel_handle.bind("<ButtonPress-1>", self._on_carousel_handle_press)
+        self.carousel_handle.bind("<B1-Motion>", self._on_carousel_handle_drag)
+        self.carousel_handle.bind("<ButtonRelease-1>", self._on_carousel_handle_release)
+
+        self.root.update_idletasks()
+        self._update_carousel()
+
+    def _set_carousel_height(self, height: int) -> None:
+        height = max(self.carousel_min_height, min(self.carousel_max_height, int(height)))
+        if height != self.carousel_height:
+            self.carousel_height = height
+            self.carousel_panel.configure(height=height)
+
+    def _on_carousel_handle_press(self, event):
+        self._carousel_dragging = False
+
+    def _on_carousel_handle_drag(self, event):
+        self._carousel_dragging = True
+        window_bottom = self.root.winfo_rooty() + self.root.winfo_height()
+        new_height = window_bottom - event.y_root
+        self._set_carousel_height(new_height)
+        self.root.update_idletasks()
+        self._update_carousel()
+
+    def _on_carousel_handle_release(self, event):
+        if not self._carousel_dragging:
+            if self.carousel_height <= self.carousel_min_height + 2:
+                self._set_carousel_height(self.carousel_default_height)
+            else:
+                self._set_carousel_height(self.carousel_min_height)
+            self.root.update_idletasks()
+            self._update_carousel()
+        self._carousel_dragging = False
+
+    def _append_history_item(self, row: tuple) -> None:
+        if not row:
+            return
+        self.carousel_history.append({
+            "path": row[1],
+            "thumb": None,
+            "thumb_size": None,
+        })
+
+    def _thumbnail_placeholder(self, size: Tuple[int, int], label: str) -> ImageTk.PhotoImage:
+        img = Image.new("RGB", size, color="#2b2b2b")
+        draw = ImageDraw.Draw(img)
+        draw.text((6, max(6, size[1] // 2 - 6)), label, fill="#b0b0b0")
+        return ImageTk.PhotoImage(img)
+
+    def _build_thumbnail(self, path: str, size: Tuple[int, int]) -> ImageTk.PhotoImage:
+        kind = self._media_kind(path)
+        if kind == "video":
+            return self._thumbnail_placeholder(size, "VIDEO")
+
+        try:
+            im = Image.open(path)
+        except Exception:
+            return self._thumbnail_placeholder(size, "N/A")
+
+        try:
+            if getattr(im, "is_animated", False):
+                im.seek(0)
+        except Exception:
+            pass
+        if im.mode not in ("RGB", "RGBA"):
+            im = im.convert("RGB")
+        im.thumbnail(size, Image.Resampling.LANCZOS)
+        return ImageTk.PhotoImage(im)
+
+    def _open_history_item(self, entry: dict) -> None:
+        path = entry.get("path")
+        if not path:
+            return
+        try:
+            os.startfile(path)
+        except Exception:
+            pass
+
+    def _update_carousel(self) -> None:
+        if not getattr(self, "carousel_panel", None):
+            return
+        self.root.update_idletasks()
+
+        if not self.carousel_visible:
+            return
+
+        panel_w = max(1, int(self.carousel_panel.winfo_width() or 1))
+        panel_h = max(1, int(self.carousel_panel.winfo_height() or 1))
+        status_h = max(1, int(self.carousel_status.winfo_height() or 1))
+        available_h = max(1, panel_h - status_h - 12)
+        slot_count = max(1, len(self.carousel_slots))
+        pad = 8
+
+        thumb_w = max(40, (panel_w - pad * (slot_count + 1)) // slot_count)
+        thumb_h = max(32, available_h)
+        new_size = (thumb_w, thumb_h)
+
+        if self._thumb_size != new_size:
+            self._thumb_size = new_size
+            for btn in self.carousel_slots:
+                btn.configure(image="", text="")
+                btn.image = None
+            for item in self.carousel_history:
+                item["thumb"] = None
+                item["thumb_size"] = None
+
+        history = list(self.carousel_history)
+        visible = history[-slot_count:]
+
+        if self.carousel_height <= self.carousel_min_height + 2:
+            self.carousel_status.configure(text="History collapsed (click handle to expand)")
+        elif not visible:
+            self.carousel_status.configure(text="Recent duel history (empty)")
+        else:
+            self.carousel_status.configure(text="Recent duel history")
+
+        for idx, btn in enumerate(self.carousel_slots):
+            if idx < len(visible):
+                entry = visible[idx]
+                if entry.get("thumb") is None or entry.get("thumb_size") != new_size:
+                    entry["thumb"] = self._build_thumbnail(entry["path"], new_size)
+                    entry["thumb_size"] = new_size
+                btn.configure(image=entry["thumb"], text="")
+                btn.image = entry["thumb"]
+                btn.configure(command=lambda e=entry: self._open_history_item(e))
+            else:
+                btn.configure(image="", text="")
+                btn.image = None
+                btn.configure(command=lambda: None)
 
     def _media_kind(self, path: str) -> str:
         ext = Path(path).suffix.lower()
@@ -1049,6 +1245,9 @@ class App:
         self._side["b"]["row"] = b
         self._side["a"]["media_kind"] = self._media_kind(a[1])
         self._side["b"]["media_kind"] = self._media_kind(b[1])
+        self._append_history_item(a)
+        self._append_history_item(b)
+        self._update_carousel()
 
     def load_duel(self):
         a, b = self.pick_two()
@@ -2805,6 +3004,7 @@ class App:
             panel = self.left_panel if side == "a" else self.right_panel
             self._cancel_animation(side)
             self._render_image_or_gif(side, panel, row[1])
+        self._update_carousel()
 
     # -------------------- quit --------------------
     def quit(self):
