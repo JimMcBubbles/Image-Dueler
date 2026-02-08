@@ -1,7 +1,7 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-07
-# Update: Auto-play videos when they are selected in a duel.
+# Version: 2026-02-08
+# Update: Add blur toggle and scrollable duel history in the sidebar.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
@@ -77,6 +77,7 @@ INFO_BAR_FG = "#d0d0d0"
 INFO_BAR_FONT = ("Segoe UI", 10)
 SEPARATOR_BG = "#242424"
 SIDEBAR_WIDTH = 420
+BLUR_RADIUS = 6
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 GIF_EXTS = {".gif"}
@@ -346,7 +347,7 @@ class App:
 
         # state
         self.current: Optional[Tuple[tuple, tuple]] = None
-        self.prev_artists = deque(maxlen=6)
+        self.prev_artists = deque(maxlen=20)
         self.page = 0
         self.metric = LEADERBOARD_METRIC_DEFAULT
         self._last_ranks = {r["folder"]: r["rank"] for r in folder_leaderboard(self.conn, metric=self.metric)}
@@ -483,6 +484,11 @@ class App:
                                             command=self.toggle_sidebar,
                                             bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat", width=7)
         self.sidebar_toggle_btn.pack(side="right")
+        self.blur_enabled = False
+        self.blur_toggle_btn = tk.Button(self.pool_filter_row, text="Blur: Off",
+                                         command=self.toggle_blur,
+                                         bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat", width=9)
+        self.blur_toggle_btn.pack(side="right", padx=(0, 6))
         self.pool_filter_row.pack(fill="x", pady=(0, 6))
 
         # ---- Leaderboard ----
@@ -494,16 +500,6 @@ class App:
         self.board = tk.Text(self.sidebar, height=20, font=("Consolas", 10),
                              bg=DARK_PANEL, fg=TEXT_COLOR, insertbackground=TEXT_COLOR,
                              relief="flat", wrap="none")
-        self.nav_row = tk.Frame(self.sidebar, bg=DARK_BG)
-        self.btn_prev = tk.Button(self.nav_row, text="Prev [ / PgUp", width=14,
-                                  command=lambda: self.change_page(-1),
-                                  bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat")
-        self.btn_next = tk.Button(self.nav_row, text="Next ] / PgDn", width=14,
-                                  command=lambda: self.change_page(+1),
-                                  bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat")
-        self.btn_prev.pack(side="left", padx=(0, 6))
-        self.btn_next.pack(side="right")
-
         # ---- Counters ----
         self.counters_header = tk.Label(self.sidebar, text="Counters",
                                         font=("Segoe UI", 11, "bold"), fg=ACCENT, bg=DARK_BG)
@@ -513,8 +509,13 @@ class App:
         # ---- Current / Previous ----
         self.now_header = tk.Label(self.sidebar, text="Current / Previous",
                                    font=("Segoe UI", 11, "bold"), fg=ACCENT, bg=DARK_BG)
-        self.now = tk.Label(self.sidebar, text="", justify="left",
-                            font=("Segoe UI", 10), fg=TEXT_COLOR, bg=DARK_BG)
+        self.now = tk.Text(self.sidebar, height=6, wrap="word",
+                           font=("Segoe UI", 10), fg=TEXT_COLOR, bg=DARK_BG,
+                           relief="flat", highlightthickness=0, bd=0)
+        self.now.configure(state="disabled")
+        self.now.bind("<MouseWheel>", self._scroll_now)
+        self.now.bind("<Button-4>", self._scroll_now)
+        self.now.bind("<Button-5>", self._scroll_now)
 
         # ---- Links ----
         self.links_header = tk.Label(self.sidebar, text="Links",
@@ -559,7 +560,6 @@ class App:
         self.metric_label.pack(anchor="w")
         self.page_label.pack(anchor="e", pady=(0, 4))
         self.board.pack(fill="x", pady=(4, 6))
-        self.nav_row.pack(fill="x", pady=(0, 6))
         tk.Frame(self.sidebar, height=1, bg=SEPARATOR_BG).pack(fill="x", pady=(0, 6))
 
         self.counters_header.pack(anchor="w", pady=(2, 0))
@@ -567,7 +567,7 @@ class App:
         tk.Frame(self.sidebar, height=1, bg=SEPARATOR_BG).pack(fill="x", pady=(0, 6))
 
         self.now_header.pack(anchor="w")
-        self.now.pack(anchor="w", pady=(2, 6))
+        self.now.pack(fill="x", pady=(2, 6))
 
         self.links_header.pack(anchor="w")
         self.link_left.pack(anchor="w")
@@ -1191,6 +1191,14 @@ class App:
             except Exception:
                 pass
 
+    def _apply_blur(self, im: Image.Image) -> Image.Image:
+        if not getattr(self, "blur_enabled", False):
+            return im
+        try:
+            return im.filter(ImageFilter.GaussianBlur(BLUR_RADIUS))
+        except Exception:
+            return im
+
     def _render_image_or_gif(self, side: str, widget: tk.Label, path: str):
         self.root.update_idletasks()
         w = max(1, widget.winfo_width())
@@ -1216,6 +1224,7 @@ class App:
             if im.mode not in ("RGB", "RGBA"):
                 im = im.convert("RGB")
             im.thumbnail(target, Image.Resampling.LANCZOS)
+            im = self._apply_blur(im)
             tk_im = ImageTk.PhotoImage(im)
             widget.configure(image=tk_im, text="", bg=DARK_PANEL)
             widget.image = tk_im
@@ -1230,12 +1239,14 @@ class App:
                 delays.append(int(delay))
                 fr = frame.convert("RGBA") if frame.mode != "RGBA" else frame.copy()
                 fr.thumbnail(target, Image.Resampling.LANCZOS)
+                fr = self._apply_blur(fr)
                 frames.append(ImageTk.PhotoImage(fr))
         except Exception:
             # fallback: first frame only
             im.seek(0)
             fr = im.convert("RGBA") if im.mode != "RGBA" else im.copy()
             fr.thumbnail(target, Image.Resampling.LANCZOS)
+            fr = self._apply_blur(fr)
             tk_im = ImageTk.PhotoImage(fr)
             widget.configure(image=tk_im, text="", bg=DARK_PANEL)
             widget.image = tk_im
@@ -2338,10 +2349,8 @@ class App:
                 prev_display.append(f"• Prev: #{pr} {leaf} — {pa:.1f} (n={pn}){self._format_delta(f, leader)}")
             else:
                 prev_display.append(f"• Prev: {leaf} — (unranked)")
-            if len(prev_display) >= 2:
-                break
 
-        self.now.configure(text="\n".join([l_line, r_line] + prev_display))
+        self._set_now_text("\n".join([l_line, r_line] + prev_display))
 
         # Links for current duel
         left_url = e621_url_for_path(a[1])
@@ -2435,6 +2444,40 @@ class App:
             "Ctrl+B:    Toggle sidebar (focus mode)",
             "Q:         Quit",
         ])
+
+    def _scroll_now(self, event):
+        if not getattr(self, "now", None):
+            return "break"
+        if getattr(event, "delta", 0):
+            direction = -1 if event.delta > 0 else 1
+        else:
+            direction = -1 if getattr(event, "num", None) == 4 else 1
+        try:
+            self.now.yview_scroll(direction, "units")
+        except Exception:
+            pass
+        return "break"
+
+    def _set_now_text(self, text: str) -> None:
+        try:
+            self.now.configure(state="normal")
+            self.now.delete("1.0", "end")
+            self.now.insert("1.0", text)
+            self.now.configure(state="disabled")
+            self.now.yview_moveto(0)
+        except Exception:
+            pass
+
+    def toggle_blur(self):
+        self.blur_enabled = not getattr(self, "blur_enabled", False)
+        self._update_blur_toggle()
+        self._refresh_visuals_only()
+
+    def _update_blur_toggle(self):
+        if not getattr(self, "blur_toggle_btn", None):
+            return
+        label = "Blur: On" if getattr(self, "blur_enabled", False) else "Blur: Off"
+        self.blur_toggle_btn.configure(text=label)
 
     # -------------------- file open / reveal --------------------
 
