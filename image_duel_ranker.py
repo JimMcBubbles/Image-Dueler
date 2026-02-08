@@ -1,7 +1,7 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-08b
-# Update: Increase blur strength and restore the visible history drawer.
+# Version: 2026-02-08c
+# Update: Make the history drawer framing visibly distinct.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
@@ -509,9 +509,9 @@ class App:
         # ---- Current / Previous ----
         self.now_header = tk.Label(self.sidebar, text="Current / Previous",
                                    font=("Segoe UI", 11, "bold"), fg=ACCENT, bg=DARK_BG)
-        self.now_frame = tk.Frame(self.sidebar, bg=DARK_PANEL, highlightthickness=1, highlightbackground=DARK_BORDER)
-        self.now_handle = tk.Frame(self.now_frame, bg=DARK_BORDER, height=4)
-        self.now_handle.pack(fill="x")
+        self.now_frame = tk.Frame(self.sidebar, bg=DARK_PANEL, bd=1, relief="solid")
+        self.now_handle = tk.Frame(self.now_frame, bg=SEPARATOR_BG, height=6)
+        self.now_handle.pack(fill="x", padx=6, pady=(6, 0))
         self.now = tk.Text(self.now_frame, height=6, wrap="word",
                            font=("Segoe UI", 10), fg=TEXT_COLOR, bg=DARK_PANEL,
                            relief="flat", highlightthickness=0, bd=0)
