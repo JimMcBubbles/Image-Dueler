@@ -1,7 +1,7 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-08g
-# Update: Animate pixelated blur overlays with VLC-safe GIF frames.
+# Version: 2026-02-08h
+# Update: Keep VLC blur overlay visible while GIF frames prepare.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
@@ -3279,16 +3279,19 @@ class App:
             target_w, target_h = video_size
         else:
             target_w, target_h = frame_w, frame_h
-        if self._ensure_video_blur_gif(side, path, (target_w, target_h)):
-            self._clear_vlc_blur_logo(side)
-            self._start_video_blur_gif_animation(side)
-            return
         snapshot = self._capture_video_snapshot(side, (target_w, target_h))
         if snapshot is None:
             snapshot = Image.effect_noise((target_w, target_h), 64).convert("RGB")
         if snapshot.size != (target_w, target_h):
             snapshot = snapshot.resize((target_w, target_h), Image.Resampling.LANCZOS)
         snapshot = self._apply_pixelate(snapshot, pixel_size=50)
+        if HAVE_VLC and st.get("vlc_player"):
+            if self._ensure_video_blur_gif(side, path, (target_w, target_h)):
+                self._start_video_blur_gif_animation(side)
+            else:
+                self._cancel_video_blur_gif_animation(side)
+                self._set_vlc_blur_logo(side, snapshot)
+            return
         self._cancel_video_blur_gif_animation(side)
         self._clear_vlc_blur_logo(side)
         tk_im = ImageTk.PhotoImage(snapshot)
