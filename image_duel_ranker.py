@@ -1,7 +1,7 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-08
-# Update: Add blur toggle and scrollable duel history in the sidebar.
+# Version: 2026-02-08b
+# Update: Increase blur strength and restore the visible history drawer.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
@@ -77,7 +77,7 @@ INFO_BAR_FG = "#d0d0d0"
 INFO_BAR_FONT = ("Segoe UI", 10)
 SEPARATOR_BG = "#242424"
 SIDEBAR_WIDTH = 420
-BLUR_RADIUS = 6
+BLUR_RADIUS = 18
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 GIF_EXTS = {".gif"}
@@ -509,13 +509,17 @@ class App:
         # ---- Current / Previous ----
         self.now_header = tk.Label(self.sidebar, text="Current / Previous",
                                    font=("Segoe UI", 11, "bold"), fg=ACCENT, bg=DARK_BG)
-        self.now = tk.Text(self.sidebar, height=6, wrap="word",
-                           font=("Segoe UI", 10), fg=TEXT_COLOR, bg=DARK_BG,
+        self.now_frame = tk.Frame(self.sidebar, bg=DARK_PANEL, highlightthickness=1, highlightbackground=DARK_BORDER)
+        self.now_handle = tk.Frame(self.now_frame, bg=DARK_BORDER, height=4)
+        self.now_handle.pack(fill="x")
+        self.now = tk.Text(self.now_frame, height=6, wrap="word",
+                           font=("Segoe UI", 10), fg=TEXT_COLOR, bg=DARK_PANEL,
                            relief="flat", highlightthickness=0, bd=0)
         self.now.configure(state="disabled")
         self.now.bind("<MouseWheel>", self._scroll_now)
         self.now.bind("<Button-4>", self._scroll_now)
         self.now.bind("<Button-5>", self._scroll_now)
+        self.now.pack(fill="x", padx=6, pady=(4, 6))
 
         # ---- Links ----
         self.links_header = tk.Label(self.sidebar, text="Links",
@@ -567,7 +571,7 @@ class App:
         tk.Frame(self.sidebar, height=1, bg=SEPARATOR_BG).pack(fill="x", pady=(0, 6))
 
         self.now_header.pack(anchor="w")
-        self.now.pack(fill="x", pady=(2, 6))
+        self.now_frame.pack(fill="x", pady=(2, 6))
 
         self.links_header.pack(anchor="w")
         self.link_left.pack(anchor="w")
