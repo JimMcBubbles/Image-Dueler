@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-12c
-# Update: Matched sidebar tag-filter menu styling to the per-image tag dropdown.
-# Build: 2026-02-12c (tag filter style alignment)
+# Version: 2026-02-12d
+# Update: Restored blur effect on history thumbnails when Blur mode is enabled.
+# Build: 2026-02-12d (history thumbnail blur fix)
 
 import os
 import io
@@ -983,6 +983,9 @@ class App:
         w, h = self.carousel_thumb_size
         left = self._make_thumb_image(left_path)
         right = self._make_thumb_image(right_path)
+        if self.blur_enabled:
+            left = self._apply_pixelate(left, pixel_size=14)
+            right = self._apply_pixelate(right, pixel_size=14)
         composite = Image.new("RGB", (w * 2 + 2, h), "#000000")
         composite.paste(left, (0, 0))
         composite.paste(right, (w + 2, 0))
@@ -3217,6 +3220,10 @@ class App:
     def toggle_blur(self):
         self.blur_enabled = not getattr(self, "blur_enabled", False)
         self._update_blur_toggle_style()
+
+        for entry in self.duel_history:
+            entry["thumb"] = None
+        self._update_carousel()
 
         for side in ("a", "b"):
             st = self._side.get(side, {})
