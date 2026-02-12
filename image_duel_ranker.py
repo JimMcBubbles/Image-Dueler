@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-12l
-# Update: Synced title build stamp and made tag filter exclude selected tags immediately.
-# Build: 2026-02-12l (title stamp + tag exclusion filter)
+# Version: 2026-02-12m
+# Update: Force immediate pool revalidation after per-image tag edits.
+# Build: 2026-02-12m (tag edit reroll consistency)
 
 import os
 import io
@@ -1328,10 +1328,9 @@ class App:
         updated = self._fetch_row(row[0])
         if updated:
             self._side[side]["row"] = updated
-            if not self._row_matches_filter(updated):
-                self._replace_side_keep_other(side)
-                return
-            self.update_sidebar()
+
+        # Revalidate both sides against active pool/tag filters immediately.
+        self.on_pool_filter_change()
 
     def _on_configure(self, event=None):
         # avoid recreating players on resize; only re-render still images/gifs
