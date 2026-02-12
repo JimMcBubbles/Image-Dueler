@@ -1,7 +1,7 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-08d
-# Update: Size video blur overlays to VLC video output.
+# Version: 2026-02-12c
+# Update: Prevent Tk image errors when rebuilding blurred carousel thumbs.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
@@ -928,6 +928,8 @@ class App:
                             canvas = Image.new("RGB", (w, h), "#111111")
                             offset = ((w - im.width) // 2, (h - im.height) // 2)
                             canvas.paste(im, offset)
+                            if self.blur_enabled:
+                                canvas = self._apply_pixelate(canvas, pixel_size=10)
                             return canvas
                     except Exception:
                         pass
@@ -943,6 +945,8 @@ class App:
             canvas = Image.new("RGB", (w, h), "#111111")
             offset = ((w - im.width) // 2, (h - im.height) // 2)
             canvas.paste(im, offset)
+            if self.blur_enabled:
+                canvas = self._apply_pixelate(canvas, pixel_size=10)
             return canvas
         except Exception:
             img = Image.new("RGB", (w, h), "#111111")
@@ -3098,6 +3102,14 @@ class App:
     def toggle_blur(self):
         self.blur_enabled = not getattr(self, "blur_enabled", False)
         self._update_blur_toggle_style()
+
+        # Rebuild history thumbnails under the new blur state.
+        # Clear button image handles first to avoid stale Tk image references.
+        for btn in self.carousel_slots:
+            btn.configure(image="")
+        for entry in self.duel_history:
+            entry["thumb"] = None
+        self._update_carousel()
 
         for side in ("a", "b"):
             st = self._side.get(side, {})
