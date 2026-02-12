@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-12i
-# Update: Prevented click-binding overlap for Shift/Ctrl left-click actions.
-# Build: 2026-02-12i (click binding overlap fix)
+# Version: 2026-02-12j
+# Update: Re-rolls sides when tag edits are filtered out and adds undo tag/hide menu action.
+# Build: 2026-02-12j (tag filter reroll + undo menu)
 
 import os
 import io
@@ -1324,6 +1324,14 @@ class App:
         self._side[side]["tags"] = self._ordered_tags(tags)
         self._set_tag_button_label(side)
 
+        updated = self._fetch_row(row[0])
+        if updated:
+            self._side[side]["row"] = updated
+            if not self._row_matches_filter(updated):
+                self._replace_side_keep_other(side)
+                return
+            self.update_sidebar()
+
     def _on_configure(self, event=None):
         # avoid recreating players on resize; only re-render still images/gifs
         if self._resize_job:
@@ -1696,6 +1704,26 @@ class App:
         if not self.current:
             return
         self._replace_side_keep_other(side)
+
+    def undo_side_tag_hide(self, side: str) -> None:
+        if not self.current:
+            return
+        row = self._side[side].get("row")
+        if not row:
+            return
+        tags = set(self._tags_for_row(row))
+        tags.discard("HIDE")
+        self._write_tags(row[0], tags, hidden=0)
+        updated = self._fetch_row(row[0])
+        if updated:
+            self._side[side]["row"] = updated
+            self._side[side]["tags"] = self._ordered_tags(tags)
+            if not self._row_matches_filter(updated):
+                self._replace_side_keep_other(side)
+                return
+            self._sync_tag_controls(side)
+            self._render_side(side)
+            self.update_sidebar()
 
     def hide_side(self, side: str):
         if not self.current:
@@ -3075,6 +3103,7 @@ class App:
         menu.add_command(label="Downvote", command=lambda s=side: self.downvote_side(s))
         menu.add_command(label="Skip", command=lambda s=side: self.skip_side(s))
         menu.add_command(label="Hide", command=lambda s=side: self.hide_side(s))
+        menu.add_command(label="Undo tag/hide", command=lambda s=side: self.undo_side_tag_hide(s))
         menu.add_separator()
         menu.add_command(label="Open image/video", command=self.open_left if side == "a" else self.open_right)
         menu.add_command(label="Reveal folder", command=self.reveal_left_folder if side == "a" else self.reveal_right_folder)
