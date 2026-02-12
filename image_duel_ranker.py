@@ -1,7 +1,7 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-12
-# Update: Apply blur toggle to carousel history thumbnails.
+# Version: 2026-02-12b
+# Update: Refresh carousel thumbs when blur is toggled.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
@@ -3102,6 +3102,11 @@ class App:
     def toggle_blur(self):
         self.blur_enabled = not getattr(self, "blur_enabled", False)
         self._update_blur_toggle_style()
+
+        # Rebuild history thumbnails under the new blur state.
+        for entry in self.duel_history:
+            entry["thumb"] = None
+        self._update_carousel()
 
         for side in ("a", "b"):
             st = self._side.get(side, {})
