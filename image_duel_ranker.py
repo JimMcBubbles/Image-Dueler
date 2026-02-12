@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-12
-# Update: Added per-side action controls, tag filtering dropdown, and refreshed sidebar link/keybind UX.
-# Build: 2026-02-12 (side actions + tag filtering refresh)
+# Version: 2026-02-12b
+# Update: Replaced tag filter dropdown with multi-select tag checkboxes.
+# Build: 2026-02-12b (tag filter multiselect checkboxes)
 
 import os
 import io
@@ -102,15 +102,14 @@ E621_MAX_TAGS = 40
 DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
 TAG_OPTIONS = ["SFW", "MEME", "HIDE", "CW"]
-TAG_FILTER_OPTIONS = [
-    "Default (-MEME -SFW -CW)",
-    "All tags",
-    "Only SFW",
-    "Only MEME",
-    "Only CW",
-]
+TAG_FILTER_LABELS = {
+    "SFW": "SFW 🟦",
+    "MEME": "MEME 🟦",
+    "HIDE": "HIDE 🟦",
+    "CW": "CW 🟦",
+}
 
-BUILD_STAMP = '2026-02-12 (side actions + tag filtering refresh)'
+BUILD_STAMP = '2026-02-12b (tag filter multiselect checkboxes)'
 
 # -------------------- DB --------------------
 def init_db() -> sqlite3.Connection:
@@ -534,18 +533,31 @@ class App:
         self.pool_filter.pack(side="right")
         self.pool_filter.bind("<<ComboboxSelected>>", lambda e: self.on_pool_filter_change())
 
-        tk.Label(self.pool_filter_row, text="Tags:", font=("Segoe UI", 10, "bold"),
-                 fg=ACCENT, bg=DARK_BG).pack(side="right", padx=(0, 4))
-        self.tag_filter_var = tk.StringVar(value=TAG_FILTER_OPTIONS[0])
-        self.tag_filter = ttk.Combobox(
+        self.tag_filter_vars: dict = {}
+        self.tag_filter_btn = tk.Menubutton(
             self.pool_filter_row,
-            textvariable=self.tag_filter_var,
-            values=TAG_FILTER_OPTIONS,
-            state="readonly",
+            text="Tags: none",
+            font=("Segoe UI", 9),
+            fg=TEXT_COLOR,
+            bg=DARK_PANEL,
+            activebackground=ACCENT,
+            activeforeground=TEXT_COLOR,
+            relief="flat",
+            cursor="hand2",
             width=20,
+            anchor="w",
         )
-        self.tag_filter.pack(side="right", padx=(0, 6))
-        self.tag_filter.bind("<<ComboboxSelected>>", lambda e: self.on_pool_filter_change())
+        self.tag_filter_btn.pack(side="right", padx=(0, 6))
+        self.tag_filter_menu = tk.Menu(self.tag_filter_btn, tearoff=0)
+        for tag in TAG_OPTIONS:
+            var = tk.BooleanVar(value=False)
+            self.tag_filter_vars[tag] = var
+            self.tag_filter_menu.add_checkbutton(
+                label=TAG_FILTER_LABELS.get(tag, tag),
+                variable=var,
+                command=self.on_tag_filter_change,
+            )
+        self.tag_filter_btn.configure(menu=self.tag_filter_menu)
 
         # Sidebar toggle (focus mode)
         self.sidebar_visible = True
@@ -1448,18 +1460,34 @@ class App:
         except Exception:
             pass
 
+    def _selected_tag_filters(self) -> List[str]:
+        selected = []
+        for tag in TAG_OPTIONS:
+            var = self.tag_filter_vars.get(tag)
+            if var and var.get():
+                selected.append(tag)
+        return selected
+
+    def _update_tag_filter_button_label(self) -> None:
+        selected = self._selected_tag_filters()
+        if not selected:
+            label = "Tags: none"
+        else:
+            label = "Tags: " + ", ".join(selected)
+            if len(label) > 28:
+                label = f"Tags: {len(selected)} selected"
+        self.tag_filter_btn.configure(text=label)
+
+    def on_tag_filter_change(self):
+        self._update_tag_filter_button_label()
+        self.on_pool_filter_change()
+
     def _tag_filter_matches(self, row: tuple) -> bool:
-        mode = (self.tag_filter_var.get() or TAG_FILTER_OPTIONS[0]).strip()
-        tags = set(self._parse_tags(row[8] if row and len(row) > 8 else ""))
-        if mode == "All tags":
+        selected = set(self._selected_tag_filters())
+        if not selected:
             return True
-        if mode == "Only SFW":
-            return "SFW" in tags
-        if mode == "Only MEME":
-            return "MEME" in tags
-        if mode == "Only CW":
-            return "CW" in tags
-        return not any(t in tags for t in ("MEME", "SFW", "CW"))
+        tags = set(self._parse_tags(row[8] if row and len(row) > 8 else ""))
+        return any(tag in tags for tag in selected)
 
     def _row_matches_filter(self, row: tuple) -> bool:
         # row: (id, path, folder, duels, wins, losses, score, hidden, tags)
