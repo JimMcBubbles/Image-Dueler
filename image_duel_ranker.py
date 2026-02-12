@@ -1,7 +1,7 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-08d
-# Update: Size video blur overlays to VLC video output.
+# Version: 2026-02-12
+# Update: Apply blur toggle to carousel history thumbnails.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
@@ -928,6 +928,8 @@ class App:
                             canvas = Image.new("RGB", (w, h), "#111111")
                             offset = ((w - im.width) // 2, (h - im.height) // 2)
                             canvas.paste(im, offset)
+                            if self.blur_enabled:
+                                canvas = self._apply_pixelate(canvas, pixel_size=10)
                             return canvas
                     except Exception:
                         pass
@@ -943,6 +945,8 @@ class App:
             canvas = Image.new("RGB", (w, h), "#111111")
             offset = ((w - im.width) // 2, (h - im.height) // 2)
             canvas.paste(im, offset)
+            if self.blur_enabled:
+                canvas = self._apply_pixelate(canvas, pixel_size=10)
             return canvas
         except Exception:
             img = Image.new("RGB", (w, h), "#111111")
