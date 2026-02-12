@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-08d
-# Update: Size video blur overlays to VLC video output.
-# Build: 2026-01-25c (aligned tag dropdowns)
+# Version: 2026-02-12m
+# Update: Force immediate pool revalidation after per-image tag edits.
+# Build: 2026-02-12m (tag edit reroll consistency)
 
 import os
 import io
@@ -103,7 +103,7 @@ DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
 TAG_OPTIONS = ["SFW", "MEME", "HIDE", "CW"]
 
-BUILD_STAMP = '2026-01-25c (aligned tag dropdowns)'
+BUILD_STAMP = '2026-02-12l (title stamp + tag exclusion filter)'
 
 # -------------------- DB --------------------
 def init_db() -> sqlite3.Connection:
@@ -465,23 +465,27 @@ class App:
 
         self._build_tag_menu("a", self.left_info_row)
         self._build_tag_menu("b", self.right_info_row)
+        self._build_action_buttons("a", self.left_info_row)
+        self._build_action_buttons("b", self.right_info_row)
         self.left_info_row.columnconfigure(0, weight=1)
         self.right_info_row.columnconfigure(0, weight=1)
 
         # Make info bars behave like the image/video panel for clicks
         for w in (self.left_info_bar, self.left_info_text):
             w.bind("<Button-1>", lambda e: self.choose("a"))
-            w.bind("<Button-3>", lambda e: self.choose("downvote"))
+            w.bind("<Shift-Button-1>", lambda e: self._on_shift_downvote("a", e))
+            w.bind("<Control-Button-1>", lambda e: self._on_ctrl_options("a", e))
+            w.bind("<Button-3>", lambda e: self.skip_side("a"))
             w.bind("<Button-2>", lambda e: self.hide_side("a"))
             w.bind("<Double-Button-1>", self.open_left)
-            w.bind("<Control-Button-1>", lambda e: self.toggle_video("a"))
 
         for w in (self.right_info_bar, self.right_info_text):
             w.bind("<Button-1>", lambda e: self.choose("b"))
-            w.bind("<Button-3>", lambda e: self.choose("downvote"))
+            w.bind("<Shift-Button-1>", lambda e: self._on_shift_downvote("b", e))
+            w.bind("<Control-Button-1>", lambda e: self._on_ctrl_options("b", e))
+            w.bind("<Button-3>", lambda e: self.skip_side("b"))
             w.bind("<Button-2>", lambda e: self.hide_side("b"))
             w.bind("<Double-Button-1>", self.open_right)
-            w.bind("<Control-Button-1>", lambda e: self.toggle_video("b"))
 
         self.left_video = tk.Frame(self.left_container, bg="black", bd=0, highlightthickness=0)
         self.right_video = tk.Frame(self.right_container, bg="black", bd=0, highlightthickness=0)
@@ -525,12 +529,37 @@ class App:
         self.pool_filter.pack(side="right")
         self.pool_filter.bind("<<ComboboxSelected>>", lambda e: self.on_pool_filter_change())
 
+        self.tag_filter_vars: dict = {}
+        self.tag_filter_btn = tk.Menubutton(
+            self.pool_filter_row,
+            text="Tags: (none)",
+            font=("Segoe UI", 9),
+            fg=INFO_BAR_FG,
+            bg=INFO_BAR_BG,
+            activebackground=INFO_BAR_BG,
+            activeforeground=INFO_BAR_FG,
+            relief="flat",
+            cursor="hand2",
+            anchor="w",
+        )
+        self.tag_filter_btn.pack(side="right", padx=(0, 6))
+        self.tag_filter_menu = tk.Menu(self.tag_filter_btn, tearoff=0)
+        for tag in TAG_OPTIONS:
+            var = tk.BooleanVar(value=False)
+            self.tag_filter_vars[tag] = var
+            self.tag_filter_menu.add_checkbutton(
+                label=tag,
+                variable=var,
+                command=self.on_tag_filter_change,
+            )
+        self.tag_filter_btn.configure(menu=self.tag_filter_menu)
+
         # Sidebar toggle (focus mode)
         self.sidebar_visible = True
         self.sidebar_toggle_btn = tk.Button(self.pool_filter_row, text="Focus",
                                             command=self.toggle_sidebar,
                                             bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat", width=7)
-        self.sidebar_toggle_btn.pack(side="right")
+        self.sidebar_toggle_btn.pack(side="right", padx=(0, 6))
         self.blur_enabled = False
         self.blur_toggle_btn = tk.Button(self.pool_filter_row, text="Blur",
                                          command=self.toggle_blur,
@@ -547,6 +576,10 @@ class App:
         self.board = tk.Text(self.sidebar, height=20, font=("Consolas", 10),
                              bg=DARK_PANEL, fg=TEXT_COLOR, insertbackground=TEXT_COLOR,
                              relief="flat", wrap="none")
+        self.board.tag_configure("delta_up", foreground="#7ad97a")
+        self.board.tag_configure("delta_down", foreground="#ff7a7a")
+        self.board.tag_configure("delta_flat", foreground="#9a9a9a")
+        self.board.tag_configure("delta_new", foreground="#9bd6ff")
         self.nav_row = tk.Frame(self.sidebar, bg=DARK_BG)
         self.btn_prev = tk.Button(self.nav_row, text="Prev [ / PgUp", width=14,
                                   command=lambda: self.change_page(-1),
@@ -581,17 +614,9 @@ class App:
         self.link_left.bind("<Button-1>", lambda e: self._open_url(getattr(self.link_left, "url", "")))
         self.link_right.bind("<Button-1>", lambda e: self._open_url(getattr(self.link_right, "url", "")))
 
-        # ---- Search tags + export ----
-        self.search_header = tk.Label(self.sidebar, text="Search tags",
-                                      font=("Segoe UI", 11, "bold"), fg=ACCENT, bg=DARK_BG)
-        self.common_tags_entry = tk.Entry(self.sidebar, font=("Consolas", 9),
-                                          bg=DARK_PANEL, fg=TEXT_COLOR, insertbackground=TEXT_COLOR,
-                                          relief="flat")
-        self.common_tags_entry.insert(0, DEFAULT_COMMON_TAGS)
+        # ---- Links tools ----
+        self.common_tags_var = tk.StringVar(value=DEFAULT_COMMON_TAGS)
 
-        self.export_links_btn = tk.Button(self.sidebar, text="Export e621 links (clipboard + file)",
-                                          command=self.export_e621_links,
-                                          bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat")
         self.view_links_btn = tk.Button(self.sidebar, text="View/open e621 links",
                                         command=self.show_links_view,
                                         bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat")
@@ -627,9 +652,6 @@ class App:
         self.link_right.pack(anchor="w", pady=(0, 6))
         tk.Frame(self.sidebar, height=1, bg=SEPARATOR_BG).pack(fill="x", pady=(0, 6))
 
-        self.search_header.pack(anchor="w")
-        self.common_tags_entry.pack(fill="x", pady=(2, 6))
-        self.export_links_btn.pack(fill="x", pady=(0, 2))
         self.view_links_btn.pack(fill="x", pady=(0, 2))
         self.db_stats_btn.pack(fill="x", pady=(0, 6))
         self.export_status.pack(anchor="w", pady=(0, 6))
@@ -729,58 +751,40 @@ class App:
         # ---- Mouse controls ----
         self.left_panel.bind("<Button-1>", lambda e: self.choose("a"))
         self.right_panel.bind("<Button-1>", lambda e: self.choose("b"))
+        self.left_panel.bind("<Shift-Button-1>", lambda e: self._on_shift_downvote("a", e))
+        self.right_panel.bind("<Shift-Button-1>", lambda e: self._on_shift_downvote("b", e))
+        self.left_panel.bind("<Control-Button-1>", lambda e: self._on_ctrl_options("a", e))
+        self.right_panel.bind("<Control-Button-1>", lambda e: self._on_ctrl_options("b", e))
         self.left_panel.bind("<Double-Button-1>", self.open_left)
         self.right_panel.bind("<Double-Button-1>", self.open_right)
-        self.left_panel.bind("<Button-3>", lambda e: self.choose("downvote"))
-        self.right_panel.bind("<Button-3>", lambda e: self.choose("downvote"))
+        self.left_panel.bind("<Button-3>", lambda e: self.skip_side("a"))
+        self.right_panel.bind("<Button-3>", lambda e: self.skip_side("b"))
 
         # Hide: middle click
         self.left_panel.bind("<Button-2>", lambda e: self.hide_side("a"))
         self.right_panel.bind("<Button-2>", lambda e: self.hide_side("b"))
 
-        # Ctrl+Click: play/pause that side if video
-        self.left_panel.bind("<Control-Button-1>", lambda e: self.toggle_video("a"))
-        self.right_panel.bind("<Control-Button-1>", lambda e: self.toggle_video("b"))
-
         # Also allow click on video frames
         for w, side in [(self.left_video, "a"), (self.right_video, "b")]:
-            w.bind("<Control-Button-1>", lambda e, s=side: self.toggle_video(s))
+            w.bind("<Control-Button-1>", lambda e, s=side: self._on_ctrl_options(s, e))
+            w.bind("<Shift-Button-1>", lambda e, s=side: self._on_shift_downvote(s, e))
             w.bind("<Double-Button-1>", self.open_left if side == "a" else self.open_right)
             w.bind("<Button-1>", lambda e, s=side: self.choose("a" if s == "a" else "b"))
+            w.bind("<Button-3>", lambda e, s=side: self.skip_side(s))
+            w.bind("<Button-2>", lambda e, s=side: self.hide_side(s))
 
         # ---- Keybinds ----
         root.bind("1", lambda e: self.choose("a"))
         root.bind("2", lambda e: self.choose("b"))
-        root.bind("3", lambda e: self.choose("downvote"))
+        root.bind("3", lambda e: self.focus_side("a"))
+        root.bind("4", lambda e: self.downvote_side("a"))
+        root.bind("5", lambda e: self.downvote_side("b"))
+        root.bind("6", lambda e: self.focus_side("b"))
+        root.bind("7", lambda e: self.skip_side("a"))
+        root.bind("8", lambda e: self.skip_side("b"))
+        root.bind("9", lambda e: self.toggle_sidebar())
         root.bind("0", lambda e: self.choose(None))
-        root.bind("<space>", lambda e: self.choose(None))
-
-        root.bind("x", lambda e: self.hide_side("a"))
-        root.bind("m", lambda e: self.hide_side("b"))
-
-        root.bind("o", self.open_left)
-        root.bind("p", self.open_right)
-        root.bind("O", self.reveal_left_folder)
-        root.bind("P", self.reveal_right_folder)
-
-        root.bind("[", lambda e: self.change_page(-1))
-        root.bind("]", lambda e: self.change_page(+1))
-        root.bind("<Prior>", lambda e: self.change_page(-1))
-        root.bind("<Next>", lambda e: self.change_page(+1))
-
-        root.bind("t", lambda e: self.toggle_metric())
-        root.bind("g", lambda e: self.export_e621_links())
-        root.bind("G", lambda e: self.export_e621_links())
-        root.bind("v", lambda e: self.show_links_view())
-        root.bind("V", lambda e: self.show_links_view())
-        root.bind("i", lambda e: self.show_db_stats())
-        root.bind("I", lambda e: self.show_db_stats())
-
-        # Video (VLC) controls
-        root.bind("<Control-1>", lambda e: self.toggle_video("a"))
-        root.bind("<Control-2>", lambda e: self.toggle_video("b"))
-        root.bind("<Control-Shift-1>", lambda e: self.toggle_mute("a"))
-        root.bind("<Control-Shift-2>", lambda e: self.toggle_mute("b"))
+        root.bind(".", lambda e: self.toggle_blur())
 
         root.bind("q", lambda e: self.quit())
 
@@ -820,6 +824,8 @@ class App:
             "tags": [],
             "tag_vars": {},
             "tag_button": None,
+            "action_buttons": {},
+            "last_replaced_row": None,
         }
 
     def _toggle_carousel(self) -> None:
@@ -954,6 +960,9 @@ class App:
         w, h = self.carousel_thumb_size
         left = self._make_thumb_image(left_path)
         right = self._make_thumb_image(right_path)
+        if self.blur_enabled:
+            left = self._apply_pixelate(left, pixel_size=14)
+            right = self._apply_pixelate(right, pixel_size=14)
         composite = Image.new("RGB", (w * 2 + 2, h), "#000000")
         composite.paste(left, (0, 0))
         composite.paste(right, (w + 2, 0))
@@ -1137,6 +1146,8 @@ class App:
         self._update_carousel_layout(len(indices))
 
         for i, btn in enumerate(self.carousel_slots):
+            # Clear stale Tk image handles first to avoid "image ... doesn't exist" on reconfigure.
+            btn.configure(image="")
             if i < len(indices):
                 idx = indices[i]
                 entry = self.duel_history[idx]
@@ -1181,7 +1192,7 @@ class App:
             relief="flat",
             cursor="hand2",
         )
-        button.grid(row=0, column=1, sticky="e", padx=8, pady=2)
+        button.grid(row=0, column=2, sticky="e", padx=8, pady=2)
         menu = tk.Menu(button, tearoff=0)
         tag_vars: dict = {}
         for tag in TAG_OPTIONS:
@@ -1195,6 +1206,37 @@ class App:
         button.configure(menu=menu)
         self._side[side]["tag_vars"] = tag_vars
         self._side[side]["tag_button"] = button
+
+    def _build_action_buttons(self, side: str, parent: tk.Frame) -> None:
+        actions = tk.Frame(parent, bg=INFO_BAR_BG)
+        actions.grid(row=0, column=1, sticky="e", padx=(0, 8), pady=2)
+
+        spec = [
+            ("Upvote", lambda s=side: self.choose(s)),
+            ("Downvote", lambda s=side: self.downvote_side(s)),
+            ("Skip", lambda s=side: self.skip_side(s)),
+            ("Hide", lambda s=side: self.hide_side(s)),
+        ]
+        buttons: dict = {}
+        for text, cmd in spec:
+            btn = tk.Button(
+                actions,
+                text=text,
+                command=cmd,
+                bg=INFO_BAR_BG,
+                fg=INFO_BAR_FG,
+                activebackground=DARK_PANEL,
+                activeforeground=INFO_BAR_FG,
+                relief="flat",
+                padx=6,
+                pady=0,
+                font=("Segoe UI", 8),
+                cursor="hand2",
+            )
+            btn.pack(side="left", padx=(0, 2))
+            buttons[text.lower()] = btn
+        self._side[side]["action_buttons"] = buttons
+
 
     def _ordered_tags(self, tags: set) -> List[str]:
         return [tag for tag in TAG_OPTIONS if tag in tags]
@@ -1282,6 +1324,13 @@ class App:
             self._write_tags(row[0], tags)
         self._side[side]["tags"] = self._ordered_tags(tags)
         self._set_tag_button_label(side)
+
+        updated = self._fetch_row(row[0])
+        if updated:
+            self._side[side]["row"] = updated
+
+        # Revalidate both sides against active pool/tag filters immediately.
+        self.on_pool_filter_change()
 
     def _on_configure(self, event=None):
         # avoid recreating players on resize; only re-render still images/gifs
@@ -1393,6 +1442,30 @@ class App:
         except Exception:
             pass
 
+    def _selected_tag_filters(self) -> List[str]:
+        selected = []
+        for tag in TAG_OPTIONS:
+            var = self.tag_filter_vars.get(tag)
+            if var and var.get():
+                selected.append(tag)
+        return selected
+
+    def _update_tag_filter_button_label(self) -> None:
+        selected = self._selected_tag_filters()
+        label = "Tags: " + (", ".join(selected) if selected else "(none)")
+        self.tag_filter_btn.configure(text=label)
+
+    def on_tag_filter_change(self):
+        self._update_tag_filter_button_label()
+        self.on_pool_filter_change()
+
+    def _tag_filter_matches(self, row: tuple) -> bool:
+        selected = set(self._selected_tag_filters())
+        if not selected:
+            return True
+        tags = set(self._parse_tags(row[8] if row and len(row) > 8 else ""))
+        return not any(tag in tags for tag in selected)
+
     def _row_matches_filter(self, row: tuple) -> bool:
         # row: (id, path, folder, duels, wins, losses, score, hidden, tags)
         hidden = int(row[7] or 0)
@@ -1402,6 +1475,8 @@ class App:
         if f == "Hidden":
             return hidden == 1
         if hidden == 1:
+            return False
+        if not self._tag_filter_matches(row):
             return False
 
         if f == "All":
@@ -1587,41 +1662,21 @@ class App:
         self._stop_video("b")
         self.load_duel()
 
-    def hide_side(self, side: str):
+    def _replace_side_keep_other(self, side: str) -> None:
         if not self.current:
             return
         a, b = self.current
-        target = a if side == "a" else b
+        outgoing = a if side == "a" else b
         other = b if side == "a" else a
+        self._side[side]["last_replaced_row"] = outgoing
 
-        # In "Hidden" pool, middle-click acts as UNHIDE (to make recovery easy).
-
-
-        if self.pool_filter_var.get() == "Hidden":
-
-
-            unhide_image(self.conn, target)
-            tags = set(self._tags_for_row(target))
-            tags.discard("HIDE")
-            self._write_tags(target[0], tags, hidden=0)
-
-
-        else:
-
-
-            hide_image(self.conn, target)
-            tags = set(self._tags_for_row(target))
-            tags.add("HIDE")
-            self._write_tags(target[0], tags, hidden=1)
-
-        pool = self._pool_rows()  # respects current filter
+        pool = self._pool_rows()
         replacement = self.pick_one(
             exclude_id=other[0],
             pool=pool,
             required_kind=self._media_kind(other[1]),
         )
         if not replacement:
-            # if no replacement in pool, just reload duel
             self.load_duel()
             return
 
@@ -1630,10 +1685,78 @@ class App:
         else:
             self._set_current(other, replacement)
 
-        # stop old side video
         self._stop_video(side)
         self._render_side(side)
         self.update_sidebar()
+
+    def downvote_side(self, side: str) -> None:
+        if not self.current:
+            return
+        a, b = self.current
+        target = a if side == "a" else b
+        now_ts = int(time.time())
+        self.conn.execute(
+            "UPDATE images SET score=score-?, duels=duels+1, losses=losses+1, last_seen=? WHERE id=?",
+            (DOWNVOTE_PENALTY, now_ts, target[0]),
+        )
+        self.conn.commit()
+        self._replace_side_keep_other(side)
+
+    def skip_side(self, side: str) -> None:
+        if not self.current:
+            return
+        self._replace_side_keep_other(side)
+
+    def undo_side_tag_hide(self, side: str) -> None:
+        if not self.current:
+            return
+        candidate = self._side[side].get("last_replaced_row") or self._side[side].get("row")
+        if not candidate:
+            return
+        restored = self._fetch_row(candidate[0])
+        if not restored:
+            return
+
+        tags = set(self._tags_for_row(restored))
+        tags.discard("HIDE")
+        self._write_tags(restored[0], tags, hidden=0)
+        restored = self._fetch_row(restored[0])
+        if not restored:
+            return
+
+        a, b = self.current
+        other = b if side == "a" else a
+        if self._media_kind(restored[1]) != self._media_kind(other[1]):
+            return
+
+        if side == "a":
+            self._set_current(restored, other)
+        else:
+            self._set_current(other, restored)
+        self._side[side]["last_replaced_row"] = None
+        self._stop_video(side)
+        self._render_side(side)
+        self.update_sidebar()
+
+    def hide_side(self, side: str):
+        if not self.current:
+            return
+        a, b = self.current
+        target = a if side == "a" else b
+
+        # In "Hidden" pool, middle-click acts as UNHIDE (to make recovery easy).
+        if self.pool_filter_var.get() == "Hidden":
+            unhide_image(self.conn, target)
+            tags = set(self._tags_for_row(target))
+            tags.discard("HIDE")
+            self._write_tags(target[0], tags, hidden=0)
+        else:
+            hide_image(self.conn, target)
+            tags = set(self._tags_for_row(target))
+            tags.add("HIDE")
+            self._write_tags(target[0], tags, hidden=1)
+
+        self._replace_side_keep_other(side)
 
     # -------------------- rendering --------------------
     def _apply_pixelate(self, im: Image.Image, pixel_size: int = 50) -> Image.Image:
@@ -2823,20 +2946,38 @@ class App:
             return name if len(name) <= LEAF_MAX else (name[:LEAF_MAX - 1] + "…")
 
         lines = []
-        for row in leader[start:end]:
+        deltas: List[Tuple[int, str]] = []
+        for idx, row in enumerate(leader[start:end]):
             leaf = trunc(Path(row["folder"]).name)
             marker = "  ◀" if row["folder"] in {folder_left, folder_right} else ""
-            if self.metric == "avg":
-                line = f"{row['rank']:>3}. {leaf:<{LEAF_MAX}} {row['avg']:6.1f}  (n={row['n']}){marker}"
-            elif self.metric == "shrunken_avg":
-                line = f"{row['rank']:>3}. {leaf:<{LEAF_MAX}} {row['score']:6.1f}  avg={row['avg']:5.1f} (n={row['n']}){marker}"
+            old_rank = self._last_ranks.get(row["folder"])
+            if old_rank is None:
+                ticker, ticker_tag = "▲", "delta_new"
             else:
-                line = f"{row['rank']:>3}. {leaf:<{LEAF_MAX}} {row['score']:6.1f}  avg={row['avg']:5.1f} (n={row['n']}){marker}"
+                shift = old_rank - row["rank"]
+                if shift > 0:
+                    ticker, ticker_tag = "▲", "delta_up"
+                elif shift < 0:
+                    ticker, ticker_tag = "▼", "delta_down"
+                else:
+                    ticker, ticker_tag = "•", "delta_flat"
+            if self.metric == "avg":
+                line = f"{ticker} {row['rank']:>3}. {leaf:<{LEAF_MAX}} {row['avg']:6.1f}  (n={row['n']}){marker}"
+            elif self.metric == "shrunken_avg":
+                line = f"{ticker} {row['rank']:>3}. {leaf:<{LEAF_MAX}} {row['score']:6.1f}  avg={row['avg']:5.1f} (n={row['n']}){marker}"
+            else:
+                line = f"{ticker} {row['rank']:>3}. {leaf:<{LEAF_MAX}} {row['score']:6.1f}  avg={row['avg']:5.1f} (n={row['n']}){marker}"
             lines.append(line)
+            deltas.append((idx, ticker_tag))
 
         self.board.configure(state="normal")
         self.board.delete("1.0", "end")
-        self.board.insert("1.0", "\n".join(lines) if lines else "No folders yet.")
+        if lines:
+            self.board.insert("1.0", "\n".join(lines))
+            for row_idx, tag in deltas:
+                self.board.tag_add(tag, f"{row_idx + 1}.0", f"{row_idx + 1}.1")
+        else:
+            self.board.insert("1.0", "No folders yet.")
         self.board.configure(state="disabled")
 
         # Current / previous rank lines
@@ -2933,32 +3074,67 @@ class App:
 
     def _keybind_text(self) -> str:
         return "\n".join([
-            "L-Click:   Pick LEFT",
-            "R-Click:   Pick RIGHT",
-            "R-Click(3):Downvote (both)",
-            "0 / Space: Skip / tie",
+            "Keybinds:",
+            "L Click: Vote",
+            "R Click: Skip",
+            "M Click: Hide",
             "",
-            "M-Click:   Hide side (replace only that side)",
-            "X / M:     Hide LEFT / Hide RIGHT",
+            "Shift + L Click: Downvote",
+            "Ctrl + L Click: More Options",
             "",
-            "Dbl-Click: Open image/video",
-            "O / P:     Open LEFT / Open RIGHT",
-            "Shift+O/P: Reveal LEFT/RIGHT folder",
-            "",
-            "[ / PgUp:  Prev leaderboard page",
-            "] / PgDn:  Next leaderboard page",
-            "T:         Toggle leaderboard metric",
-            "G:         Export e621 links",
-            "V:         View/open e621 links",
-            "I:         DB stats",
-            "",
-            "Ctrl+1/2:  Play/Pause LEFT/RIGHT video",
-            "Ctrl+Shift+1/2: Mute/Unmute LEFT/RIGHT",
-            "Ctrl+Click: Play/Pause hovered side",
-            "",
-            "Ctrl+B:    Toggle sidebar (focus mode)",
-            "Q:         Quit",
+            "1: Vote Left",
+            "2: Vote Right",
+            "3: Focus Left",
+            "4: Downvote Left",
+            "5: Downvote Right",
+            "6: Focus Right",
+            "7: Skip Left",
+            "8: Skip Right",
+            "9: Toggle Focus",
+            "0: Skip Both",
+            ".: Toggle Blur",
         ])
+
+    def _on_shift_downvote(self, side: str, _event=None):
+        self.downvote_side(side)
+        return "break"
+
+    def _on_ctrl_options(self, side: str, event=None):
+        self.show_side_options(side, event)
+        return "break"
+
+    def focus_side(self, side: str) -> None:
+        """Focus one side by entering fullscreen for that side."""
+        try:
+            self._enter_fullscreen(side)
+        except Exception:
+            pass
+
+    def show_side_options(self, side: str, event=None) -> None:
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="Upvote", command=lambda s=side: self.choose(s))
+        menu.add_command(label="Downvote", command=lambda s=side: self.downvote_side(s))
+        menu.add_command(label="Skip", command=lambda s=side: self.skip_side(s))
+        menu.add_command(label="Hide", command=lambda s=side: self.hide_side(s))
+        menu.add_command(label="Undo tag/hide", command=lambda s=side: self.undo_side_tag_hide(s))
+        menu.add_separator()
+        menu.add_command(label="Open image/video", command=self.open_left if side == "a" else self.open_right)
+        menu.add_command(label="Reveal folder", command=self.reveal_left_folder if side == "a" else self.reveal_right_folder)
+        menu.add_command(label="Focus this side", command=lambda s=side: self.focus_side(s))
+        menu.add_separator()
+        menu.add_command(label="Toggle leaderboard metric", command=self.toggle_metric)
+        menu.add_command(label="View/open e621 links", command=self.show_links_view)
+        menu.add_command(label="DB stats", command=self.show_db_stats)
+        menu.add_command(label="Toggle blur", command=self.toggle_blur)
+        try:
+            if event is not None:
+                menu.tk_popup(event.x_root, event.y_root)
+            else:
+                x = self.root.winfo_rootx() + self.root.winfo_width() // 2
+                y = self.root.winfo_rooty() + self.root.winfo_height() // 2
+                menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
 
     # -------------------- file open / reveal --------------------
 
@@ -3099,6 +3275,13 @@ class App:
         self.blur_enabled = not getattr(self, "blur_enabled", False)
         self._update_blur_toggle_style()
 
+        for entry in self.duel_history:
+            try:
+                entry["thumb"] = self._build_duel_thumbnail(entry["a_path"], entry["b_path"])
+            except Exception:
+                entry["thumb"] = None
+        self._update_carousel()
+
         for side in ("a", "b"):
             st = self._side.get(side, {})
             row = st.get("row")
@@ -3107,10 +3290,9 @@ class App:
             if st.get("media_kind") == "video":
                 vframe = self.left_video if side == "a" else self.right_video
                 self._update_video_blur_overlay(side, vframe, row[1])
-            else:
-                panel = self.left_panel if side == "a" else self.right_panel
-                self._cancel_animation(side)
-                self._render_image_or_gif(side, panel, row[1])
+
+        # Defer still-image re-render one tick to avoid transient empty frames.
+        self.root.after_idle(self._refresh_visuals_only)
 
     def toggle_sidebar(self):
         """Toggle the right sidebar (focus mode)."""
@@ -3169,7 +3351,7 @@ class App:
 
     # -------------------- e621 link generation --------------------
     def _parse_common_tags(self) -> List[str]:
-        raw = (self.common_tags_entry.get() or "").strip()
+        raw = (self.common_tags_var.get() or "").strip()
         if not raw:
             return []
         return [t for t in raw.split() if t.strip()]
@@ -3294,10 +3476,22 @@ class App:
                                             fg=TEXT_COLOR, bg=DARK_BG, anchor="e", justify="right")
         self._links_common_label.pack(side="right")
 
+        tags_frame = tk.Frame(win, bg=DARK_BG)
+        tags_frame.pack(fill="x", padx=10, pady=(0, 8))
+        tk.Label(tags_frame, text="Search tags", font=("Segoe UI", 10, "bold"),
+                 fg=ACCENT, bg=DARK_BG).pack(side="left")
+        self.common_tags_entry = tk.Entry(tags_frame, textvariable=self.common_tags_var,
+                                          font=("Consolas", 9),
+                                          bg=DARK_PANEL, fg=TEXT_COLOR, insertbackground=TEXT_COLOR,
+                                          relief="flat")
+        self.common_tags_entry.pack(side="left", fill="x", expand=True, padx=(8, 0))
+
         btn_frame = tk.Frame(win, bg=DARK_BG)
         btn_frame.pack(fill="x", padx=10, pady=(0, 8))
 
         tk.Button(btn_frame, text="Refresh", command=self._links_refresh,
+                  bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat").pack(side="left", padx=(0, 8))
+        tk.Button(btn_frame, text="Export links (clipboard + file)", command=self.export_e621_links,
                   bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat").pack(side="left", padx=(0, 8))
         tk.Button(btn_frame, text="Copy all", command=self._links_copy_all,
                   bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat").pack(side="left", padx=(0, 8))
