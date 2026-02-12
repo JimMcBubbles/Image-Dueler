@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-12b
-# Update: Replaced tag filter dropdown with multi-select tag checkboxes.
-# Build: 2026-02-12b (tag filter multiselect checkboxes)
+# Version: 2026-02-12c
+# Update: Matched sidebar tag-filter menu styling to the per-image tag dropdown.
+# Build: 2026-02-12c (tag filter style alignment)
 
 import os
 import io
@@ -102,14 +102,8 @@ E621_MAX_TAGS = 40
 DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
 TAG_OPTIONS = ["SFW", "MEME", "HIDE", "CW"]
-TAG_FILTER_LABELS = {
-    "SFW": "SFW 🟦",
-    "MEME": "MEME 🟦",
-    "HIDE": "HIDE 🟦",
-    "CW": "CW 🟦",
-}
 
-BUILD_STAMP = '2026-02-12b (tag filter multiselect checkboxes)'
+BUILD_STAMP = '2026-02-12c (tag filter style alignment)'
 
 # -------------------- DB --------------------
 def init_db() -> sqlite3.Connection:
@@ -536,15 +530,14 @@ class App:
         self.tag_filter_vars: dict = {}
         self.tag_filter_btn = tk.Menubutton(
             self.pool_filter_row,
-            text="Tags: none",
+            text="Tags: (none)",
             font=("Segoe UI", 9),
-            fg=TEXT_COLOR,
-            bg=DARK_PANEL,
-            activebackground=ACCENT,
-            activeforeground=TEXT_COLOR,
+            fg=INFO_BAR_FG,
+            bg=INFO_BAR_BG,
+            activebackground=INFO_BAR_BG,
+            activeforeground=INFO_BAR_FG,
             relief="flat",
             cursor="hand2",
-            width=20,
             anchor="w",
         )
         self.tag_filter_btn.pack(side="right", padx=(0, 6))
@@ -553,7 +546,7 @@ class App:
             var = tk.BooleanVar(value=False)
             self.tag_filter_vars[tag] = var
             self.tag_filter_menu.add_checkbutton(
-                label=TAG_FILTER_LABELS.get(tag, tag),
+                label=tag,
                 variable=var,
                 command=self.on_tag_filter_change,
             )
@@ -1470,12 +1463,7 @@ class App:
 
     def _update_tag_filter_button_label(self) -> None:
         selected = self._selected_tag_filters()
-        if not selected:
-            label = "Tags: none"
-        else:
-            label = "Tags: " + ", ".join(selected)
-            if len(label) > 28:
-                label = f"Tags: {len(selected)} selected"
+        label = "Tags: " + (", ".join(selected) if selected else "(none)")
         self.tag_filter_btn.configure(text=label)
 
     def on_tag_filter_change(self):
