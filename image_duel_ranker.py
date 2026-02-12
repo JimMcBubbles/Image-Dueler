@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-12f
-# Update: Fixed carousel image-handle errors during blur toggles and immediate refresh.
-# Build: 2026-02-12f (blur toggle image handle fix)
+# Version: 2026-02-12g
+# Update: Moved search tags into links view and aligned side-click/keybind controls.
+# Build: 2026-02-12g (links search + control remap)
 
 import os
 import io
@@ -473,17 +473,17 @@ class App:
         # Make info bars behave like the image/video panel for clicks
         for w in (self.left_info_bar, self.left_info_text):
             w.bind("<Button-1>", lambda e: self.choose("a"))
-            w.bind("<Button-3>", lambda e: self.downvote_side("a"))
+            w.bind("<Button-3>", lambda e: self.skip_side("a"))
             w.bind("<Button-2>", lambda e: self.hide_side("a"))
             w.bind("<Double-Button-1>", self.open_left)
-            w.bind("<Control-Button-1>", lambda e: self.toggle_video("a"))
+            w.bind("<Control-Button-1>", lambda e: self.downvote_side("a"))
 
         for w in (self.right_info_bar, self.right_info_text):
             w.bind("<Button-1>", lambda e: self.choose("b"))
-            w.bind("<Button-3>", lambda e: self.downvote_side("b"))
+            w.bind("<Button-3>", lambda e: self.skip_side("b"))
             w.bind("<Button-2>", lambda e: self.hide_side("b"))
             w.bind("<Double-Button-1>", self.open_right)
-            w.bind("<Control-Button-1>", lambda e: self.toggle_video("b"))
+            w.bind("<Control-Button-1>", lambda e: self.downvote_side("b"))
 
         self.left_video = tk.Frame(self.left_container, bg="black", bd=0, highlightthickness=0)
         self.right_video = tk.Frame(self.right_container, bg="black", bd=0, highlightthickness=0)
@@ -612,13 +612,8 @@ class App:
         self.link_left.bind("<Button-1>", lambda e: self._open_url(getattr(self.link_left, "url", "")))
         self.link_right.bind("<Button-1>", lambda e: self._open_url(getattr(self.link_right, "url", "")))
 
-        # ---- Search tags + export ----
-        self.search_header = tk.Label(self.sidebar, text="Search tags",
-                                      font=("Segoe UI", 11, "bold"), fg=ACCENT, bg=DARK_BG)
-        self.common_tags_entry = tk.Entry(self.sidebar, font=("Consolas", 9),
-                                          bg=DARK_PANEL, fg=TEXT_COLOR, insertbackground=TEXT_COLOR,
-                                          relief="flat")
-        self.common_tags_entry.insert(0, DEFAULT_COMMON_TAGS)
+        # ---- Links tools ----
+        self.common_tags_var = tk.StringVar(value=DEFAULT_COMMON_TAGS)
 
         self.view_links_btn = tk.Button(self.sidebar, text="View/open e621 links",
                                         command=self.show_links_view,
@@ -655,8 +650,6 @@ class App:
         self.link_right.pack(anchor="w", pady=(0, 6))
         tk.Frame(self.sidebar, height=1, bg=SEPARATOR_BG).pack(fill="x", pady=(0, 6))
 
-        self.search_header.pack(anchor="w")
-        self.common_tags_entry.pack(fill="x", pady=(2, 6))
         self.view_links_btn.pack(fill="x", pady=(0, 2))
         self.db_stats_btn.pack(fill="x", pady=(0, 6))
         self.export_status.pack(anchor="w", pady=(0, 6))
@@ -758,30 +751,32 @@ class App:
         self.right_panel.bind("<Button-1>", lambda e: self.choose("b"))
         self.left_panel.bind("<Double-Button-1>", self.open_left)
         self.right_panel.bind("<Double-Button-1>", self.open_right)
-        self.left_panel.bind("<Button-3>", lambda e: self.downvote_side("a"))
-        self.right_panel.bind("<Button-3>", lambda e: self.downvote_side("b"))
+        self.left_panel.bind("<Button-3>", lambda e: self.skip_side("a"))
+        self.right_panel.bind("<Button-3>", lambda e: self.skip_side("b"))
 
         # Hide: middle click
         self.left_panel.bind("<Button-2>", lambda e: self.hide_side("a"))
         self.right_panel.bind("<Button-2>", lambda e: self.hide_side("b"))
 
         # Ctrl+Click: play/pause that side if video
-        self.left_panel.bind("<Control-Button-1>", lambda e: self.toggle_video("a"))
-        self.right_panel.bind("<Control-Button-1>", lambda e: self.toggle_video("b"))
+        self.left_panel.bind("<Control-Button-1>", lambda e: self.downvote_side("a"))
+        self.right_panel.bind("<Control-Button-1>", lambda e: self.downvote_side("b"))
 
         # Also allow click on video frames
         for w, side in [(self.left_video, "a"), (self.right_video, "b")]:
-            w.bind("<Control-Button-1>", lambda e, s=side: self.toggle_video(s))
+            w.bind("<Control-Button-1>", lambda e, s=side: self.downvote_side(s))
             w.bind("<Double-Button-1>", self.open_left if side == "a" else self.open_right)
             w.bind("<Button-1>", lambda e, s=side: self.choose("a" if s == "a" else "b"))
+            w.bind("<Button-3>", lambda e, s=side: self.skip_side(s))
+            w.bind("<Button-2>", lambda e, s=side: self.hide_side(s))
 
         # ---- Keybinds ----
         root.bind("1", lambda e: self.choose("a"))
         root.bind("2", lambda e: self.choose("b"))
-        root.bind("3", lambda e: self.downvote_side("a"))
-        root.bind("4", lambda e: self.downvote_side("b"))
-        root.bind("5", lambda e: self.skip_side("a"))
-        root.bind("6", lambda e: self.skip_side("b"))
+        root.bind("4", lambda e: self.downvote_side("a"))
+        root.bind("5", lambda e: self.downvote_side("b"))
+        root.bind("7", lambda e: self.skip_side("a"))
+        root.bind("8", lambda e: self.skip_side("b"))
         root.bind("0", lambda e: self.choose(None))
         root.bind("<space>", lambda e: self.choose(None))
 
@@ -1215,7 +1210,7 @@ class App:
             relief="flat",
             cursor="hand2",
         )
-        button.grid(row=0, column=1, sticky="e", padx=8, pady=2)
+        button.grid(row=0, column=2, sticky="e", padx=8, pady=2)
         menu = tk.Menu(button, tearoff=0)
         tag_vars: dict = {}
         for tag in TAG_OPTIONS:
@@ -1232,7 +1227,7 @@ class App:
 
     def _build_action_buttons(self, side: str, parent: tk.Frame) -> None:
         actions = tk.Frame(parent, bg=INFO_BAR_BG)
-        actions.grid(row=0, column=2, sticky="e", padx=(0, 8), pady=2)
+        actions.grid(row=0, column=1, sticky="e", padx=(0, 8), pady=2)
 
         spec = [
             ("Upvote", lambda s=side: self.choose(s)),
@@ -3057,13 +3052,19 @@ class App:
 
     def _keybind_text(self) -> str:
         return "\n".join([
-            "Voting",
-            "1 / Left Click:      Upvote LEFT (winner)",
-            "2 / Right Click:     Upvote RIGHT (winner)",
-            "3 / 4:               Downvote LEFT / RIGHT (reroll only that side)",
-            "5 / 6:               Skip LEFT / RIGHT (reroll only that side)",
-            "X / M:               Hide LEFT / RIGHT (tag + reroll side)",
-            "0 / Space:           Skip duel (tie / reroll both)",
+            "Mouse",
+            "Left Click:          Select Winner",
+            "Right Click:         Skip Selected",
+            "Middle Click:        Hide",
+            "Ctrl + Left Click:   Downvote",
+            "",
+            "Keyboard (Voting)",
+            "1:                   Vote Left",
+            "2:                   Vote Right",
+            "0 / Space:           Skip Both",
+            "4 / 5:               Downvote Left / Right",
+            "7 / 8:               Skip Left / Right",
+            "X / M:               Hide Left / Right",
             "",
             "Open / Navigation",
             "Double-Click:        Open image/video",
@@ -3077,7 +3078,6 @@ class App:
             "Video",
             "Ctrl+1 / Ctrl+2:     Play/Pause LEFT / RIGHT",
             "Ctrl+Shift+1 / +2:   Mute/Unmute LEFT / RIGHT",
-            "Ctrl+Click:          Play/Pause hovered side",
             "",
             "UI",
             "Ctrl+B:              Toggle sidebar (focus mode)",
@@ -3299,7 +3299,7 @@ class App:
 
     # -------------------- e621 link generation --------------------
     def _parse_common_tags(self) -> List[str]:
-        raw = (self.common_tags_entry.get() or "").strip()
+        raw = (self.common_tags_var.get() or "").strip()
         if not raw:
             return []
         return [t for t in raw.split() if t.strip()]
@@ -3423,6 +3423,16 @@ class App:
         self._links_common_label = tk.Label(info_frame, text="", font=("Consolas", 9),
                                             fg=TEXT_COLOR, bg=DARK_BG, anchor="e", justify="right")
         self._links_common_label.pack(side="right")
+
+        tags_frame = tk.Frame(win, bg=DARK_BG)
+        tags_frame.pack(fill="x", padx=10, pady=(0, 8))
+        tk.Label(tags_frame, text="Search tags", font=("Segoe UI", 10, "bold"),
+                 fg=ACCENT, bg=DARK_BG).pack(side="left")
+        self.common_tags_entry = tk.Entry(tags_frame, textvariable=self.common_tags_var,
+                                          font=("Consolas", 9),
+                                          bg=DARK_PANEL, fg=TEXT_COLOR, insertbackground=TEXT_COLOR,
+                                          relief="flat")
+        self.common_tags_entry.pack(side="left", fill="x", expand=True, padx=(8, 0))
 
         btn_frame = tk.Frame(win, bg=DARK_BG)
         btn_frame.pack(fill="x", padx=10, pady=(0, 8))
