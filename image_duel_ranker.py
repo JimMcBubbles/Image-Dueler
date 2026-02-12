@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-12j
-# Update: Re-rolls sides when tag edits are filtered out and adds undo tag/hide menu action.
-# Build: 2026-02-12j (tag filter reroll + undo menu)
+# Version: 2026-02-12k
+# Update: Undo tag/hide now restores the previously rerolled side image.
+# Build: 2026-02-12k (undo restore previous side)
 
 import os
 import io
@@ -825,6 +825,7 @@ class App:
             "tag_vars": {},
             "tag_button": None,
             "action_buttons": {},
+            "last_replaced_row": None,
         }
 
     def _toggle_carousel(self) -> None:
@@ -1666,7 +1667,9 @@ class App:
         if not self.current:
             return
         a, b = self.current
+        outgoing = a if side == "a" else b
         other = b if side == "a" else a
+        self._side[side]["last_replaced_row"] = outgoing
 
         pool = self._pool_rows()
         replacement = self.pick_one(
@@ -1708,22 +1711,33 @@ class App:
     def undo_side_tag_hide(self, side: str) -> None:
         if not self.current:
             return
-        row = self._side[side].get("row")
-        if not row:
+        candidate = self._side[side].get("last_replaced_row") or self._side[side].get("row")
+        if not candidate:
             return
-        tags = set(self._tags_for_row(row))
+        restored = self._fetch_row(candidate[0])
+        if not restored:
+            return
+
+        tags = set(self._tags_for_row(restored))
         tags.discard("HIDE")
-        self._write_tags(row[0], tags, hidden=0)
-        updated = self._fetch_row(row[0])
-        if updated:
-            self._side[side]["row"] = updated
-            self._side[side]["tags"] = self._ordered_tags(tags)
-            if not self._row_matches_filter(updated):
-                self._replace_side_keep_other(side)
-                return
-            self._sync_tag_controls(side)
-            self._render_side(side)
-            self.update_sidebar()
+        self._write_tags(restored[0], tags, hidden=0)
+        restored = self._fetch_row(restored[0])
+        if not restored:
+            return
+
+        a, b = self.current
+        other = b if side == "a" else a
+        if self._media_kind(restored[1]) != self._media_kind(other[1]):
+            return
+
+        if side == "a":
+            self._set_current(restored, other)
+        else:
+            self._set_current(other, restored)
+        self._side[side]["last_replaced_row"] = None
+        self._stop_video(side)
+        self._render_side(side)
+        self.update_sidebar()
 
     def hide_side(self, side: str):
         if not self.current:
