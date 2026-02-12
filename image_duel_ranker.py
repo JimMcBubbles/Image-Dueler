@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-12g
-# Update: Moved search tags into links view and aligned side-click/keybind controls.
-# Build: 2026-02-12g (links search + control remap)
+# Version: 2026-02-12i
+# Update: Prevented click-binding overlap for Shift/Ctrl left-click actions.
+# Build: 2026-02-12i (click binding overlap fix)
 
 import os
 import io
@@ -473,17 +473,19 @@ class App:
         # Make info bars behave like the image/video panel for clicks
         for w in (self.left_info_bar, self.left_info_text):
             w.bind("<Button-1>", lambda e: self.choose("a"))
+            w.bind("<Shift-Button-1>", lambda e: self._on_shift_downvote("a", e))
+            w.bind("<Control-Button-1>", lambda e: self._on_ctrl_options("a", e))
             w.bind("<Button-3>", lambda e: self.skip_side("a"))
             w.bind("<Button-2>", lambda e: self.hide_side("a"))
             w.bind("<Double-Button-1>", self.open_left)
-            w.bind("<Control-Button-1>", lambda e: self.downvote_side("a"))
 
         for w in (self.right_info_bar, self.right_info_text):
             w.bind("<Button-1>", lambda e: self.choose("b"))
+            w.bind("<Shift-Button-1>", lambda e: self._on_shift_downvote("b", e))
+            w.bind("<Control-Button-1>", lambda e: self._on_ctrl_options("b", e))
             w.bind("<Button-3>", lambda e: self.skip_side("b"))
             w.bind("<Button-2>", lambda e: self.hide_side("b"))
             w.bind("<Double-Button-1>", self.open_right)
-            w.bind("<Control-Button-1>", lambda e: self.downvote_side("b"))
 
         self.left_video = tk.Frame(self.left_container, bg="black", bd=0, highlightthickness=0)
         self.right_video = tk.Frame(self.right_container, bg="black", bd=0, highlightthickness=0)
@@ -749,6 +751,10 @@ class App:
         # ---- Mouse controls ----
         self.left_panel.bind("<Button-1>", lambda e: self.choose("a"))
         self.right_panel.bind("<Button-1>", lambda e: self.choose("b"))
+        self.left_panel.bind("<Shift-Button-1>", lambda e: self._on_shift_downvote("a", e))
+        self.right_panel.bind("<Shift-Button-1>", lambda e: self._on_shift_downvote("b", e))
+        self.left_panel.bind("<Control-Button-1>", lambda e: self._on_ctrl_options("a", e))
+        self.right_panel.bind("<Control-Button-1>", lambda e: self._on_ctrl_options("b", e))
         self.left_panel.bind("<Double-Button-1>", self.open_left)
         self.right_panel.bind("<Double-Button-1>", self.open_right)
         self.left_panel.bind("<Button-3>", lambda e: self.skip_side("a"))
@@ -758,13 +764,10 @@ class App:
         self.left_panel.bind("<Button-2>", lambda e: self.hide_side("a"))
         self.right_panel.bind("<Button-2>", lambda e: self.hide_side("b"))
 
-        # Ctrl+Click: play/pause that side if video
-        self.left_panel.bind("<Control-Button-1>", lambda e: self.downvote_side("a"))
-        self.right_panel.bind("<Control-Button-1>", lambda e: self.downvote_side("b"))
-
         # Also allow click on video frames
         for w, side in [(self.left_video, "a"), (self.right_video, "b")]:
-            w.bind("<Control-Button-1>", lambda e, s=side: self.downvote_side(s))
+            w.bind("<Control-Button-1>", lambda e, s=side: self._on_ctrl_options(s, e))
+            w.bind("<Shift-Button-1>", lambda e, s=side: self._on_shift_downvote(s, e))
             w.bind("<Double-Button-1>", self.open_left if side == "a" else self.open_right)
             w.bind("<Button-1>", lambda e, s=side: self.choose("a" if s == "a" else "b"))
             w.bind("<Button-3>", lambda e, s=side: self.skip_side(s))
@@ -773,37 +776,15 @@ class App:
         # ---- Keybinds ----
         root.bind("1", lambda e: self.choose("a"))
         root.bind("2", lambda e: self.choose("b"))
+        root.bind("3", lambda e: self.focus_side("a"))
         root.bind("4", lambda e: self.downvote_side("a"))
         root.bind("5", lambda e: self.downvote_side("b"))
+        root.bind("6", lambda e: self.focus_side("b"))
         root.bind("7", lambda e: self.skip_side("a"))
         root.bind("8", lambda e: self.skip_side("b"))
+        root.bind("9", lambda e: self.toggle_sidebar())
         root.bind("0", lambda e: self.choose(None))
-        root.bind("<space>", lambda e: self.choose(None))
-
-        root.bind("x", lambda e: self.hide_side("a"))
-        root.bind("m", lambda e: self.hide_side("b"))
-
-        root.bind("o", self.open_left)
-        root.bind("p", self.open_right)
-        root.bind("O", self.reveal_left_folder)
-        root.bind("P", self.reveal_right_folder)
-
-        root.bind("[", lambda e: self.change_page(-1))
-        root.bind("]", lambda e: self.change_page(+1))
-        root.bind("<Prior>", lambda e: self.change_page(-1))
-        root.bind("<Next>", lambda e: self.change_page(+1))
-
-        root.bind("t", lambda e: self.toggle_metric())
-        root.bind("v", lambda e: self.show_links_view())
-        root.bind("V", lambda e: self.show_links_view())
-        root.bind("i", lambda e: self.show_db_stats())
-        root.bind("I", lambda e: self.show_db_stats())
-
-        # Video (VLC) controls
-        root.bind("<Control-1>", lambda e: self.toggle_video("a"))
-        root.bind("<Control-2>", lambda e: self.toggle_video("b"))
-        root.bind("<Control-Shift-1>", lambda e: self.toggle_mute("a"))
-        root.bind("<Control-Shift-2>", lambda e: self.toggle_mute("b"))
+        root.bind(".", lambda e: self.toggle_blur())
 
         root.bind("q", lambda e: self.quit())
 
@@ -3052,37 +3033,66 @@ class App:
 
     def _keybind_text(self) -> str:
         return "\n".join([
-            "Mouse",
-            "Left Click:          Select Winner",
-            "Right Click:         Skip Selected",
-            "Middle Click:        Hide",
-            "Ctrl + Left Click:   Downvote",
+            "Keybinds:",
+            "L Click: Vote",
+            "R Click: Skip",
+            "M Click: Hide",
             "",
-            "Keyboard (Voting)",
-            "1:                   Vote Left",
-            "2:                   Vote Right",
-            "0 / Space:           Skip Both",
-            "4 / 5:               Downvote Left / Right",
-            "7 / 8:               Skip Left / Right",
-            "X / M:               Hide Left / Right",
+            "Shift + L Click: Downvote",
+            "Ctrl + L Click: More Options",
             "",
-            "Open / Navigation",
-            "Double-Click:        Open image/video",
-            "O / P:               Open LEFT / RIGHT",
-            "Shift+O / Shift+P:   Reveal LEFT / RIGHT folder",
-            "[ / ] or PgUp / PgDn: Leaderboard page",
-            "T:                   Toggle leaderboard metric",
-            "V:                   View/open e621 links",
-            "I:                   DB stats",
-            "",
-            "Video",
-            "Ctrl+1 / Ctrl+2:     Play/Pause LEFT / RIGHT",
-            "Ctrl+Shift+1 / +2:   Mute/Unmute LEFT / RIGHT",
-            "",
-            "UI",
-            "Ctrl+B:              Toggle sidebar (focus mode)",
-            "Q:                   Quit",
+            "1: Vote Left",
+            "2: Vote Right",
+            "3: Focus Left",
+            "4: Downvote Left",
+            "5: Downvote Right",
+            "6: Focus Right",
+            "7: Skip Left",
+            "8: Skip Right",
+            "9: Toggle Focus",
+            "0: Skip Both",
+            ".: Toggle Blur",
         ])
+
+    def _on_shift_downvote(self, side: str, _event=None):
+        self.downvote_side(side)
+        return "break"
+
+    def _on_ctrl_options(self, side: str, event=None):
+        self.show_side_options(side, event)
+        return "break"
+
+    def focus_side(self, side: str) -> None:
+        """Focus one side by entering fullscreen for that side."""
+        try:
+            self._enter_fullscreen(side)
+        except Exception:
+            pass
+
+    def show_side_options(self, side: str, event=None) -> None:
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="Upvote", command=lambda s=side: self.choose(s))
+        menu.add_command(label="Downvote", command=lambda s=side: self.downvote_side(s))
+        menu.add_command(label="Skip", command=lambda s=side: self.skip_side(s))
+        menu.add_command(label="Hide", command=lambda s=side: self.hide_side(s))
+        menu.add_separator()
+        menu.add_command(label="Open image/video", command=self.open_left if side == "a" else self.open_right)
+        menu.add_command(label="Reveal folder", command=self.reveal_left_folder if side == "a" else self.reveal_right_folder)
+        menu.add_command(label="Focus this side", command=lambda s=side: self.focus_side(s))
+        menu.add_separator()
+        menu.add_command(label="Toggle leaderboard metric", command=self.toggle_metric)
+        menu.add_command(label="View/open e621 links", command=self.show_links_view)
+        menu.add_command(label="DB stats", command=self.show_db_stats)
+        menu.add_command(label="Toggle blur", command=self.toggle_blur)
+        try:
+            if event is not None:
+                menu.tk_popup(event.x_root, event.y_root)
+            else:
+                x = self.root.winfo_rootx() + self.root.winfo_width() // 2
+                y = self.root.winfo_rooty() + self.root.winfo_height() // 2
+                menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
 
     # -------------------- file open / reveal --------------------
 
