@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-08d
-# Update: Size video blur overlays to VLC video output.
-# Build: 2026-01-25c (aligned tag dropdowns)
+# Version: 2026-02-12
+# Update: Added per-side action controls, tag filtering dropdown, and refreshed sidebar link/keybind UX.
+# Build: 2026-02-12 (side actions + tag filtering refresh)
 
 import os
 import io
@@ -102,8 +102,15 @@ E621_MAX_TAGS = 40
 DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
 TAG_OPTIONS = ["SFW", "MEME", "HIDE", "CW"]
+TAG_FILTER_OPTIONS = [
+    "Default (-MEME -SFW -CW)",
+    "All tags",
+    "Only SFW",
+    "Only MEME",
+    "Only CW",
+]
 
-BUILD_STAMP = '2026-01-25c (aligned tag dropdowns)'
+BUILD_STAMP = '2026-02-12 (side actions + tag filtering refresh)'
 
 # -------------------- DB --------------------
 def init_db() -> sqlite3.Connection:
@@ -465,20 +472,22 @@ class App:
 
         self._build_tag_menu("a", self.left_info_row)
         self._build_tag_menu("b", self.right_info_row)
+        self._build_action_buttons("a", self.left_info_row)
+        self._build_action_buttons("b", self.right_info_row)
         self.left_info_row.columnconfigure(0, weight=1)
         self.right_info_row.columnconfigure(0, weight=1)
 
         # Make info bars behave like the image/video panel for clicks
         for w in (self.left_info_bar, self.left_info_text):
             w.bind("<Button-1>", lambda e: self.choose("a"))
-            w.bind("<Button-3>", lambda e: self.choose("downvote"))
+            w.bind("<Button-3>", lambda e: self.downvote_side("a"))
             w.bind("<Button-2>", lambda e: self.hide_side("a"))
             w.bind("<Double-Button-1>", self.open_left)
             w.bind("<Control-Button-1>", lambda e: self.toggle_video("a"))
 
         for w in (self.right_info_bar, self.right_info_text):
             w.bind("<Button-1>", lambda e: self.choose("b"))
-            w.bind("<Button-3>", lambda e: self.choose("downvote"))
+            w.bind("<Button-3>", lambda e: self.downvote_side("b"))
             w.bind("<Button-2>", lambda e: self.hide_side("b"))
             w.bind("<Double-Button-1>", self.open_right)
             w.bind("<Control-Button-1>", lambda e: self.toggle_video("b"))
@@ -525,12 +534,25 @@ class App:
         self.pool_filter.pack(side="right")
         self.pool_filter.bind("<<ComboboxSelected>>", lambda e: self.on_pool_filter_change())
 
+        tk.Label(self.pool_filter_row, text="Tags:", font=("Segoe UI", 10, "bold"),
+                 fg=ACCENT, bg=DARK_BG).pack(side="right", padx=(0, 4))
+        self.tag_filter_var = tk.StringVar(value=TAG_FILTER_OPTIONS[0])
+        self.tag_filter = ttk.Combobox(
+            self.pool_filter_row,
+            textvariable=self.tag_filter_var,
+            values=TAG_FILTER_OPTIONS,
+            state="readonly",
+            width=20,
+        )
+        self.tag_filter.pack(side="right", padx=(0, 6))
+        self.tag_filter.bind("<<ComboboxSelected>>", lambda e: self.on_pool_filter_change())
+
         # Sidebar toggle (focus mode)
         self.sidebar_visible = True
         self.sidebar_toggle_btn = tk.Button(self.pool_filter_row, text="Focus",
                                             command=self.toggle_sidebar,
                                             bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat", width=7)
-        self.sidebar_toggle_btn.pack(side="right")
+        self.sidebar_toggle_btn.pack(side="right", padx=(0, 6))
         self.blur_enabled = False
         self.blur_toggle_btn = tk.Button(self.pool_filter_row, text="Blur",
                                          command=self.toggle_blur,
@@ -547,6 +569,10 @@ class App:
         self.board = tk.Text(self.sidebar, height=20, font=("Consolas", 10),
                              bg=DARK_PANEL, fg=TEXT_COLOR, insertbackground=TEXT_COLOR,
                              relief="flat", wrap="none")
+        self.board.tag_configure("delta_up", foreground="#7ad97a")
+        self.board.tag_configure("delta_down", foreground="#ff7a7a")
+        self.board.tag_configure("delta_flat", foreground="#9a9a9a")
+        self.board.tag_configure("delta_new", foreground="#9bd6ff")
         self.nav_row = tk.Frame(self.sidebar, bg=DARK_BG)
         self.btn_prev = tk.Button(self.nav_row, text="Prev [ / PgUp", width=14,
                                   command=lambda: self.change_page(-1),
@@ -589,9 +615,6 @@ class App:
                                           relief="flat")
         self.common_tags_entry.insert(0, DEFAULT_COMMON_TAGS)
 
-        self.export_links_btn = tk.Button(self.sidebar, text="Export e621 links (clipboard + file)",
-                                          command=self.export_e621_links,
-                                          bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat")
         self.view_links_btn = tk.Button(self.sidebar, text="View/open e621 links",
                                         command=self.show_links_view,
                                         bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat")
@@ -629,7 +652,6 @@ class App:
 
         self.search_header.pack(anchor="w")
         self.common_tags_entry.pack(fill="x", pady=(2, 6))
-        self.export_links_btn.pack(fill="x", pady=(0, 2))
         self.view_links_btn.pack(fill="x", pady=(0, 2))
         self.db_stats_btn.pack(fill="x", pady=(0, 6))
         self.export_status.pack(anchor="w", pady=(0, 6))
@@ -731,8 +753,8 @@ class App:
         self.right_panel.bind("<Button-1>", lambda e: self.choose("b"))
         self.left_panel.bind("<Double-Button-1>", self.open_left)
         self.right_panel.bind("<Double-Button-1>", self.open_right)
-        self.left_panel.bind("<Button-3>", lambda e: self.choose("downvote"))
-        self.right_panel.bind("<Button-3>", lambda e: self.choose("downvote"))
+        self.left_panel.bind("<Button-3>", lambda e: self.downvote_side("a"))
+        self.right_panel.bind("<Button-3>", lambda e: self.downvote_side("b"))
 
         # Hide: middle click
         self.left_panel.bind("<Button-2>", lambda e: self.hide_side("a"))
@@ -751,7 +773,10 @@ class App:
         # ---- Keybinds ----
         root.bind("1", lambda e: self.choose("a"))
         root.bind("2", lambda e: self.choose("b"))
-        root.bind("3", lambda e: self.choose("downvote"))
+        root.bind("3", lambda e: self.downvote_side("a"))
+        root.bind("4", lambda e: self.downvote_side("b"))
+        root.bind("5", lambda e: self.skip_side("a"))
+        root.bind("6", lambda e: self.skip_side("b"))
         root.bind("0", lambda e: self.choose(None))
         root.bind("<space>", lambda e: self.choose(None))
 
@@ -769,8 +794,6 @@ class App:
         root.bind("<Next>", lambda e: self.change_page(+1))
 
         root.bind("t", lambda e: self.toggle_metric())
-        root.bind("g", lambda e: self.export_e621_links())
-        root.bind("G", lambda e: self.export_e621_links())
         root.bind("v", lambda e: self.show_links_view())
         root.bind("V", lambda e: self.show_links_view())
         root.bind("i", lambda e: self.show_db_stats())
@@ -820,6 +843,7 @@ class App:
             "tags": [],
             "tag_vars": {},
             "tag_button": None,
+            "action_buttons": {},
         }
 
     def _toggle_carousel(self) -> None:
@@ -1196,6 +1220,37 @@ class App:
         self._side[side]["tag_vars"] = tag_vars
         self._side[side]["tag_button"] = button
 
+    def _build_action_buttons(self, side: str, parent: tk.Frame) -> None:
+        actions = tk.Frame(parent, bg=INFO_BAR_BG)
+        actions.grid(row=0, column=2, sticky="e", padx=(0, 8), pady=2)
+
+        spec = [
+            ("Upvote", lambda s=side: self.choose(s)),
+            ("Downvote", lambda s=side: self.downvote_side(s)),
+            ("Skip", lambda s=side: self.skip_side(s)),
+            ("Hide", lambda s=side: self.hide_side(s)),
+        ]
+        buttons: dict = {}
+        for text, cmd in spec:
+            btn = tk.Button(
+                actions,
+                text=text,
+                command=cmd,
+                bg=INFO_BAR_BG,
+                fg=INFO_BAR_FG,
+                activebackground=DARK_PANEL,
+                activeforeground=INFO_BAR_FG,
+                relief="flat",
+                padx=6,
+                pady=0,
+                font=("Segoe UI", 8),
+                cursor="hand2",
+            )
+            btn.pack(side="left", padx=(0, 2))
+            buttons[text.lower()] = btn
+        self._side[side]["action_buttons"] = buttons
+
+
     def _ordered_tags(self, tags: set) -> List[str]:
         return [tag for tag in TAG_OPTIONS if tag in tags]
 
@@ -1393,6 +1448,19 @@ class App:
         except Exception:
             pass
 
+    def _tag_filter_matches(self, row: tuple) -> bool:
+        mode = (self.tag_filter_var.get() or TAG_FILTER_OPTIONS[0]).strip()
+        tags = set(self._parse_tags(row[8] if row and len(row) > 8 else ""))
+        if mode == "All tags":
+            return True
+        if mode == "Only SFW":
+            return "SFW" in tags
+        if mode == "Only MEME":
+            return "MEME" in tags
+        if mode == "Only CW":
+            return "CW" in tags
+        return not any(t in tags for t in ("MEME", "SFW", "CW"))
+
     def _row_matches_filter(self, row: tuple) -> bool:
         # row: (id, path, folder, duels, wins, losses, score, hidden, tags)
         hidden = int(row[7] or 0)
@@ -1402,6 +1470,8 @@ class App:
         if f == "Hidden":
             return hidden == 1
         if hidden == 1:
+            return False
+        if not self._tag_filter_matches(row):
             return False
 
         if f == "All":
@@ -1587,41 +1657,19 @@ class App:
         self._stop_video("b")
         self.load_duel()
 
-    def hide_side(self, side: str):
+    def _replace_side_keep_other(self, side: str) -> None:
         if not self.current:
             return
         a, b = self.current
-        target = a if side == "a" else b
         other = b if side == "a" else a
 
-        # In "Hidden" pool, middle-click acts as UNHIDE (to make recovery easy).
-
-
-        if self.pool_filter_var.get() == "Hidden":
-
-
-            unhide_image(self.conn, target)
-            tags = set(self._tags_for_row(target))
-            tags.discard("HIDE")
-            self._write_tags(target[0], tags, hidden=0)
-
-
-        else:
-
-
-            hide_image(self.conn, target)
-            tags = set(self._tags_for_row(target))
-            tags.add("HIDE")
-            self._write_tags(target[0], tags, hidden=1)
-
-        pool = self._pool_rows()  # respects current filter
+        pool = self._pool_rows()
         replacement = self.pick_one(
             exclude_id=other[0],
             pool=pool,
             required_kind=self._media_kind(other[1]),
         )
         if not replacement:
-            # if no replacement in pool, just reload duel
             self.load_duel()
             return
 
@@ -1630,10 +1678,47 @@ class App:
         else:
             self._set_current(other, replacement)
 
-        # stop old side video
         self._stop_video(side)
         self._render_side(side)
         self.update_sidebar()
+
+    def downvote_side(self, side: str) -> None:
+        if not self.current:
+            return
+        a, b = self.current
+        target = a if side == "a" else b
+        now_ts = int(time.time())
+        self.conn.execute(
+            "UPDATE images SET score=score-?, duels=duels+1, losses=losses+1, last_seen=? WHERE id=?",
+            (DOWNVOTE_PENALTY, now_ts, target[0]),
+        )
+        self.conn.commit()
+        self._replace_side_keep_other(side)
+
+    def skip_side(self, side: str) -> None:
+        if not self.current:
+            return
+        self._replace_side_keep_other(side)
+
+    def hide_side(self, side: str):
+        if not self.current:
+            return
+        a, b = self.current
+        target = a if side == "a" else b
+
+        # In "Hidden" pool, middle-click acts as UNHIDE (to make recovery easy).
+        if self.pool_filter_var.get() == "Hidden":
+            unhide_image(self.conn, target)
+            tags = set(self._tags_for_row(target))
+            tags.discard("HIDE")
+            self._write_tags(target[0], tags, hidden=0)
+        else:
+            hide_image(self.conn, target)
+            tags = set(self._tags_for_row(target))
+            tags.add("HIDE")
+            self._write_tags(target[0], tags, hidden=1)
+
+        self._replace_side_keep_other(side)
 
     # -------------------- rendering --------------------
     def _apply_pixelate(self, im: Image.Image, pixel_size: int = 50) -> Image.Image:
@@ -2823,20 +2908,38 @@ class App:
             return name if len(name) <= LEAF_MAX else (name[:LEAF_MAX - 1] + "…")
 
         lines = []
-        for row in leader[start:end]:
+        deltas: List[Tuple[int, str]] = []
+        for idx, row in enumerate(leader[start:end]):
             leaf = trunc(Path(row["folder"]).name)
             marker = "  ◀" if row["folder"] in {folder_left, folder_right} else ""
-            if self.metric == "avg":
-                line = f"{row['rank']:>3}. {leaf:<{LEAF_MAX}} {row['avg']:6.1f}  (n={row['n']}){marker}"
-            elif self.metric == "shrunken_avg":
-                line = f"{row['rank']:>3}. {leaf:<{LEAF_MAX}} {row['score']:6.1f}  avg={row['avg']:5.1f} (n={row['n']}){marker}"
+            old_rank = self._last_ranks.get(row["folder"])
+            if old_rank is None:
+                ticker, ticker_tag = "▲", "delta_new"
             else:
-                line = f"{row['rank']:>3}. {leaf:<{LEAF_MAX}} {row['score']:6.1f}  avg={row['avg']:5.1f} (n={row['n']}){marker}"
+                shift = old_rank - row["rank"]
+                if shift > 0:
+                    ticker, ticker_tag = "▲", "delta_up"
+                elif shift < 0:
+                    ticker, ticker_tag = "▼", "delta_down"
+                else:
+                    ticker, ticker_tag = "•", "delta_flat"
+            if self.metric == "avg":
+                line = f"{ticker} {row['rank']:>3}. {leaf:<{LEAF_MAX}} {row['avg']:6.1f}  (n={row['n']}){marker}"
+            elif self.metric == "shrunken_avg":
+                line = f"{ticker} {row['rank']:>3}. {leaf:<{LEAF_MAX}} {row['score']:6.1f}  avg={row['avg']:5.1f} (n={row['n']}){marker}"
+            else:
+                line = f"{ticker} {row['rank']:>3}. {leaf:<{LEAF_MAX}} {row['score']:6.1f}  avg={row['avg']:5.1f} (n={row['n']}){marker}"
             lines.append(line)
+            deltas.append((idx, ticker_tag))
 
         self.board.configure(state="normal")
         self.board.delete("1.0", "end")
-        self.board.insert("1.0", "\n".join(lines) if lines else "No folders yet.")
+        if lines:
+            self.board.insert("1.0", "\n".join(lines))
+            for row_idx, tag in deltas:
+                self.board.tag_add(tag, f"{row_idx + 1}.0", f"{row_idx + 1}.1")
+        else:
+            self.board.insert("1.0", "No folders yet.")
         self.board.configure(state="disabled")
 
         # Current / previous rank lines
@@ -2933,31 +3036,31 @@ class App:
 
     def _keybind_text(self) -> str:
         return "\n".join([
-            "L-Click:   Pick LEFT",
-            "R-Click:   Pick RIGHT",
-            "R-Click(3):Downvote (both)",
-            "0 / Space: Skip / tie",
+            "Voting",
+            "1 / Left Click:      Upvote LEFT (winner)",
+            "2 / Right Click:     Upvote RIGHT (winner)",
+            "3 / 4:               Downvote LEFT / RIGHT (reroll only that side)",
+            "5 / 6:               Skip LEFT / RIGHT (reroll only that side)",
+            "X / M:               Hide LEFT / RIGHT (tag + reroll side)",
+            "0 / Space:           Skip duel (tie / reroll both)",
             "",
-            "M-Click:   Hide side (replace only that side)",
-            "X / M:     Hide LEFT / Hide RIGHT",
+            "Open / Navigation",
+            "Double-Click:        Open image/video",
+            "O / P:               Open LEFT / RIGHT",
+            "Shift+O / Shift+P:   Reveal LEFT / RIGHT folder",
+            "[ / ] or PgUp / PgDn: Leaderboard page",
+            "T:                   Toggle leaderboard metric",
+            "V:                   View/open e621 links",
+            "I:                   DB stats",
             "",
-            "Dbl-Click: Open image/video",
-            "O / P:     Open LEFT / Open RIGHT",
-            "Shift+O/P: Reveal LEFT/RIGHT folder",
+            "Video",
+            "Ctrl+1 / Ctrl+2:     Play/Pause LEFT / RIGHT",
+            "Ctrl+Shift+1 / +2:   Mute/Unmute LEFT / RIGHT",
+            "Ctrl+Click:          Play/Pause hovered side",
             "",
-            "[ / PgUp:  Prev leaderboard page",
-            "] / PgDn:  Next leaderboard page",
-            "T:         Toggle leaderboard metric",
-            "G:         Export e621 links",
-            "V:         View/open e621 links",
-            "I:         DB stats",
-            "",
-            "Ctrl+1/2:  Play/Pause LEFT/RIGHT video",
-            "Ctrl+Shift+1/2: Mute/Unmute LEFT/RIGHT",
-            "Ctrl+Click: Play/Pause hovered side",
-            "",
-            "Ctrl+B:    Toggle sidebar (focus mode)",
-            "Q:         Quit",
+            "UI",
+            "Ctrl+B:              Toggle sidebar (focus mode)",
+            "Q:                   Quit",
         ])
 
     # -------------------- file open / reveal --------------------
@@ -3298,6 +3401,8 @@ class App:
         btn_frame.pack(fill="x", padx=10, pady=(0, 8))
 
         tk.Button(btn_frame, text="Refresh", command=self._links_refresh,
+                  bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat").pack(side="left", padx=(0, 8))
+        tk.Button(btn_frame, text="Export links (clipboard + file)", command=self.export_e621_links,
                   bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat").pack(side="left", padx=(0, 8))
         tk.Button(btn_frame, text="Copy all", command=self._links_copy_all,
                   bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat").pack(side="left", padx=(0, 8))
