@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-12k
-# Update: Undo tag/hide now restores the previously rerolled side image.
-# Build: 2026-02-12k (undo restore previous side)
+# Version: 2026-02-12l
+# Update: Synced title build stamp and made tag filter exclude selected tags immediately.
+# Build: 2026-02-12l (title stamp + tag exclusion filter)
 
 import os
 import io
@@ -103,7 +103,7 @@ DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
 TAG_OPTIONS = ["SFW", "MEME", "HIDE", "CW"]
 
-BUILD_STAMP = '2026-02-12c (tag filter style alignment)'
+BUILD_STAMP = '2026-02-12l (title stamp + tag exclusion filter)'
 
 # -------------------- DB --------------------
 def init_db() -> sqlite3.Connection:
@@ -1465,7 +1465,7 @@ class App:
         if not selected:
             return True
         tags = set(self._parse_tags(row[8] if row and len(row) > 8 else ""))
-        return any(tag in tags for tag in selected)
+        return not any(tag in tags for tag in selected)
 
     def _row_matches_filter(self, row: tuple) -> bool:
         # row: (id, path, folder, duels, wins, losses, score, hidden, tags)
