@@ -1,7 +1,7 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-12b
-# Update: Refresh carousel thumbs when blur is toggled.
+# Version: 2026-02-12c
+# Update: Prevent Tk image errors when rebuilding blurred carousel thumbs.
 # Build: 2026-01-25c (aligned tag dropdowns)
 
 import os
@@ -3104,6 +3104,9 @@ class App:
         self._update_blur_toggle_style()
 
         # Rebuild history thumbnails under the new blur state.
+        # Clear button image handles first to avoid stale Tk image references.
+        for btn in self.carousel_slots:
+            btn.configure(image="")
         for entry in self.duel_history:
             entry["thumb"] = None
         self._update_carousel()
