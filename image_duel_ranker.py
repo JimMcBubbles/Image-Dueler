@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-12e
-# Update: Fixed blur-toggle refresh so duel images and history thumbs update immediately.
-# Build: 2026-02-12e (blur toggle refresh fix)
+# Version: 2026-02-12f
+# Update: Fixed carousel image-handle errors during blur toggles and immediate refresh.
+# Build: 2026-02-12f (blur toggle image handle fix)
 
 import os
 import io
@@ -1169,6 +1169,8 @@ class App:
         self._update_carousel_layout(len(indices))
 
         for i, btn in enumerate(self.carousel_slots):
+            # Clear stale Tk image handles first to avoid "image ... doesn't exist" on reconfigure.
+            btn.configure(image="")
             if i < len(indices):
                 idx = indices[i]
                 entry = self.duel_history[idx]
