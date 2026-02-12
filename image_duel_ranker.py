@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-12d
-# Update: Restored blur effect on history thumbnails when Blur mode is enabled.
-# Build: 2026-02-12d (history thumbnail blur fix)
+# Version: 2026-02-12e
+# Update: Fixed blur-toggle refresh so duel images and history thumbs update immediately.
+# Build: 2026-02-12e (blur toggle refresh fix)
 
 import os
 import io
@@ -3222,7 +3222,10 @@ class App:
         self._update_blur_toggle_style()
 
         for entry in self.duel_history:
-            entry["thumb"] = None
+            try:
+                entry["thumb"] = self._build_duel_thumbnail(entry["a_path"], entry["b_path"])
+            except Exception:
+                entry["thumb"] = None
         self._update_carousel()
 
         for side in ("a", "b"):
@@ -3233,10 +3236,9 @@ class App:
             if st.get("media_kind") == "video":
                 vframe = self.left_video if side == "a" else self.right_video
                 self._update_video_blur_overlay(side, vframe, row[1])
-            else:
-                panel = self.left_panel if side == "a" else self.right_panel
-                self._cancel_animation(side)
-                self._render_image_or_gif(side, panel, row[1])
+
+        # Defer still-image re-render one tick to avoid transient empty frames.
+        self.root.after_idle(self._refresh_visuals_only)
 
     def toggle_sidebar(self):
         """Toggle the right sidebar (focus mode)."""
