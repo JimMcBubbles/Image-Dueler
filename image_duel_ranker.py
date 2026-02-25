@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-25d
-# Update: Removed header tooltips and added per-formula metric tooltip guidance.
-# Build: 2026-02-25d (metric formula tooltips)
+# Version: 2026-02-25e
+# Update: Lifted metric-formula tooltips above dropdown menu using top-level overlay window.
+# Build: 2026-02-25e (tooltip z-order fix)
 
 import os
 import io
@@ -105,7 +105,7 @@ DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
 TAG_OPTIONS = ["SFW", "MEME", "HIDE", "CW"]
 
-BUILD_STAMP = '2026-02-25d (metric formula tooltips)'
+BUILD_STAMP = '2026-02-25e (tooltip z-order fix)'
 
 _DISLIKE_COUNTS_BY_REL_FOLDER: dict[str, int] = {}
 
@@ -892,9 +892,13 @@ class App:
 
     # -------------------- helpers / state --------------------
     def _ensure_ui_tooltip(self):
-        if getattr(self, "_ui_tip", None) is None:
+        if getattr(self, "_ui_tip_win", None) is None:
+            self._ui_tip_win = tk.Toplevel(self.root)
+            self._ui_tip_win.overrideredirect(True)
+            self._ui_tip_win.attributes("-topmost", True)
+            self._ui_tip_win.withdraw()
             self._ui_tip = tk.Label(
-                self.root,
+                self._ui_tip_win,
                 text="",
                 bg="#111111",
                 fg=TEXT_COLOR,
@@ -904,27 +908,28 @@ class App:
                 padx=6,
                 pady=2,
             )
-            self._ui_tip.place_forget()
+            self._ui_tip.pack()
 
     def _show_ui_tooltip_at_pointer(self, text: str):
         self._ensure_ui_tooltip()
         self._ui_tip.configure(text=text)
-        x_root = self.root.winfo_pointerx()
-        y_root = self.root.winfo_pointery()
-        rx = self.root.winfo_rootx()
-        ry = self.root.winfo_rooty()
-        rw = self.root.winfo_width()
-        rh = self.root.winfo_height()
-        x = (x_root - rx) + 12
-        y = (y_root - ry) + 14
-        x = max(6, min(rw - 260, x))
-        y = max(6, min(rh - 30, y))
-        self._ui_tip.place(x=x, y=y)
+        self._ui_tip.update_idletasks()
+        x_root = self.root.winfo_pointerx() + 12
+        y_root = self.root.winfo_pointery() + 14
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        tw = max(10, self._ui_tip.winfo_reqwidth())
+        th = max(10, self._ui_tip.winfo_reqheight())
+        x_root = max(4, min(sw - tw - 4, x_root))
+        y_root = max(4, min(sh - th - 4, y_root))
+        self._ui_tip_win.geometry(f"+{x_root}+{y_root}")
+        self._ui_tip_win.deiconify()
+        self._ui_tip_win.lift()
 
     def _hide_ui_tooltip(self, _event=None):
-        tip = getattr(self, "_ui_tip", None)
-        if tip is not None:
-            tip.place_forget()
+        tip_win = getattr(self, "_ui_tip_win", None)
+        if tip_win is not None:
+            tip_win.withdraw()
 
     def _new_side_state(self) -> dict:
         return {
