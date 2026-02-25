@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-25f
-# Update: Unified pool dropdown styling, added carousel close gestures, tag-aware pairing, and dislikes-adjusted metric default.
-# Build: 2026-02-25f (ui+pairing+metric)
+# Version: 2026-02-25g
+# Update: Fixed carousel toggle-bar click/drag behavior to avoid immediate close on open.
+# Build: 2026-02-25g (carousel-toggle-fix)
 
 import os
 import io
@@ -106,7 +106,7 @@ DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 TAG_OPTIONS = ["SFW", "MEME", "HIDE", "CW"]
 POOL_FILTER_OPTIONS = ["All", "Images", "GIFs", "Videos", "Videos (audio)", "Animated", "Hidden"]
 
-BUILD_STAMP = '2026-02-25f (ui+pairing+metric)'
+BUILD_STAMP = '2026-02-25g (carousel-toggle-fix)'
 
 _DISLIKE_COUNTS_BY_REL_FOLDER: dict[str, int] = {}
 
@@ -449,6 +449,7 @@ class App:
         self._carousel_drag_start = None
         self._carousel_dragging = False
         self._carousel_drag_start_height = None
+        self._carousel_drag_started_visible = False
 
         # video state per side
         self.vlc_instance = None
@@ -784,7 +785,9 @@ class App:
             bg=DARK_BG,
         )
         self.carousel_toggle_label.pack(side="left")
-        self.carousel_toggle_label.bind("<Button-1>", self._on_carousel_toggle_click)
+        self.carousel_toggle_label.bind("<ButtonPress-1>", self._on_carousel_drag_start)
+        self.carousel_toggle_label.bind("<B1-Motion>", self._on_carousel_drag)
+        self.carousel_toggle_label.bind("<ButtonRelease-1>", self._on_carousel_release)
         self.carousel_info = tk.Label(
             self.carousel_toggle_bar,
             text="History: 0",
@@ -793,6 +796,9 @@ class App:
             bg=DARK_BG,
         )
         self.carousel_info.pack(side="right")
+        self.carousel_info.bind("<ButtonPress-1>", self._on_carousel_drag_start)
+        self.carousel_info.bind("<B1-Motion>", self._on_carousel_drag)
+        self.carousel_info.bind("<ButtonRelease-1>", self._on_carousel_release)
         self.carousel_handle_bar = tk.Frame(
             self.carousel_toggle_bar,
             bg="#e4e4e4",
@@ -1002,43 +1008,34 @@ class App:
             self.carousel_panel.pack(side="bottom", fill="x", padx=6, pady=(0, 6))
         self._update_carousel()
 
-    def _on_carousel_toggle_click(self, _event=None) -> None:
-        self._toggle_carousel()
-
     def _on_carousel_drag_start(self, event) -> None:
-        if not self.carousel_visible:
-            self._show_carousel(self.carousel_default_height)
         self._carousel_drag_start = event.y_root
         self._carousel_drag_start_height = self.carousel_height
+        self._carousel_drag_started_visible = self.carousel_visible
         self._carousel_dragging = False
 
     def _on_carousel_drag(self, event) -> None:
-        if self._carousel_drag_start is None:
+        if self._carousel_drag_start is None or not self._carousel_drag_started_visible:
             return
-        if not self.carousel_visible:
-            self._show_carousel(self.carousel_default_height)
         delta = event.y_root - self._carousel_drag_start
+        if abs(delta) < 4:
+            return
+        self._carousel_dragging = True
         base = self._carousel_drag_start_height or self.carousel_height
         new_height = int(base - delta)
         new_height = max(0, min(self.carousel_max_height, new_height))
         if new_height != self.carousel_height:
             self.carousel_height = new_height
-            if self.carousel_height <= 0:
-                self._toggle_carousel()
-                self._carousel_drag_start = None
-                self._carousel_drag_start_height = None
-                self._carousel_dragging = False
-                return
             self.carousel_panel.configure(height=self.carousel_height)
             self._update_carousel()
-        self._carousel_dragging = True
 
     def _on_carousel_release(self, event) -> None:
         if self._carousel_drag_start is None:
             return
         delta = event.y_root - self._carousel_drag_start
-        if self._carousel_dragging:
-            if delta > 60:
+        started_visible = self._carousel_drag_started_visible
+        if self._carousel_dragging and started_visible:
+            if delta > 60 or self.carousel_height <= 0:
                 self._toggle_carousel()
             elif self.carousel_height < self.carousel_min_height:
                 self.carousel_height = self.carousel_min_height
@@ -1049,6 +1046,7 @@ class App:
             self._toggle_carousel()
         self._carousel_drag_start = None
         self._carousel_drag_start_height = None
+        self._carousel_drag_started_visible = False
         self._carousel_dragging = False
 
     def _update_carousel_layout(self, slot_count: int) -> None:
