@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-25i
-# Update: Moved GIF frame decoding off the UI thread and capped animation preload work to prevent lockups on large GIF duels.
-# Build: 2026-02-25i (gif-async-preload)
+# Version: 2026-02-25j
+# Update: Prevented repeated GIF reload loops during UI refreshes by skipping GIF rerenders in resize-only refresh passes.
+# Build: 2026-02-25j (gif-refresh-loop-fix)
 
 import os
 import io
@@ -106,7 +106,7 @@ DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 TAG_OPTIONS = ["SFW", "MEME", "HIDE", "CW"]
 POOL_FILTER_OPTIONS = ["All", "Images", "GIFs", "Videos", "Videos (audio)", "Animated", "Hidden"]
 
-BUILD_STAMP = '2026-02-25i (gif-async-preload)'
+BUILD_STAMP = '2026-02-25j (gif-refresh-loop-fix)'
 
 GIF_PRELOAD_MAX_FRAMES = 120
 
@@ -3931,18 +3931,17 @@ class App:
 
     # -------------------- refresh visuals only --------------------
     def _refresh_visuals_only(self):
-        # Only rerender still images/gifs, avoid touching VLC players.
+        # Only rerender still images; avoid touching GIF/video playback state.
         for side in ("a", "b"):
             st = self._side[side]
             row = st.get("row")
             if not row:
                 continue
             kind = self._media_kind(row[1])
-            if kind == "video":
-                # do nothing; VLC output is independent of Tk size changes
+            if kind in ("gif", "video"):
+                # keep active GIF/video playback running; avoid reload loops from resize churn
                 continue
             panel = self.left_panel if side == "a" else self.right_panel
-            self._cancel_animation(side)
             self._render_image_or_gif(side, panel, row[1])
         self._update_carousel()
 
