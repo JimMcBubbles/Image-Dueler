@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-25c
-# Update: Put metric selector and page readout on one row with explanatory tooltips.
-# Build: 2026-02-25c (leaderboard header tooltips + one-line controls)
+# Version: 2026-02-25d
+# Update: Removed header tooltips and added per-formula metric tooltip guidance.
+# Build: 2026-02-25d (metric formula tooltips)
 
 import os
 import io
@@ -105,7 +105,7 @@ DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
 TAG_OPTIONS = ["SFW", "MEME", "HIDE", "CW"]
 
-BUILD_STAMP = '2026-02-25c (leaderboard header tooltips + one-line controls)'
+BUILD_STAMP = '2026-02-25d (metric formula tooltips)'
 
 _DISLIKE_COUNTS_BY_REL_FOLDER: dict[str, int] = {}
 
@@ -638,6 +638,14 @@ class App:
         )
         self.metric_btn.pack(side="left", fill="x", expand=True)
         self.metric_menu = tk.Menu(self.metric_btn, tearoff=0)
+        self._metric_tooltips = {
+            "shrunken_avg": f"Shrunken Avg: dampens small-sample folders using prior={FOLDER_PRIOR_IMAGES}.",
+            "dislikes_adjusted": (
+                f"Shrunken Avg - dislikes×{DISLIKES_PER_FILE_PENALTY:g}: applies mirrored dislikes penalty per file."
+            ),
+            "avg": "Simple Avg: plain mean score by folder.",
+            "lcb": f"Lower Confidence Bound: conservative score (mean - z*SE, z={LCB_Z}).",
+        }
         for metric_key in ("shrunken_avg", "dislikes_adjusted", "avg", "lcb"):
             self.metric_menu.add_radiobutton(
                 label=self._metric_human(metric_key),
@@ -645,6 +653,8 @@ class App:
                 value=metric_key,
                 command=self.on_metric_change,
             )
+        self.metric_menu.bind("<<MenuSelect>>", self._on_metric_menu_select, add="+")
+        self.metric_menu.bind("<Unmap>", self._hide_ui_tooltip, add="+")
         self.metric_btn.configure(menu=self.metric_menu)
         self.metric_btn.configure(text=f"Metric: {self._metric_human(self.metric)}")
         self.page_label = tk.Label(
@@ -656,8 +666,6 @@ class App:
             cursor="question_arrow",
         )
         self.page_label.pack(side="right", padx=(10, 0))
-        self._bind_tooltip(self.metric_btn, "Choose the ranking formula used for Top Artists.")
-        self._bind_tooltip(self.page_label, "Shows current leaderboard page and total folder count.")
 
         self.board = tk.Text(self.sidebar, height=20, font=("Consolas", 10),
                              bg=DARK_PANEL, fg=TEXT_COLOR, insertbackground=TEXT_COLOR,
@@ -898,16 +906,18 @@ class App:
             )
             self._ui_tip.place_forget()
 
-    def _show_ui_tooltip(self, event, text: str):
+    def _show_ui_tooltip_at_pointer(self, text: str):
         self._ensure_ui_tooltip()
         self._ui_tip.configure(text=text)
+        x_root = self.root.winfo_pointerx()
+        y_root = self.root.winfo_pointery()
         rx = self.root.winfo_rootx()
         ry = self.root.winfo_rooty()
         rw = self.root.winfo_width()
         rh = self.root.winfo_height()
-        x = (event.x_root - rx) + 12
-        y = (event.y_root - ry) + 14
-        x = max(6, min(rw - 220, x))
+        x = (x_root - rx) + 12
+        y = (y_root - ry) + 14
+        x = max(6, min(rw - 260, x))
         y = max(6, min(rh - 30, y))
         self._ui_tip.place(x=x, y=y)
 
@@ -915,11 +925,6 @@ class App:
         tip = getattr(self, "_ui_tip", None)
         if tip is not None:
             tip.place_forget()
-
-    def _bind_tooltip(self, widget, text: str):
-        widget.bind("<Enter>", lambda e, t=text: self._show_ui_tooltip(e, t), add="+")
-        widget.bind("<Motion>", lambda e, t=text: self._show_ui_tooltip(e, t), add="+")
-        widget.bind("<Leave>", self._hide_ui_tooltip, add="+")
 
     def _new_side_state(self) -> dict:
         return {
@@ -3016,6 +3021,27 @@ class App:
             return
         target = int(frac * total)
         self._show_wave_tooltip(event.x_root, event.y_root, self._format_mmss(target))
+
+    def _on_metric_menu_select(self, _event=None):
+        menu = getattr(self, "metric_menu", None)
+        if not menu:
+            return
+        try:
+            active = menu.index("active")
+        except Exception:
+            active = None
+        if active is None:
+            self._hide_ui_tooltip()
+            return
+        try:
+            metric_key = menu.entrycget(active, "value")
+        except Exception:
+            metric_key = None
+        if not metric_key:
+            self._hide_ui_tooltip()
+            return
+        text = self._metric_tooltips.get(metric_key, self._metric_human(metric_key))
+        self._show_ui_tooltip_at_pointer(text)
 
     def _metric_human(self, metric_key: Optional[str] = None) -> str:
         key = metric_key or self.metric
