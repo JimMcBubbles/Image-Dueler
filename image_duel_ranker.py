@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-25b
-# Update: Replaced static metric readout with a metric selector dropdown in the sidebar.
-# Build: 2026-02-25b (metric selector dropdown)
+# Version: 2026-02-25c
+# Update: Put metric selector and page readout on one row with explanatory tooltips.
+# Build: 2026-02-25c (leaderboard header tooltips + one-line controls)
 
 import os
 import io
@@ -105,7 +105,7 @@ DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
 TAG_OPTIONS = ["SFW", "MEME", "HIDE", "CW"]
 
-BUILD_STAMP = '2026-02-25b (metric selector dropdown)'
+BUILD_STAMP = '2026-02-25c (leaderboard header tooltips + one-line controls)'
 
 _DISLIKE_COUNTS_BY_REL_FOLDER: dict[str, int] = {}
 
@@ -623,9 +623,9 @@ class App:
         # ---- Leaderboard ----
         self.leader_header = tk.Label(self.sidebar, text="Top Artists",
                                       font=("Segoe UI", 12, "bold"), fg=ACCENT, bg=DARK_BG)
-        self.metric_row = tk.Frame(self.sidebar, bg=DARK_BG)
+        self.leader_controls_row = tk.Frame(self.sidebar, bg=DARK_BG)
         self.metric_btn = tk.Menubutton(
-            self.metric_row,
+            self.leader_controls_row,
             text="Metric: (loading)",
             font=("Segoe UI", 9),
             fg=INFO_BAR_FG,
@@ -647,7 +647,17 @@ class App:
             )
         self.metric_btn.configure(menu=self.metric_menu)
         self.metric_btn.configure(text=f"Metric: {self._metric_human(self.metric)}")
-        self.page_label = tk.Label(self.sidebar, text="", font=("Segoe UI", 9), fg=TEXT_COLOR, bg=DARK_BG)
+        self.page_label = tk.Label(
+            self.leader_controls_row,
+            text="",
+            font=("Segoe UI", 9),
+            fg=TEXT_COLOR,
+            bg=DARK_BG,
+            cursor="question_arrow",
+        )
+        self.page_label.pack(side="right", padx=(10, 0))
+        self._bind_tooltip(self.metric_btn, "Choose the ranking formula used for Top Artists.")
+        self._bind_tooltip(self.page_label, "Shows current leaderboard page and total folder count.")
 
         self.board = tk.Text(self.sidebar, height=20, font=("Consolas", 10),
                              bg=DARK_PANEL, fg=TEXT_COLOR, insertbackground=TEXT_COLOR,
@@ -710,8 +720,7 @@ class App:
 
         # Layout (sidebar)
         self.leader_header.pack(anchor="w")
-        self.metric_row.pack(fill="x", pady=(2, 0))
-        self.page_label.pack(anchor="e", pady=(0, 4))
+        self.leader_controls_row.pack(fill="x", pady=(2, 4))
         self.board.pack(fill="x", pady=(4, 6))
         self.nav_row.pack(fill="x", pady=(0, 6))
         tk.Frame(self.sidebar, height=1, bg=SEPARATOR_BG).pack(fill="x", pady=(0, 6))
@@ -874,6 +883,44 @@ class App:
         self.load_duel()
 
     # -------------------- helpers / state --------------------
+    def _ensure_ui_tooltip(self):
+        if getattr(self, "_ui_tip", None) is None:
+            self._ui_tip = tk.Label(
+                self.root,
+                text="",
+                bg="#111111",
+                fg=TEXT_COLOR,
+                font=("Segoe UI", 8),
+                bd=1,
+                relief="solid",
+                padx=6,
+                pady=2,
+            )
+            self._ui_tip.place_forget()
+
+    def _show_ui_tooltip(self, event, text: str):
+        self._ensure_ui_tooltip()
+        self._ui_tip.configure(text=text)
+        rx = self.root.winfo_rootx()
+        ry = self.root.winfo_rooty()
+        rw = self.root.winfo_width()
+        rh = self.root.winfo_height()
+        x = (event.x_root - rx) + 12
+        y = (event.y_root - ry) + 14
+        x = max(6, min(rw - 220, x))
+        y = max(6, min(rh - 30, y))
+        self._ui_tip.place(x=x, y=y)
+
+    def _hide_ui_tooltip(self, _event=None):
+        tip = getattr(self, "_ui_tip", None)
+        if tip is not None:
+            tip.place_forget()
+
+    def _bind_tooltip(self, widget, text: str):
+        widget.bind("<Enter>", lambda e, t=text: self._show_ui_tooltip(e, t), add="+")
+        widget.bind("<Motion>", lambda e, t=text: self._show_ui_tooltip(e, t), add="+")
+        widget.bind("<Leave>", self._hide_ui_tooltip, add="+")
+
     def _new_side_state(self) -> dict:
         return {
             "row": None,
