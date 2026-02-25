@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-25h
-# Update: Added drag-to-open support for the carousel toggle bar while preserving click/drag close behavior.
-# Build: 2026-02-25h (carousel-drag-open)
+# Version: 2026-02-25i
+# Update: Moved GIF frame decoding off the UI thread and capped animation preload work to prevent lockups on large GIF duels.
+# Build: 2026-02-25i (gif-async-preload)
 
 import os
 import io
@@ -106,7 +106,9 @@ DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 TAG_OPTIONS = ["SFW", "MEME", "HIDE", "CW"]
 POOL_FILTER_OPTIONS = ["All", "Images", "GIFs", "Videos", "Videos (audio)", "Animated", "Hidden"]
 
-BUILD_STAMP = '2026-02-25h (carousel-drag-open)'
+BUILD_STAMP = '2026-02-25i (gif-async-preload)'
+
+GIF_PRELOAD_MAX_FRAMES = 120
 
 _DISLIKE_COUNTS_BY_REL_FOLDER: dict[str, int] = {}
 
@@ -966,6 +968,7 @@ class App:
             "anim_frames": None,
             "anim_delays": None,
             "anim_index": 0,
+            "gif_render_token": 0,
 
             "vlc_player": None,
             "vlc_media": None,
@@ -2035,6 +2038,10 @@ class App:
             return
         target = (max(120, w - 12), max(120, h - 12))
 
+        st = self._side[side]
+        st["gif_render_token"] = st.get("gif_render_token", 0) + 1
+        render_token = st["gif_render_token"]
+
         try:
             im = Image.open(path)
         except Exception as e:
@@ -2058,50 +2065,74 @@ class App:
             widget.image = tk_im
             return
 
-        # GIF animation
-        frames: List[ImageTk.PhotoImage] = []
-        delays: List[int] = []
-        try:
-            for frame in ImageSequence.Iterator(im):
-                delay = frame.info.get("duration", im.info.get("duration", 100))
-                delays.append(int(delay))
-                fr = frame.convert("RGBA") if frame.mode != "RGBA" else frame.copy()
-                fr.thumbnail(target, Image.Resampling.LANCZOS)
-                if self.blur_enabled:
-                    fr = self._apply_pixelate(fr, pixel_size=50)
-                frames.append(ImageTk.PhotoImage(fr))
-        except Exception:
-            # fallback: first frame only
-            im.seek(0)
-            fr = im.convert("RGBA") if im.mode != "RGBA" else im.copy()
-            fr.thumbnail(target, Image.Resampling.LANCZOS)
-            if self.blur_enabled:
-                fr = self._apply_pixelate(fr, pixel_size=50)
-            tk_im = ImageTk.PhotoImage(fr)
-            widget.configure(image=tk_im, text="", bg=DARK_PANEL)
-            widget.image = tk_im
-            return
+        # GIF animation (decode asynchronously to keep the UI responsive)
+        widget.configure(text="Loading GIF…", image="", fg=TEXT_COLOR, bg=DARK_PANEL)
 
-        st = self._side[side]
-        st["anim_frames"] = frames
-        st["anim_delays"] = delays
-        st["anim_index"] = 0
+        def decode_worker(expected_token: int, source_path: str, size_target: tuple[int, int], blur_on: bool):
+            frames_payload: List[tuple[bytes, tuple[int, int], str]] = []
+            delays: List[int] = []
+            error: Optional[str] = None
+            try:
+                with Image.open(source_path) as gif_im:
+                    for frame_i, frame in enumerate(ImageSequence.Iterator(gif_im)):
+                        if frame_i >= GIF_PRELOAD_MAX_FRAMES:
+                            break
+                        delay = frame.info.get("duration", gif_im.info.get("duration", 100))
+                        delays.append(int(delay))
+                        fr = frame.convert("RGBA") if frame.mode != "RGBA" else frame.copy()
+                        fr.thumbnail(size_target, Image.Resampling.LANCZOS)
+                        if blur_on:
+                            fr = self._apply_pixelate(fr, pixel_size=50)
+                        frames_payload.append((fr.tobytes(), fr.size, fr.mode))
+            except Exception as ex:
+                error = str(ex)
 
-        def step():
-            st2 = self._side[side]
-            if not st2.get("anim_frames"):
-                return
-            idx = st2["anim_index"] % len(st2["anim_frames"])
-            widget.configure(image=st2["anim_frames"][idx], text="", bg=DARK_PANEL)
-            widget.image = st2["anim_frames"][idx]
-            st2["anim_index"] = (idx + 1) % len(st2["anim_frames"])
-            delay = max(20, int(st2["anim_delays"][idx] if idx < len(st2["anim_delays"]) else 100))
-            st2["anim_job"] = self.root.after(delay, step)
+            def apply_result():
+                st2 = self._side[side]
+                if st2.get("gif_render_token") != expected_token:
+                    return
+                if error:
+                    widget.configure(text=f"Failed to load:\n{source_path}\n\n{error}", fg=TEXT_COLOR, bg=DARK_PANEL)
+                    return
+                if not frames_payload:
+                    widget.configure(text=f"Failed to load:\n{source_path}\n\nNo GIF frames available.", fg=TEXT_COLOR, bg=DARK_PANEL)
+                    return
 
-        st["anim_job"] = self.root.after(0, step)
+                frames: List[ImageTk.PhotoImage] = []
+                for payload, payload_size, payload_mode in frames_payload:
+                    img = Image.frombytes(payload_mode, payload_size, payload)
+                    frames.append(ImageTk.PhotoImage(img))
+
+                st2["anim_frames"] = frames
+                st2["anim_delays"] = delays
+                st2["anim_index"] = 0
+
+                def step():
+                    st3 = self._side[side]
+                    if st3.get("gif_render_token") != expected_token:
+                        return
+                    if not st3.get("anim_frames"):
+                        return
+                    idx = st3["anim_index"] % len(st3["anim_frames"])
+                    widget.configure(image=st3["anim_frames"][idx], text="", bg=DARK_PANEL)
+                    widget.image = st3["anim_frames"][idx]
+                    st3["anim_index"] = (idx + 1) % len(st3["anim_frames"])
+                    delay = max(20, int(st3["anim_delays"][idx] if idx < len(st3["anim_delays"]) else 100))
+                    st3["anim_job"] = self.root.after(delay, step)
+
+                st2["anim_job"] = self.root.after(0, step)
+
+            self.root.after(0, apply_result)
+
+        threading.Thread(
+            target=decode_worker,
+            args=(render_token, path, target, self.blur_enabled),
+            daemon=True,
+        ).start()
 
     def _cancel_animation(self, side: str):
         st = self._side[side]
+        st["gif_render_token"] = st.get("gif_render_token", 0) + 1
         if st.get("anim_job"):
             try:
                 self.root.after_cancel(st["anim_job"])
