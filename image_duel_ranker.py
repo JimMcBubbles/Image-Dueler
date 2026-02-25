@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-12m
-# Update: Force immediate pool revalidation after per-image tag edits.
-# Build: 2026-02-12m (tag edit reroll consistency)
+# Version: 2026-02-25e
+# Update: Lifted metric-formula tooltips above dropdown menu using top-level overlay window.
+# Build: 2026-02-25e (tooltip z-order fix)
 
 import os
 import io
@@ -62,6 +62,7 @@ LINK_COLOR  = "#4ea1ff"
 
 # -------------------- CONFIG --------------------
 ROOT_DIR = r"I:\OneDrive\Discord Downloader Output\+\Grabber"
+DISLIKES_ROOT_DIR = r"G:\-\Grabber"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DB_PATH = SCRIPT_DIR / ".image_ranking.sqlite"
@@ -97,13 +98,16 @@ LEADERBOARD_METRIC_DEFAULT = "shrunken_avg"  # avg | shrunken_avg | lcb
 FOLDER_MIN_N = 1
 FOLDER_PRIOR_IMAGES = 8
 LCB_Z = 1.0
+DISLIKES_PER_FILE_PENALTY = 6.0
 
 E621_MAX_TAGS = 40
 DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
 TAG_OPTIONS = ["SFW", "MEME", "HIDE", "CW"]
 
-BUILD_STAMP = '2026-02-12l (title stamp + tag exclusion filter)'
+BUILD_STAMP = '2026-02-25e (tooltip z-order fix)'
+
+_DISLIKE_COUNTS_BY_REL_FOLDER: dict[str, int] = {}
 
 # -------------------- DB --------------------
 def init_db() -> sqlite3.Connection:
@@ -174,6 +178,47 @@ def scan_images(conn: sqlite3.Connection) -> None:
     n = cur.execute("SELECT COUNT(*) FROM images").fetchone()[0]
     print(f"[scan] total images in DB: {n}")
 
+
+def _normalize_rel_folder_key(path_like: str) -> str:
+    text = str(path_like).strip()
+    text = text.replace('\\', '/')
+    text = text.strip('/')
+    return text.lower()
+
+
+def _build_dislikes_index(dislikes_root: Path) -> dict[str, int]:
+    idx: dict[str, int] = {}
+    if not dislikes_root.exists():
+        return idx
+    for p in dislikes_root.rglob('*'):
+        if not p.is_file() or p.suffix.lower() not in SUPPORTED_EXTS:
+            continue
+        try:
+            rel_parent = p.parent.relative_to(dislikes_root)
+            key = _normalize_rel_folder_key(str(rel_parent))
+            idx[key] = idx.get(key, 0) + 1
+        except Exception:
+            continue
+    return idx
+
+
+def _relative_folder_to_root(folder: str, root: str) -> str:
+    try:
+        rel = Path(folder).resolve().relative_to(Path(root).resolve())
+        return _normalize_rel_folder_key(str(rel))
+    except Exception:
+        return _normalize_rel_folder_key(Path(folder).name)
+
+
+def refresh_dislikes_index() -> None:
+    global _DISLIKE_COUNTS_BY_REL_FOLDER
+    dislikes_root = Path(DISLIKES_ROOT_DIR)
+    print('[dislikes] scanning', dislikes_root)
+    _DISLIKE_COUNTS_BY_REL_FOLDER = _build_dislikes_index(dislikes_root)
+    folders = len(_DISLIKE_COUNTS_BY_REL_FOLDER)
+    files = sum(_DISLIKE_COUNTS_BY_REL_FOLDER.values())
+    print(f'[dislikes] indexed {files} files across {folders} mirrored folders')
+
 # -------------------- Elo helpers --------------------
 def elo_expected(sa: float, sb: float) -> float:
     return 1.0 / (1.0 + 10 ** ((sb - sa) / 400.0))
@@ -193,7 +238,7 @@ def folder_leaderboard(conn: sqlite3.Connection, metric: str = LEADERBOARD_METRI
     global_mu = float(mu_row[0] if mu_row and mu_row[0] is not None else BASE_SCORE)
 
     rows: List[dict] = []
-    if metric in ("avg", "shrunken_avg"):
+    if metric in ("avg", "shrunken_avg", "dislikes_adjusted"):
         data = conn.execute("""
             SELECT folder, AVG(score) AS avg_s, COUNT(*) AS n
             FROM images
@@ -204,8 +249,12 @@ def folder_leaderboard(conn: sqlite3.Connection, metric: str = LEADERBOARD_METRI
         for (folder, avg_s, n) in data:
             avg_s = float(avg_s); n = int(n)
             score = ((avg_s * n + global_mu * FOLDER_PRIOR_IMAGES) / (n + FOLDER_PRIOR_IMAGES)
-                     if metric == "shrunken_avg" else avg_s)
-            rows.append({"folder": folder, "avg": avg_s, "n": n, "score": score})
+                     if metric in ("shrunken_avg", "dislikes_adjusted") else avg_s)
+            rel_key = _relative_folder_to_root(folder, ROOT_DIR)
+            dislikes_n = int(_DISLIKE_COUNTS_BY_REL_FOLDER.get(rel_key, 0))
+            if metric == "dislikes_adjusted":
+                score -= dislikes_n * DISLIKES_PER_FILE_PENALTY
+            rows.append({"folder": folder, "avg": avg_s, "n": n, "score": score, "dislikes_n": dislikes_n})
     elif metric == "lcb":
         data = conn.execute("""
             SELECT folder, COUNT(*) AS n, AVG(score) AS avg_s, AVG(score*score) AS avg_sq
@@ -219,7 +268,9 @@ def folder_leaderboard(conn: sqlite3.Connection, metric: str = LEADERBOARD_METRI
             var = max(0.0, avg_sq - avg_s * avg_s)
             se = (var ** 0.5) / (n ** 0.5) if n > 0 else 0.0
             score = avg_s - LCB_Z * se
-            rows.append({"folder": folder, "avg": avg_s, "n": n, "score": score})
+            rel_key = _relative_folder_to_root(folder, ROOT_DIR)
+            dislikes_n = int(_DISLIKE_COUNTS_BY_REL_FOLDER.get(rel_key, 0))
+            rows.append({"folder": folder, "avg": avg_s, "n": n, "score": score, "dislikes_n": dislikes_n})
     else:
         return folder_leaderboard(conn, metric="avg", min_n=min_n)
 
@@ -228,7 +279,8 @@ def folder_leaderboard(conn: sqlite3.Connection, metric: str = LEADERBOARD_METRI
     for i, r in enumerate(rows, start=1):
         out.append({
             "folder": r["folder"], "avg": r["avg"], "n": r["n"],
-            "rank": i, "score": r["score"], "metric": metric
+            "rank": i, "score": r["score"], "metric": metric,
+            "dislikes_n": int(r.get("dislikes_n", 0))
         })
     return out
 
@@ -380,6 +432,7 @@ class App:
         self.prev_artists = deque(maxlen=6)
         self.page = 0
         self.metric = LEADERBOARD_METRIC_DEFAULT
+        self.metric_var = tk.StringVar(value=self.metric)
         self._last_ranks = {r["folder"]: r["rank"] for r in folder_leaderboard(self.conn, metric=self.metric)}
         self._resize_job = None
         self._audio_cache = {}
@@ -570,8 +623,49 @@ class App:
         # ---- Leaderboard ----
         self.leader_header = tk.Label(self.sidebar, text="Top Artists",
                                       font=("Segoe UI", 12, "bold"), fg=ACCENT, bg=DARK_BG)
-        self.metric_label = tk.Label(self.sidebar, text="", font=("Segoe UI", 9), fg=TEXT_COLOR, bg=DARK_BG)
-        self.page_label = tk.Label(self.sidebar, text="", font=("Segoe UI", 9), fg=TEXT_COLOR, bg=DARK_BG)
+        self.leader_controls_row = tk.Frame(self.sidebar, bg=DARK_BG)
+        self.metric_btn = tk.Menubutton(
+            self.leader_controls_row,
+            text="Metric: (loading)",
+            font=("Segoe UI", 9),
+            fg=INFO_BAR_FG,
+            bg=INFO_BAR_BG,
+            activebackground=INFO_BAR_BG,
+            activeforeground=INFO_BAR_FG,
+            relief="flat",
+            cursor="hand2",
+            anchor="w",
+        )
+        self.metric_btn.pack(side="left", fill="x", expand=True)
+        self.metric_menu = tk.Menu(self.metric_btn, tearoff=0)
+        self._metric_tooltips = {
+            "shrunken_avg": f"Shrunken Avg: dampens small-sample folders using prior={FOLDER_PRIOR_IMAGES}.",
+            "dislikes_adjusted": (
+                f"Shrunken Avg - dislikes×{DISLIKES_PER_FILE_PENALTY:g}: applies mirrored dislikes penalty per file."
+            ),
+            "avg": "Simple Avg: plain mean score by folder.",
+            "lcb": f"Lower Confidence Bound: conservative score (mean - z*SE, z={LCB_Z}).",
+        }
+        for metric_key in ("shrunken_avg", "dislikes_adjusted", "avg", "lcb"):
+            self.metric_menu.add_radiobutton(
+                label=self._metric_human(metric_key),
+                variable=self.metric_var,
+                value=metric_key,
+                command=self.on_metric_change,
+            )
+        self.metric_menu.bind("<<MenuSelect>>", self._on_metric_menu_select, add="+")
+        self.metric_menu.bind("<Unmap>", self._hide_ui_tooltip, add="+")
+        self.metric_btn.configure(menu=self.metric_menu)
+        self.metric_btn.configure(text=f"Metric: {self._metric_human(self.metric)}")
+        self.page_label = tk.Label(
+            self.leader_controls_row,
+            text="",
+            font=("Segoe UI", 9),
+            fg=TEXT_COLOR,
+            bg=DARK_BG,
+            cursor="question_arrow",
+        )
+        self.page_label.pack(side="right", padx=(10, 0))
 
         self.board = tk.Text(self.sidebar, height=20, font=("Consolas", 10),
                              bg=DARK_PANEL, fg=TEXT_COLOR, insertbackground=TEXT_COLOR,
@@ -634,8 +728,7 @@ class App:
 
         # Layout (sidebar)
         self.leader_header.pack(anchor="w")
-        self.metric_label.pack(anchor="w")
-        self.page_label.pack(anchor="e", pady=(0, 4))
+        self.leader_controls_row.pack(fill="x", pady=(2, 4))
         self.board.pack(fill="x", pady=(4, 6))
         self.nav_row.pack(fill="x", pady=(0, 6))
         tk.Frame(self.sidebar, height=1, bg=SEPARATOR_BG).pack(fill="x", pady=(0, 6))
@@ -798,6 +891,46 @@ class App:
         self.load_duel()
 
     # -------------------- helpers / state --------------------
+    def _ensure_ui_tooltip(self):
+        if getattr(self, "_ui_tip_win", None) is None:
+            self._ui_tip_win = tk.Toplevel(self.root)
+            self._ui_tip_win.overrideredirect(True)
+            self._ui_tip_win.attributes("-topmost", True)
+            self._ui_tip_win.withdraw()
+            self._ui_tip = tk.Label(
+                self._ui_tip_win,
+                text="",
+                bg="#111111",
+                fg=TEXT_COLOR,
+                font=("Segoe UI", 8),
+                bd=1,
+                relief="solid",
+                padx=6,
+                pady=2,
+            )
+            self._ui_tip.pack()
+
+    def _show_ui_tooltip_at_pointer(self, text: str):
+        self._ensure_ui_tooltip()
+        self._ui_tip.configure(text=text)
+        self._ui_tip.update_idletasks()
+        x_root = self.root.winfo_pointerx() + 12
+        y_root = self.root.winfo_pointery() + 14
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        tw = max(10, self._ui_tip.winfo_reqwidth())
+        th = max(10, self._ui_tip.winfo_reqheight())
+        x_root = max(4, min(sw - tw - 4, x_root))
+        y_root = max(4, min(sh - th - 4, y_root))
+        self._ui_tip_win.geometry(f"+{x_root}+{y_root}")
+        self._ui_tip_win.deiconify()
+        self._ui_tip_win.lift()
+
+    def _hide_ui_tooltip(self, _event=None):
+        tip_win = getattr(self, "_ui_tip_win", None)
+        if tip_win is not None:
+            tip_win.withdraw()
+
     def _new_side_state(self) -> dict:
         return {
             "row": None,
@@ -2894,20 +3027,53 @@ class App:
         target = int(frac * total)
         self._show_wave_tooltip(event.x_root, event.y_root, self._format_mmss(target))
 
-    def _metric_human(self) -> str:
+    def _on_metric_menu_select(self, _event=None):
+        menu = getattr(self, "metric_menu", None)
+        if not menu:
+            return
+        try:
+            active = menu.index("active")
+        except Exception:
+            active = None
+        if active is None:
+            self._hide_ui_tooltip()
+            return
+        try:
+            metric_key = menu.entrycget(active, "value")
+        except Exception:
+            metric_key = None
+        if not metric_key:
+            self._hide_ui_tooltip()
+            return
+        text = self._metric_tooltips.get(metric_key, self._metric_human(metric_key))
+        self._show_ui_tooltip_at_pointer(text)
+
+    def _metric_human(self, metric_key: Optional[str] = None) -> str:
+        key = metric_key or self.metric
         return {
             "avg": "Simple Avg",
             "shrunken_avg": f"Shrunken Avg (prior={FOLDER_PRIOR_IMAGES})",
+            "dislikes_adjusted": f"Shrunken Avg - dislikes×{DISLIKES_PER_FILE_PENALTY:g}",
             "lcb": f"Lower Conf. Bound (z={LCB_Z})"
-        }.get(self.metric, self.metric)
+        }.get(key, key)
 
-    def toggle_metric(self):
-        order = ["shrunken_avg", "avg", "lcb"]
-        i = order.index(self.metric) if self.metric in order else 0
-        self.metric = order[(i + 1) % len(order)]
+    def _set_metric(self, metric_key: str) -> None:
+        if metric_key not in {"shrunken_avg", "dislikes_adjusted", "avg", "lcb"}:
+            metric_key = "shrunken_avg"
+        self.metric = metric_key
+        self.metric_var.set(metric_key)
+        self.metric_btn.configure(text=f"Metric: {self._metric_human(metric_key)}")
         self._last_ranks = {r["folder"]: r["rank"] for r in folder_leaderboard(self.conn, metric=self.metric)}
         self.page = 0
         self.update_sidebar()
+
+    def on_metric_change(self) -> None:
+        self._set_metric(self.metric_var.get())
+
+    def toggle_metric(self):
+        order = ["shrunken_avg", "dislikes_adjusted", "avg", "lcb"]
+        i = order.index(self.metric) if self.metric in order else 0
+        self._set_metric(order[(i + 1) % len(order)])
 
     def change_page(self, delta: int):
         leader = folder_leaderboard(self.conn, metric=self.metric)
@@ -2938,7 +3104,7 @@ class App:
         start = self.page * LEADERBOARD_SIZE
         end = min(start + LEADERBOARD_SIZE, total)
 
-        self.metric_label.configure(text=f"[Metric: {self._metric_human()}]")
+        self.metric_btn.configure(text=f"Metric: {self._metric_human(self.metric)}")
         self.page_label.configure(text=f"Page {self.page+1}/{total_pages}  (total {total})")
 
         # Leaderboard lines
@@ -2963,6 +3129,11 @@ class App:
                     ticker, ticker_tag = "•", "delta_flat"
             if self.metric == "avg":
                 line = f"{ticker} {row['rank']:>3}. {leaf:<{LEAF_MAX}} {row['avg']:6.1f}  (n={row['n']}){marker}"
+            elif self.metric == "dislikes_adjusted":
+                line = (
+                    f"{ticker} {row['rank']:>3}. {leaf:<{LEAF_MAX}} {row['score']:6.1f}  "
+                    f"avg={row['avg']:5.1f} d={row.get('dislikes_n', 0)} (n={row['n']}){marker}"
+                )
             elif self.metric == "shrunken_avg":
                 line = f"{ticker} {row['rank']:>3}. {leaf:<{LEAF_MAX}} {row['score']:6.1f}  avg={row['avg']:5.1f} (n={row['n']}){marker}"
             else:
@@ -3721,6 +3892,7 @@ def show_folder_chart(conn: sqlite3.Connection) -> None:
 def run():
     conn = init_db()
     scan_images(conn)
+    refresh_dislikes_index()
     root = tk.Tk()
     app = App(root, conn)
     root.mainloop()
