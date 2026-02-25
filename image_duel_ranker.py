@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-25j
-# Update: Prevented repeated GIF reload loops during UI refreshes by skipping GIF rerenders in resize-only refresh passes.
-# Build: 2026-02-25j (gif-refresh-loop-fix)
+# Version: 2026-02-25k
+# Update: Refresh media only when panel size changes so GIFs resize correctly without repeated reload loops.
+# Build: 2026-02-25k (size-change-media-refresh)
 
 import os
 import io
@@ -106,7 +106,7 @@ DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 TAG_OPTIONS = ["SFW", "MEME", "HIDE", "CW"]
 POOL_FILTER_OPTIONS = ["All", "Images", "GIFs", "Videos", "Videos (audio)", "Animated", "Hidden"]
 
-BUILD_STAMP = '2026-02-25j (gif-refresh-loop-fix)'
+BUILD_STAMP = '2026-02-25k (size-change-media-refresh)'
 
 GIF_PRELOAD_MAX_FRAMES = 120
 
@@ -969,6 +969,7 @@ class App:
             "anim_delays": None,
             "anim_index": 0,
             "gif_render_token": 0,
+            "last_visual_size": None,
 
             "vlc_player": None,
             "vlc_media": None,
@@ -1973,6 +1974,10 @@ class App:
         im_small = im.resize((small_w, small_h), Image.Resampling.BOX)
         return im_small.resize((w, h), Image.Resampling.NEAREST)
 
+    def _get_side_display_size(self, side: str, kind: str) -> tuple[int, int]:
+        widget = (self.left_video if side == "a" else self.right_video) if kind == "video" else (self.left_panel if side == "a" else self.right_panel)
+        return (max(1, widget.winfo_width()), max(1, widget.winfo_height()))
+
     def _render_side(self, side: str):
         st = self._side[side]
         row = st["row"]
@@ -2063,6 +2068,7 @@ class App:
             tk_im = ImageTk.PhotoImage(im)
             widget.configure(image=tk_im, text="", bg=DARK_PANEL)
             widget.image = tk_im
+            st["last_visual_size"] = (w, h)
             return
 
         # GIF animation (decode asynchronously to keep the UI responsive)
@@ -2106,6 +2112,7 @@ class App:
                 st2["anim_frames"] = frames
                 st2["anim_delays"] = delays
                 st2["anim_index"] = 0
+                st2["last_visual_size"] = (w, h)
 
                 def step():
                     st3 = self._side[side]
@@ -2156,6 +2163,7 @@ class App:
         # If already playing this path, do nothing (do not reset on refresh)
         if st.get("vlc_player") and st.get("vlc_media") == path:
             self._update_video_blur_overlay(side, video_frame, path)
+            st["last_visual_size"] = self._get_side_display_size(side, "video")
             return
 
         self._stop_video(side)
@@ -2173,6 +2181,7 @@ class App:
         st["vlc_play_pending"] = False
         st["vlc_total_ms"] = None
         st["vlc_event_mgr"] = None
+        st["last_visual_size"] = self._get_side_display_size(side, "video")
 
         try:
             self.root.update_idletasks()
@@ -2249,6 +2258,7 @@ class App:
             st["vlc_event_mgr"] = mgr
         except Exception:
             st["vlc_event_mgr"] = None
+        st["last_visual_size"] = self._get_side_display_size(side, "video")
 
     def _on_video_end(self, side: str):
         st = self._side[side]
@@ -2310,6 +2320,7 @@ class App:
         st["vlc_play_pending"] = False
         st["vlc_total_ms"] = None
         st["vlc_event_mgr"] = None
+        st["last_visual_size"] = self._get_side_display_size(side, "video")
         st["scrubbing"] = False
         st["video_blur_image"] = None
         self._clear_vlc_blur_logo(side)
@@ -3931,17 +3942,27 @@ class App:
 
     # -------------------- refresh visuals only --------------------
     def _refresh_visuals_only(self):
-        # Only rerender still images; avoid touching GIF/video playback state.
+        # Refresh media only when panel size changes.
         for side in ("a", "b"):
             st = self._side[side]
             row = st.get("row")
             if not row:
                 continue
             kind = self._media_kind(row[1])
-            if kind in ("gif", "video"):
-                # keep active GIF/video playback running; avoid reload loops from resize churn
+            current_size = self._get_side_display_size(side, kind)
+            if current_size[0] <= 5 or current_size[1] <= 5:
                 continue
+            if st.get("last_visual_size") == current_size:
+                continue
+
+            if kind == "video":
+                vframe = self.left_video if side == "a" else self.right_video
+                self._update_video_blur_overlay(side, vframe, row[1])
+                st["last_visual_size"] = current_size
+                continue
+
             panel = self.left_panel if side == "a" else self.right_panel
+            self._cancel_animation(side)
             self._render_image_or_gif(side, panel, row[1])
         self._update_carousel()
 
