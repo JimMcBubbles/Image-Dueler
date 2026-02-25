@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-12m
-# Update: Force immediate pool revalidation after per-image tag edits.
-# Build: 2026-02-12m (tag edit reroll consistency)
+# Version: 2026-02-25
+# Update: Added leaderboard metric mode that penalizes folders by mirrored dislikes-tree counts.
+# Build: 2026-02-25 (dislikes tree-aware metric)
 
 import os
 import io
@@ -62,6 +62,7 @@ LINK_COLOR  = "#4ea1ff"
 
 # -------------------- CONFIG --------------------
 ROOT_DIR = r"I:\OneDrive\Discord Downloader Output\+\Grabber"
+DISLIKES_ROOT_DIR = r"G:\-\Grabber"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DB_PATH = SCRIPT_DIR / ".image_ranking.sqlite"
@@ -97,13 +98,16 @@ LEADERBOARD_METRIC_DEFAULT = "shrunken_avg"  # avg | shrunken_avg | lcb
 FOLDER_MIN_N = 1
 FOLDER_PRIOR_IMAGES = 8
 LCB_Z = 1.0
+DISLIKES_PER_FILE_PENALTY = 6.0
 
 E621_MAX_TAGS = 40
 DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
 TAG_OPTIONS = ["SFW", "MEME", "HIDE", "CW"]
 
-BUILD_STAMP = '2026-02-12l (title stamp + tag exclusion filter)'
+BUILD_STAMP = '2026-02-25 (dislikes tree-aware metric)'
+
+_DISLIKE_COUNTS_BY_REL_FOLDER: dict[str, int] = {}
 
 # -------------------- DB --------------------
 def init_db() -> sqlite3.Connection:
@@ -174,6 +178,47 @@ def scan_images(conn: sqlite3.Connection) -> None:
     n = cur.execute("SELECT COUNT(*) FROM images").fetchone()[0]
     print(f"[scan] total images in DB: {n}")
 
+
+def _normalize_rel_folder_key(path_like: str) -> str:
+    text = str(path_like).strip()
+    text = text.replace('\\', '/')
+    text = text.strip('/')
+    return text.lower()
+
+
+def _build_dislikes_index(dislikes_root: Path) -> dict[str, int]:
+    idx: dict[str, int] = {}
+    if not dislikes_root.exists():
+        return idx
+    for p in dislikes_root.rglob('*'):
+        if not p.is_file() or p.suffix.lower() not in SUPPORTED_EXTS:
+            continue
+        try:
+            rel_parent = p.parent.relative_to(dislikes_root)
+            key = _normalize_rel_folder_key(str(rel_parent))
+            idx[key] = idx.get(key, 0) + 1
+        except Exception:
+            continue
+    return idx
+
+
+def _relative_folder_to_root(folder: str, root: str) -> str:
+    try:
+        rel = Path(folder).resolve().relative_to(Path(root).resolve())
+        return _normalize_rel_folder_key(str(rel))
+    except Exception:
+        return _normalize_rel_folder_key(Path(folder).name)
+
+
+def refresh_dislikes_index() -> None:
+    global _DISLIKE_COUNTS_BY_REL_FOLDER
+    dislikes_root = Path(DISLIKES_ROOT_DIR)
+    print('[dislikes] scanning', dislikes_root)
+    _DISLIKE_COUNTS_BY_REL_FOLDER = _build_dislikes_index(dislikes_root)
+    folders = len(_DISLIKE_COUNTS_BY_REL_FOLDER)
+    files = sum(_DISLIKE_COUNTS_BY_REL_FOLDER.values())
+    print(f'[dislikes] indexed {files} files across {folders} mirrored folders')
+
 # -------------------- Elo helpers --------------------
 def elo_expected(sa: float, sb: float) -> float:
     return 1.0 / (1.0 + 10 ** ((sb - sa) / 400.0))
@@ -193,7 +238,7 @@ def folder_leaderboard(conn: sqlite3.Connection, metric: str = LEADERBOARD_METRI
     global_mu = float(mu_row[0] if mu_row and mu_row[0] is not None else BASE_SCORE)
 
     rows: List[dict] = []
-    if metric in ("avg", "shrunken_avg"):
+    if metric in ("avg", "shrunken_avg", "dislikes_adjusted"):
         data = conn.execute("""
             SELECT folder, AVG(score) AS avg_s, COUNT(*) AS n
             FROM images
@@ -204,8 +249,12 @@ def folder_leaderboard(conn: sqlite3.Connection, metric: str = LEADERBOARD_METRI
         for (folder, avg_s, n) in data:
             avg_s = float(avg_s); n = int(n)
             score = ((avg_s * n + global_mu * FOLDER_PRIOR_IMAGES) / (n + FOLDER_PRIOR_IMAGES)
-                     if metric == "shrunken_avg" else avg_s)
-            rows.append({"folder": folder, "avg": avg_s, "n": n, "score": score})
+                     if metric in ("shrunken_avg", "dislikes_adjusted") else avg_s)
+            rel_key = _relative_folder_to_root(folder, ROOT_DIR)
+            dislikes_n = int(_DISLIKE_COUNTS_BY_REL_FOLDER.get(rel_key, 0))
+            if metric == "dislikes_adjusted":
+                score -= dislikes_n * DISLIKES_PER_FILE_PENALTY
+            rows.append({"folder": folder, "avg": avg_s, "n": n, "score": score, "dislikes_n": dislikes_n})
     elif metric == "lcb":
         data = conn.execute("""
             SELECT folder, COUNT(*) AS n, AVG(score) AS avg_s, AVG(score*score) AS avg_sq
@@ -219,7 +268,9 @@ def folder_leaderboard(conn: sqlite3.Connection, metric: str = LEADERBOARD_METRI
             var = max(0.0, avg_sq - avg_s * avg_s)
             se = (var ** 0.5) / (n ** 0.5) if n > 0 else 0.0
             score = avg_s - LCB_Z * se
-            rows.append({"folder": folder, "avg": avg_s, "n": n, "score": score})
+            rel_key = _relative_folder_to_root(folder, ROOT_DIR)
+            dislikes_n = int(_DISLIKE_COUNTS_BY_REL_FOLDER.get(rel_key, 0))
+            rows.append({"folder": folder, "avg": avg_s, "n": n, "score": score, "dislikes_n": dislikes_n})
     else:
         return folder_leaderboard(conn, metric="avg", min_n=min_n)
 
@@ -228,7 +279,8 @@ def folder_leaderboard(conn: sqlite3.Connection, metric: str = LEADERBOARD_METRI
     for i, r in enumerate(rows, start=1):
         out.append({
             "folder": r["folder"], "avg": r["avg"], "n": r["n"],
-            "rank": i, "score": r["score"], "metric": metric
+            "rank": i, "score": r["score"], "metric": metric,
+            "dislikes_n": int(r.get("dislikes_n", 0))
         })
     return out
 
@@ -2898,11 +2950,12 @@ class App:
         return {
             "avg": "Simple Avg",
             "shrunken_avg": f"Shrunken Avg (prior={FOLDER_PRIOR_IMAGES})",
+            "dislikes_adjusted": f"Shrunken Avg - dislikes×{DISLIKES_PER_FILE_PENALTY:g}",
             "lcb": f"Lower Conf. Bound (z={LCB_Z})"
         }.get(self.metric, self.metric)
 
     def toggle_metric(self):
-        order = ["shrunken_avg", "avg", "lcb"]
+        order = ["shrunken_avg", "dislikes_adjusted", "avg", "lcb"]
         i = order.index(self.metric) if self.metric in order else 0
         self.metric = order[(i + 1) % len(order)]
         self._last_ranks = {r["folder"]: r["rank"] for r in folder_leaderboard(self.conn, metric=self.metric)}
@@ -2963,6 +3016,11 @@ class App:
                     ticker, ticker_tag = "•", "delta_flat"
             if self.metric == "avg":
                 line = f"{ticker} {row['rank']:>3}. {leaf:<{LEAF_MAX}} {row['avg']:6.1f}  (n={row['n']}){marker}"
+            elif self.metric == "dislikes_adjusted":
+                line = (
+                    f"{ticker} {row['rank']:>3}. {leaf:<{LEAF_MAX}} {row['score']:6.1f}  "
+                    f"avg={row['avg']:5.1f} d={row.get('dislikes_n', 0)} (n={row['n']}){marker}"
+                )
             elif self.metric == "shrunken_avg":
                 line = f"{ticker} {row['rank']:>3}. {leaf:<{LEAF_MAX}} {row['score']:6.1f}  avg={row['avg']:5.1f} (n={row['n']}){marker}"
             else:
@@ -3721,6 +3779,7 @@ def show_folder_chart(conn: sqlite3.Connection) -> None:
 def run():
     conn = init_db()
     scan_images(conn)
+    refresh_dislikes_index()
     root = tk.Tk()
     app = App(root, conn)
     root.mainloop()
