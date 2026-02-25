@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-25e
-# Update: Lifted metric-formula tooltips above dropdown menu using top-level overlay window.
-# Build: 2026-02-25e (tooltip z-order fix)
+# Version: 2026-02-25f
+# Update: Unified pool dropdown styling, added carousel close gestures, tag-aware pairing, and dislikes-adjusted metric default.
+# Build: 2026-02-25f (ui+pairing+metric)
 
 import os
 import io
@@ -94,7 +94,7 @@ DOWNVOTE_PENALTY = 12.0
 LEADERBOARD_SIZE = 30
 LEAF_MAX = 24
 
-LEADERBOARD_METRIC_DEFAULT = "shrunken_avg"  # avg | shrunken_avg | lcb
+LEADERBOARD_METRIC_DEFAULT = "dislikes_adjusted"  # avg | shrunken_avg | dislikes_adjusted | lcb
 FOLDER_MIN_N = 1
 FOLDER_PRIOR_IMAGES = 8
 LCB_Z = 1.0
@@ -104,8 +104,9 @@ E621_MAX_TAGS = 40
 DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
 TAG_OPTIONS = ["SFW", "MEME", "HIDE", "CW"]
+POOL_FILTER_OPTIONS = ["All", "Images", "GIFs", "Videos", "Videos (audio)", "Animated", "Hidden"]
 
-BUILD_STAMP = '2026-02-25e (tooltip z-order fix)'
+BUILD_STAMP = '2026-02-25f (ui+pairing+metric)'
 
 _DISLIKE_COUNTS_BY_REL_FOLDER: dict[str, int] = {}
 
@@ -447,6 +448,7 @@ class App:
         self.carousel_max_height = 320
         self._carousel_drag_start = None
         self._carousel_dragging = False
+        self._carousel_drag_start_height = None
 
         # video state per side
         self.vlc_instance = None
@@ -572,15 +574,30 @@ class App:
         self.pool_filter_row = tk.Frame(self.sidebar, bg=DARK_BG)
         tk.Label(self.pool_filter_row, text="Pool:", font=("Segoe UI", 10, "bold"),
                  fg=ACCENT, bg=DARK_BG).pack(side="left")
-        self.pool_filter = ttk.Combobox(
+        self.pool_filter = tk.Menubutton(
             self.pool_filter_row,
-            textvariable=self.pool_filter_var,
-            values=["All", "Images", "GIFs", "Videos", "Videos (audio)", "Animated", "Hidden"],
-            state="readonly",
+            text=self.pool_filter_var.get(),
+            font=("Segoe UI", 9),
+            fg=INFO_BAR_FG,
+            bg=INFO_BAR_BG,
+            activebackground=INFO_BAR_BG,
+            activeforeground=INFO_BAR_FG,
+            relief="flat",
+            cursor="hand2",
+            anchor="w",
             width=12,
         )
+        self.pool_filter_menu = tk.Menu(self.pool_filter, tearoff=0)
+        for pool_value in POOL_FILTER_OPTIONS:
+            self.pool_filter_menu.add_radiobutton(
+                label=pool_value,
+                variable=self.pool_filter_var,
+                value=pool_value,
+                command=self.on_pool_filter_change,
+            )
+        self.pool_filter.configure(menu=self.pool_filter_menu)
         self.pool_filter.pack(side="right")
-        self.pool_filter.bind("<<ComboboxSelected>>", lambda e: self.on_pool_filter_change())
+        self.pool_filter.configure(text=self.pool_filter_var.get())
 
         self.tag_filter_vars: dict = {}
         self.tag_filter_btn = tk.Menubutton(
@@ -767,6 +784,7 @@ class App:
             bg=DARK_BG,
         )
         self.carousel_toggle_label.pack(side="left")
+        self.carousel_toggle_label.bind("<Button-1>", self._on_carousel_toggle_click)
         self.carousel_info = tk.Label(
             self.carousel_toggle_bar,
             text="History: 0",
@@ -785,6 +803,9 @@ class App:
         self.carousel_handle_bar.bind("<ButtonPress-1>", self._on_carousel_drag_start)
         self.carousel_handle_bar.bind("<B1-Motion>", self._on_carousel_drag)
         self.carousel_handle_bar.bind("<ButtonRelease-1>", self._on_carousel_release)
+        self.carousel_toggle_bar.bind("<ButtonPress-1>", self._on_carousel_drag_start, add="+")
+        self.carousel_toggle_bar.bind("<B1-Motion>", self._on_carousel_drag, add="+")
+        self.carousel_toggle_bar.bind("<ButtonRelease-1>", self._on_carousel_release, add="+")
         self.carousel_handle_bar.configure(cursor="sb_v_double_arrow")
 
         self.carousel_panel = tk.Frame(self.carousel_frame, bg=DARK_BG, height=self.carousel_height)
@@ -964,6 +985,9 @@ class App:
     def _toggle_carousel(self) -> None:
         self.carousel_visible = not self.carousel_visible
         if self.carousel_visible:
+            if self.carousel_height < self.carousel_min_height:
+                self.carousel_height = self.carousel_default_height
+            self.carousel_panel.configure(height=self.carousel_height)
             self.carousel_panel.pack(side="bottom", fill="x", padx=6, pady=(0, 6))
         else:
             self.carousel_panel.pack_forget()
@@ -978,10 +1002,14 @@ class App:
             self.carousel_panel.pack(side="bottom", fill="x", padx=6, pady=(0, 6))
         self._update_carousel()
 
+    def _on_carousel_toggle_click(self, _event=None) -> None:
+        self._toggle_carousel()
+
     def _on_carousel_drag_start(self, event) -> None:
         if not self.carousel_visible:
             self._show_carousel(self.carousel_default_height)
         self._carousel_drag_start = event.y_root
+        self._carousel_drag_start_height = self.carousel_height
         self._carousel_dragging = False
 
     def _on_carousel_drag(self, event) -> None:
@@ -989,23 +1017,38 @@ class App:
             return
         if not self.carousel_visible:
             self._show_carousel(self.carousel_default_height)
-        root_y = self.root.winfo_rooty()
-        root_h = self.root.winfo_height()
-        new_height = int((root_y + root_h) - event.y_root - 6)
-        new_height = max(self.carousel_min_height, min(self.carousel_max_height, new_height))
+        delta = event.y_root - self._carousel_drag_start
+        base = self._carousel_drag_start_height or self.carousel_height
+        new_height = int(base - delta)
+        new_height = max(0, min(self.carousel_max_height, new_height))
         if new_height != self.carousel_height:
             self.carousel_height = new_height
+            if self.carousel_height <= 0:
+                self._toggle_carousel()
+                self._carousel_drag_start = None
+                self._carousel_drag_start_height = None
+                self._carousel_dragging = False
+                return
             self.carousel_panel.configure(height=self.carousel_height)
             self._update_carousel()
-        self._carousel_drag_start = event.y_root
         self._carousel_dragging = True
 
     def _on_carousel_release(self, event) -> None:
         if self._carousel_drag_start is None:
             return
-        if not self._carousel_dragging:
-            self._show_carousel(self.carousel_default_height)
+        delta = event.y_root - self._carousel_drag_start
+        if self._carousel_dragging:
+            if delta > 60:
+                self._toggle_carousel()
+            elif self.carousel_height < self.carousel_min_height:
+                self.carousel_height = self.carousel_min_height
+                if self.carousel_visible:
+                    self.carousel_panel.configure(height=self.carousel_height)
+                    self._update_carousel()
+        else:
+            self._toggle_carousel()
         self._carousel_drag_start = None
+        self._carousel_drag_start_height = None
         self._carousel_dragging = False
 
     def _update_carousel_layout(self, slot_count: int) -> None:
@@ -1658,6 +1701,7 @@ class App:
         return rows
 
     def on_pool_filter_change(self):
+        self.pool_filter.configure(text=self.pool_filter_var.get())
         # if current images are not in the new pool, replace them
         if not self.current:
             self.load_duel()
@@ -1680,6 +1724,7 @@ class App:
                 exclude_id=b[0],
                 pool=pool,
                 required_kind=self._media_kind(b[1]),
+                preferred_tags=set(self._tags_for_row(b)),
             )
             if na:
                 a = na
@@ -1689,6 +1734,7 @@ class App:
                 exclude_id=a[0],
                 pool=pool,
                 required_kind=self._media_kind(a[1]),
+                preferred_tags=set(self._tags_for_row(a)),
             )
             if nb:
                 b = nb
@@ -1710,6 +1756,7 @@ class App:
         exclude_id: Optional[int],
         pool: List[tuple],
         required_kind: Optional[str] = None,
+        preferred_tags: Optional[set] = None,
     ) -> Optional[tuple]:
         if not pool:
             return None
@@ -1720,6 +1767,10 @@ class App:
             candidates = [r for r in candidates if r[0] != exclude_id]
         if not candidates:
             return None
+        if preferred_tags:
+            tag_matched = [r for r in candidates if preferred_tags.issubset(set(self._tags_for_row(r)))]
+            if tag_matched:
+                candidates = tag_matched
         return random.choice(candidates)
 
     def pick_two(self) -> Tuple[Optional[tuple], Optional[tuple]]:
@@ -1739,7 +1790,7 @@ class App:
         if not a:
             return None, None
         required_kind = self._media_kind(a[1])
-        b = self.pick_one(exclude_id=a[0], pool=pool, required_kind=required_kind)
+        b = self.pick_one(exclude_id=a[0], pool=pool, required_kind=required_kind, preferred_tags=set(self._tags_for_row(a)))
         return a, b
 
     # -------------------- duel flow --------------------
@@ -1808,6 +1859,7 @@ class App:
             exclude_id=other[0],
             pool=pool,
             required_kind=self._media_kind(other[1]),
+            preferred_tags=set(self._tags_for_row(other)),
         )
         if not replacement:
             self.load_duel()
