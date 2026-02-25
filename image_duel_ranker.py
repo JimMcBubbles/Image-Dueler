@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-25
-# Update: Added leaderboard metric mode that penalizes folders by mirrored dislikes-tree counts.
-# Build: 2026-02-25 (dislikes tree-aware metric)
+# Version: 2026-02-25b
+# Update: Replaced static metric readout with a metric selector dropdown in the sidebar.
+# Build: 2026-02-25b (metric selector dropdown)
 
 import os
 import io
@@ -105,7 +105,7 @@ DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
 TAG_OPTIONS = ["SFW", "MEME", "HIDE", "CW"]
 
-BUILD_STAMP = '2026-02-25 (dislikes tree-aware metric)'
+BUILD_STAMP = '2026-02-25b (metric selector dropdown)'
 
 _DISLIKE_COUNTS_BY_REL_FOLDER: dict[str, int] = {}
 
@@ -432,6 +432,7 @@ class App:
         self.prev_artists = deque(maxlen=6)
         self.page = 0
         self.metric = LEADERBOARD_METRIC_DEFAULT
+        self.metric_var = tk.StringVar(value=self.metric)
         self._last_ranks = {r["folder"]: r["rank"] for r in folder_leaderboard(self.conn, metric=self.metric)}
         self._resize_job = None
         self._audio_cache = {}
@@ -622,7 +623,30 @@ class App:
         # ---- Leaderboard ----
         self.leader_header = tk.Label(self.sidebar, text="Top Artists",
                                       font=("Segoe UI", 12, "bold"), fg=ACCENT, bg=DARK_BG)
-        self.metric_label = tk.Label(self.sidebar, text="", font=("Segoe UI", 9), fg=TEXT_COLOR, bg=DARK_BG)
+        self.metric_row = tk.Frame(self.sidebar, bg=DARK_BG)
+        self.metric_btn = tk.Menubutton(
+            self.metric_row,
+            text="Metric: (loading)",
+            font=("Segoe UI", 9),
+            fg=INFO_BAR_FG,
+            bg=INFO_BAR_BG,
+            activebackground=INFO_BAR_BG,
+            activeforeground=INFO_BAR_FG,
+            relief="flat",
+            cursor="hand2",
+            anchor="w",
+        )
+        self.metric_btn.pack(side="left", fill="x", expand=True)
+        self.metric_menu = tk.Menu(self.metric_btn, tearoff=0)
+        for metric_key in ("shrunken_avg", "dislikes_adjusted", "avg", "lcb"):
+            self.metric_menu.add_radiobutton(
+                label=self._metric_human(metric_key),
+                variable=self.metric_var,
+                value=metric_key,
+                command=self.on_metric_change,
+            )
+        self.metric_btn.configure(menu=self.metric_menu)
+        self.metric_btn.configure(text=f"Metric: {self._metric_human(self.metric)}")
         self.page_label = tk.Label(self.sidebar, text="", font=("Segoe UI", 9), fg=TEXT_COLOR, bg=DARK_BG)
 
         self.board = tk.Text(self.sidebar, height=20, font=("Consolas", 10),
@@ -686,7 +710,7 @@ class App:
 
         # Layout (sidebar)
         self.leader_header.pack(anchor="w")
-        self.metric_label.pack(anchor="w")
+        self.metric_row.pack(fill="x", pady=(2, 0))
         self.page_label.pack(anchor="e", pady=(0, 4))
         self.board.pack(fill="x", pady=(4, 6))
         self.nav_row.pack(fill="x", pady=(0, 6))
@@ -2946,21 +2970,32 @@ class App:
         target = int(frac * total)
         self._show_wave_tooltip(event.x_root, event.y_root, self._format_mmss(target))
 
-    def _metric_human(self) -> str:
+    def _metric_human(self, metric_key: Optional[str] = None) -> str:
+        key = metric_key or self.metric
         return {
             "avg": "Simple Avg",
             "shrunken_avg": f"Shrunken Avg (prior={FOLDER_PRIOR_IMAGES})",
             "dislikes_adjusted": f"Shrunken Avg - dislikes×{DISLIKES_PER_FILE_PENALTY:g}",
             "lcb": f"Lower Conf. Bound (z={LCB_Z})"
-        }.get(self.metric, self.metric)
+        }.get(key, key)
+
+    def _set_metric(self, metric_key: str) -> None:
+        if metric_key not in {"shrunken_avg", "dislikes_adjusted", "avg", "lcb"}:
+            metric_key = "shrunken_avg"
+        self.metric = metric_key
+        self.metric_var.set(metric_key)
+        self.metric_btn.configure(text=f"Metric: {self._metric_human(metric_key)}")
+        self._last_ranks = {r["folder"]: r["rank"] for r in folder_leaderboard(self.conn, metric=self.metric)}
+        self.page = 0
+        self.update_sidebar()
+
+    def on_metric_change(self) -> None:
+        self._set_metric(self.metric_var.get())
 
     def toggle_metric(self):
         order = ["shrunken_avg", "dislikes_adjusted", "avg", "lcb"]
         i = order.index(self.metric) if self.metric in order else 0
-        self.metric = order[(i + 1) % len(order)]
-        self._last_ranks = {r["folder"]: r["rank"] for r in folder_leaderboard(self.conn, metric=self.metric)}
-        self.page = 0
-        self.update_sidebar()
+        self._set_metric(order[(i + 1) % len(order)])
 
     def change_page(self, delta: int):
         leader = folder_leaderboard(self.conn, metric=self.metric)
@@ -2991,7 +3026,7 @@ class App:
         start = self.page * LEADERBOARD_SIZE
         end = min(start + LEADERBOARD_SIZE, total)
 
-        self.metric_label.configure(text=f"[Metric: {self._metric_human()}]")
+        self.metric_btn.configure(text=f"Metric: {self._metric_human(self.metric)}")
         self.page_label.configure(text=f"Page {self.page+1}/{total_pages}  (total {total})")
 
         # Leaderboard lines
