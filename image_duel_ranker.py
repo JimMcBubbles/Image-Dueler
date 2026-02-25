@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-25l
-# Update: Blur toggles now force a visual refresh so same-size GIF/image panels immediately redraw with the new blur state.
-# Build: 2026-02-25l (blur-force-refresh)
+# Version: 2026-02-25m
+# Update: Blur is now forced while the app window is unfocused and automatically restored on refocus.
+# Build: 2026-02-25m (focus-force-blur)
 
 import os
 import io
@@ -106,7 +106,7 @@ DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 TAG_OPTIONS = ["SFW", "MEME", "HIDE", "CW"]
 POOL_FILTER_OPTIONS = ["All", "Images", "GIFs", "Videos", "Videos (audio)", "Animated", "Hidden"]
 
-BUILD_STAMP = '2026-02-25l (blur-force-refresh)'
+BUILD_STAMP = '2026-02-25m (focus-force-blur)'
 
 GIF_PRELOAD_MAX_FRAMES = 120
 
@@ -634,6 +634,7 @@ class App:
                                             bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat", width=7)
         self.sidebar_toggle_btn.pack(side="right", padx=(0, 6))
         self.blur_enabled = False
+        self._blur_forced_by_focus = False
         self.blur_toggle_btn = tk.Button(self.pool_filter_row, text="Blur",
                                          command=self.toggle_blur,
                                          bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat", width=7)
@@ -911,6 +912,8 @@ class App:
         root.bind("q", lambda e: self.quit())
 
         root.bind("<Configure>", self._on_configure)
+        root.bind("<FocusOut>", self._on_window_focus_out, add="+")
+        root.bind("<FocusIn>", self._on_window_focus_in, add="+")
 
         # Start periodic UI tick (scrub/time updates)
         self._tick_job = None
@@ -3553,8 +3556,10 @@ class App:
         st["video_blur_image"] = tk_im
         self._set_video_blur_visible(side, True)
 
-    def toggle_blur(self):
-        self.blur_enabled = not getattr(self, "blur_enabled", False)
+    def _set_blur_enabled(self, enabled: bool) -> None:
+        if self.blur_enabled == enabled:
+            return
+        self.blur_enabled = enabled
         self._update_blur_toggle_style()
 
         for entry in self.duel_history:
@@ -3575,6 +3580,20 @@ class App:
 
         # Defer media redraw one tick to avoid transient empty frames.
         self.root.after_idle(lambda: self._refresh_visuals_only(force=True))
+
+    def toggle_blur(self):
+        self._blur_forced_by_focus = False
+        self._set_blur_enabled(not getattr(self, "blur_enabled", False))
+
+    def _on_window_focus_out(self, _event=None):
+        if not self.blur_enabled:
+            self._blur_forced_by_focus = True
+            self._set_blur_enabled(True)
+
+    def _on_window_focus_in(self, _event=None):
+        if self._blur_forced_by_focus:
+            self._blur_forced_by_focus = False
+            self._set_blur_enabled(False)
 
     def toggle_sidebar(self):
         """Toggle the right sidebar (focus mode)."""
