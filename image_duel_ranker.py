@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-25k
-# Update: Refresh media only when panel size changes so GIFs resize correctly without repeated reload loops.
-# Build: 2026-02-25k (size-change-media-refresh)
+# Version: 2026-02-25l
+# Update: Blur toggles now force a visual refresh so same-size GIF/image panels immediately redraw with the new blur state.
+# Build: 2026-02-25l (blur-force-refresh)
 
 import os
 import io
@@ -106,7 +106,7 @@ DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 TAG_OPTIONS = ["SFW", "MEME", "HIDE", "CW"]
 POOL_FILTER_OPTIONS = ["All", "Images", "GIFs", "Videos", "Videos (audio)", "Animated", "Hidden"]
 
-BUILD_STAMP = '2026-02-25k (size-change-media-refresh)'
+BUILD_STAMP = '2026-02-25l (blur-force-refresh)'
 
 GIF_PRELOAD_MAX_FRAMES = 120
 
@@ -3573,8 +3573,8 @@ class App:
                 vframe = self.left_video if side == "a" else self.right_video
                 self._update_video_blur_overlay(side, vframe, row[1])
 
-        # Defer still-image re-render one tick to avoid transient empty frames.
-        self.root.after_idle(self._refresh_visuals_only)
+        # Defer media redraw one tick to avoid transient empty frames.
+        self.root.after_idle(lambda: self._refresh_visuals_only(force=True))
 
     def toggle_sidebar(self):
         """Toggle the right sidebar (focus mode)."""
@@ -3941,8 +3941,8 @@ class App:
         messagebox.showinfo("DB stats", msg)
 
     # -------------------- refresh visuals only --------------------
-    def _refresh_visuals_only(self):
-        # Refresh media only when panel size changes.
+    def _refresh_visuals_only(self, force: bool = False):
+        # Refresh media when panel size changes (or force=True).
         for side in ("a", "b"):
             st = self._side[side]
             row = st.get("row")
@@ -3952,7 +3952,7 @@ class App:
             current_size = self._get_side_display_size(side, kind)
             if current_size[0] <= 5 or current_size[1] <= 5:
                 continue
-            if st.get("last_visual_size") == current_size:
+            if (not force) and st.get("last_visual_size") == current_size:
                 continue
 
             if kind == "video":
