@@ -1,8 +1,8 @@
 # image_duel_ranker.py
 # Image Duel Ranker — Elo-style dueling with artist leaderboard, e621 link export, and in-app VLC video playback.
-# Version: 2026-02-25m
-# Update: Blur is now forced while the app window is unfocused and automatically restored on refocus.
-# Build: 2026-02-25m (focus-force-blur)
+# Version: 2026-02-26a
+# Update: Updating side tags now rerolls that side to a replacement matched against the other side's tags.
+# Build: 2026-02-26a (tag-update-reroll)
 
 import os
 import io
@@ -106,7 +106,7 @@ DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 TAG_OPTIONS = ["SFW", "MEME", "HIDE", "CW"]
 POOL_FILTER_OPTIONS = ["All", "Images", "GIFs", "Videos", "Videos (audio)", "Animated", "Hidden"]
 
-BUILD_STAMP = '2026-02-25m (focus-force-blur)'
+BUILD_STAMP = '2026-02-26a (tag-update-reroll)'
 
 GIF_PRELOAD_MAX_FRAMES = 120
 
@@ -1528,6 +1528,14 @@ class App:
         updated = self._fetch_row(row[0])
         if updated:
             self._side[side]["row"] = updated
+
+        # In live duel mode, changing this side's tags should immediately reroll that side
+        # so the replacement is re-matched to the opposing side's tag profile.
+        if self.history_index is None and self.current:
+            current_row = self.current[0] if side == "a" else self.current[1]
+            if current_row and current_row[0] == row[0]:
+                self._replace_side_keep_other(side)
+                return
 
         # Revalidate both sides against active pool/tag filters immediately.
         self.on_pool_filter_change()
