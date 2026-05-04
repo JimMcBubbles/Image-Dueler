@@ -11,7 +11,7 @@
 |------|-------|
 | `BASE_SCORE` | 1000.0 |
 | `DOWNVOTE_PENALTY` | 12.0 |
-| `TAG_OPTIONS` | `["SFW","MEME","HIDE","CW"]` |
+| `TAG_OPTIONS` | `["SFW","MEME","HIDE","CW"]` — mutable list; custom tags appended at runtime |
 | `carousel_size` | 6 slots |
 | `ACCENT` / `PENDING_COLOR` / `FUTURE_COLOR` | blue / amber / dark-teal |
 
@@ -53,6 +53,8 @@ self.future_queue     # List[{"a":row,"b":row,"thumb":None}] — pre-rolled upco
 | `_enter_history_mode` | 1214 | Save live_current, set history_index, show entry |
 | `_exit_history_mode` | 1220 | Restore live_current display, clear history_index |
 | `_update_carousel` | 1462 | Full carousel repaint — live/edit/future branches |
+| `_rebuild_all_tag_menus` | 1625 | Re-sync tag_vars/labels after TAG_OPTIONS changes; rebuilds filter tk.Menu |
+| `_show_custom_tag_menu` | 1648 | Custom overrideredirect popup mimicking tk.Menu; handles toggle + inline edit mode with text field, pending removes/adds, Save, click-outside save prompt |
 | `_fill_future_queue` | 2006 | Top up future_queue to target size via pick_two |
 | `_jump_to_future` | 2029 | Skip live+futures[0..i-1], make future[i] the new live duel |
 | `pick_two` | 2079 | Groups pool by (frozenset(tags), media_kind); picks two from same group |

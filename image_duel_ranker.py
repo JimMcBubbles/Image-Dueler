@@ -1593,7 +1593,7 @@ class App:
             self.carousel_next_btn.configure(state="normal")
 
     def _build_tag_menu(self, side: str, parent: tk.Frame) -> None:
-        button = tk.Menubutton(
+        button = tk.Button(
             parent,
             text="Tags: (none)",
             font=("Segoe UI", 9),
@@ -1603,21 +1603,302 @@ class App:
             activeforeground=INFO_BAR_FG,
             relief="flat",
             cursor="hand2",
+            command=lambda s=side: self._show_custom_tag_menu(s),
         )
         button.grid(row=0, column=2, sticky="e", padx=8, pady=2)
-        menu = tk.Menu(button, tearoff=0)
         tag_vars: dict = {}
         for tag in TAG_OPTIONS:
-            var = tk.BooleanVar(value=False)
-            tag_vars[tag] = var
-            menu.add_checkbutton(
-                label=tag,
-                variable=var,
-                command=lambda s=side: self._on_tag_change(s),
-            )
-        button.configure(menu=menu)
+            tag_vars[tag] = tk.BooleanVar(value=False)
         self._side[side]["tag_vars"] = tag_vars
         self._side[side]["tag_button"] = button
+
+    def _rebuild_all_tag_menus(self) -> None:
+        for side in ("a", "b"):
+            old_vars = self._side[side].get("tag_vars", {})
+            new_vars: dict = {}
+            for tag in TAG_OPTIONS:
+                new_vars[tag] = old_vars.get(tag, tk.BooleanVar(value=False))
+            self._side[side]["tag_vars"] = new_vars
+            row = self._side[side].get("row")
+            if row:
+                tags = self._tags_for_row(row)
+                for tag, var in new_vars.items():
+                    var.set(tag in tags)
+                self._side[side]["tags"] = [t for t in tags if t in TAG_OPTIONS]
+            self._set_tag_button_label(side)
+        new_filter_menu = tk.Menu(self.tag_filter_btn, tearoff=0)
+        new_filter_vars: dict = {}
+        for tag in TAG_OPTIONS:
+            var = self.tag_filter_vars.get(tag) or tk.BooleanVar(value=False)
+            new_filter_vars[tag] = var
+            new_filter_menu.add_checkbutton(
+                label=tag,
+                variable=var,
+                command=self.on_tag_filter_change,
+            )
+        self.tag_filter_vars = new_filter_vars
+        self.tag_filter_menu = new_filter_menu
+        self.tag_filter_btn.configure(menu=new_filter_menu)
+        self._update_tag_filter_button_label()
+
+    def _show_custom_tag_menu(self, side: str) -> None:
+        PROTECTED = {"HIDE", "SFW"}
+        MENU_BG    = "#1c1c1e"
+        MENU_HOVER = "#094771"
+        MENU_SEP   = "#3c3c3c"
+        MENU_FG    = "#d4d4d4"
+        MENU_FG_DIM = "#666666"
+
+        tag_vars = self._side[side]["tag_vars"]
+        edit_mode = [False]
+        pending_removes: set = set()
+        pending_adds: list = []
+        entry_ref = [None]   # holds the live Entry widget so _has_changes can read it
+
+        trigger_btn = self._side[side].get("tag_button")
+        if trigger_btn:
+            bx = trigger_btn.winfo_rootx()
+            by = trigger_btn.winfo_rooty() + trigger_btn.winfo_height()
+        else:
+            bx = self.root.winfo_pointerx()
+            by = self.root.winfo_pointery()
+
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.configure(bg=MENU_SEP)
+
+        content = tk.Frame(win, bg=MENU_BG)
+        content.pack(fill="both", expand=True, padx=1, pady=1)
+
+        def _hover(row, widgets, on):
+            bg = MENU_HOVER if on else MENU_BG
+            row.configure(bg=bg)
+            for w in widgets:
+                try:
+                    w.configure(bg=bg)
+                except tk.TclError:
+                    pass
+
+        def _bind_hover(row, widgets):
+            wlist = widgets[:]
+            row.bind("<Enter>", lambda e: _hover(row, wlist, True))
+            row.bind("<Leave>", lambda e: _hover(row, wlist, False))
+            for w in wlist:
+                w.bind("<Enter>", lambda e: _hover(row, wlist, True))
+                w.bind("<Leave>", lambda e: _hover(row, wlist, False))
+
+        def rebuild():
+            entry_ref[0] = None
+            for w in content.winfo_children():
+                w.destroy()
+
+            # ── tag rows ──────────────────────────────────────────────
+            for tag in list(TAG_OPTIONS) + [t for t in pending_adds if t not in TAG_OPTIONS]:
+                is_new      = tag in pending_adds
+                is_existing = tag in TAG_OPTIONS
+                protected   = is_existing and tag in PROTECTED
+                marked      = is_existing and tag in pending_removes
+
+                row = tk.Frame(content, bg=MENU_BG)
+                row.pack(fill="x")
+
+                # checkmark column
+                if is_existing:
+                    var = tag_vars.get(tag)
+                    ck = tk.Label(row, text="✓" if (var and var.get()) else " ",
+                                  width=2, bg=MENU_BG,
+                                  fg=MENU_FG if not marked else MENU_FG_DIM,
+                                  font=("Segoe UI", 9), anchor="center")
+                else:
+                    ck = tk.Label(row, text=" ", width=2, bg=MENU_BG,
+                                  font=("Segoe UI", 9), anchor="center")
+                ck.pack(side="left", padx=(2, 0))
+
+                if marked:
+                    fg, fnt = MENU_FG_DIM, ("Segoe UI", 9, "overstrike")
+                elif protected or (is_existing and not is_new):
+                    fg, fnt = (MENU_FG_DIM if protected else MENU_FG), ("Segoe UI", 9)
+                else:
+                    fg, fnt = "#4aaa88", ("Segoe UI", 9)
+
+                lbl = tk.Label(row, text=tag, bg=MENU_BG, fg=fg, font=fnt,
+                               anchor="w", padx=4, pady=3)
+                lbl.pack(side="left", fill="x", expand=True)
+                row_ws = [ck, lbl]
+
+                if not edit_mode[0]:
+                    if is_existing and not protected:
+                        def _toggle(e=None, t=tag):
+                            v = tag_vars.get(t)
+                            if v:
+                                v.set(not v.get())
+                            self._on_tag_change(side)
+                            win.destroy()
+                        for w in [row, ck, lbl]:
+                            w.bind("<Button-1>", _toggle)
+                        _bind_hover(row, [ck, lbl])
+                else:
+                    if protected:
+                        pl = tk.Label(row, text="protected", bg=MENU_BG, fg=MENU_FG_DIM,
+                                      font=("Segoe UI", 7), padx=6)
+                        pl.pack(side="right")
+                        row_ws.append(pl)
+                    elif is_existing and not marked:
+                        xl = tk.Label(row, text="×", bg=MENU_BG, fg="#cc4444",
+                                      font=("Segoe UI", 11, "bold"), cursor="hand2", padx=8)
+                        xl.pack(side="right")
+                        row_ws.append(xl)
+                        xl.bind("<Button-1>", lambda e, t=tag: (pending_removes.add(t), rebuild()))
+                    elif is_existing and marked:
+                        ul = tk.Label(row, text="undo", bg=MENU_BG, fg="#888",
+                                      font=("Segoe UI", 7), cursor="hand2", padx=6)
+                        ul.pack(side="right")
+                        row_ws.append(ul)
+                        ul.bind("<Button-1>", lambda e, t=tag: (pending_removes.discard(t), rebuild()))
+                    elif is_new:
+                        xl = tk.Label(row, text="×", bg=MENU_BG, fg="#cc4444",
+                                      font=("Segoe UI", 11, "bold"), cursor="hand2", padx=8)
+                        xl.pack(side="right")
+                        row_ws.append(xl)
+                        def _rm(e=None, t=tag):
+                            if t in pending_adds:
+                                pending_adds.remove(t)
+                            rebuild()
+                        xl.bind("<Button-1>", _rm)
+                    _bind_hover(row, row_ws)
+
+            # ── separator ─────────────────────────────────────────────
+            tk.Frame(content, bg=MENU_SEP, height=1).pack(fill="x", pady=1)
+
+            if edit_mode[0]:
+                # text entry for adding a new tag
+                entry = tk.Entry(content, font=("Segoe UI", 9),
+                                 bg="#252526", fg=MENU_FG_DIM,
+                                 insertbackground=MENU_FG, relief="flat", bd=0,
+                                 highlightthickness=1,
+                                 highlightbackground=MENU_SEP,
+                                 highlightcolor=ACCENT)
+                entry.insert(0, "Add Tag")
+                entry.pack(fill="x", padx=6, pady=3, ipady=2)
+                entry_ref[0] = entry
+
+                def _fin(e):
+                    if entry.get() == "Add Tag":
+                        entry.delete(0, "end")
+                        entry.configure(fg=MENU_FG)
+                def _fout(e):
+                    if not entry.get():
+                        entry.insert(0, "Add Tag")
+                        entry.configure(fg=MENU_FG_DIM)
+                def _add(e=None):
+                    name = entry.get().strip().upper()
+                    if not name or name == "ADD TAG":
+                        return
+                    if name in TAG_OPTIONS or name in pending_adds:
+                        return
+                    if not all(c.isalnum() or c == "_" for c in name):
+                        return
+                    pending_adds.append(name)
+                    rebuild()
+                    if entry_ref[0]:
+                        entry_ref[0].focus_set()
+                entry.bind("<FocusIn>", _fin)
+                entry.bind("<FocusOut>", _fout)
+                entry.bind("<Return>", _add)
+
+                tk.Frame(content, bg=MENU_SEP, height=1).pack(fill="x", pady=1)
+
+                save_row = tk.Frame(content, bg=MENU_BG)
+                save_row.pack(fill="x")
+                save_lbl = tk.Label(save_row, text="Save", bg=MENU_BG, fg=MENU_FG,
+                                    font=("Segoe UI", 9), anchor="w", padx=8, pady=3)
+                save_lbl.pack(side="left", fill="x", expand=True)
+                _bind_hover(save_row, [save_lbl])
+                for w in [save_row, save_lbl]:
+                    w.bind("<Button-1>", lambda e: (_apply(), win.destroy()))
+            else:
+                edit_row = tk.Frame(content, bg=MENU_BG)
+                edit_row.pack(fill="x")
+                edit_lbl = tk.Label(edit_row, text="Edit tags…", bg=MENU_BG, fg=MENU_FG,
+                                    font=("Segoe UI", 9), anchor="w", padx=8, pady=3)
+                edit_lbl.pack(side="left", fill="x", expand=True)
+                _bind_hover(edit_row, [edit_lbl])
+                def _open_edit(e=None):
+                    edit_mode[0] = True
+                    rebuild()
+                    if entry_ref[0]:
+                        entry_ref[0].focus_set()
+                for w in [edit_row, edit_lbl]:
+                    w.bind("<Button-1>", _open_edit)
+
+            # ── reposition after content changes ───────────────────────
+            win.update_idletasks()
+            rw = win.winfo_reqwidth()
+            rh = win.winfo_reqheight()
+            sw = win.winfo_screenwidth()
+            sh = win.winfo_screenheight()
+            win.geometry(f"{rw}x{rh}+{min(bx, sw-rw-4)}+{min(by, sh-rh-4)}")
+
+        def _apply():
+            if pending_removes:
+                rows = list(self.conn.execute(
+                    "SELECT id, tags FROM images WHERE tags IS NOT NULL AND tags != ''"
+                ))
+                updates = []
+                for img_id, raw_tags in rows:
+                    tags = set(self._parse_tags(raw_tags))
+                    new_tags = tags - pending_removes
+                    if new_tags != tags:
+                        ordered = [t for t in TAG_OPTIONS if t in new_tags and t not in pending_removes]
+                        updates.append((json.dumps(ordered, ensure_ascii=False), img_id))
+                if updates:
+                    self.conn.executemany("UPDATE images SET tags=? WHERE id=?", updates)
+                    self.conn.commit()
+                for tag in list(pending_removes):
+                    if tag in TAG_OPTIONS:
+                        TAG_OPTIONS.remove(tag)
+                for s in ("a", "b"):
+                    old_row = self._side[s].get("row")
+                    if old_row:
+                        fresh = self._fetch_row(old_row[0])
+                        if fresh:
+                            self._side[s]["row"] = fresh
+            for tag in pending_adds:
+                if tag not in TAG_OPTIONS:
+                    TAG_OPTIONS.append(tag)
+            self._rebuild_all_tag_menus()
+
+        def _has_changes():
+            typed = ""
+            try:
+                if entry_ref[0]:
+                    typed = entry_ref[0].get().strip()
+            except tk.TclError:
+                pass
+            return bool(pending_removes or pending_adds or (typed and typed not in ("", "Add Tag")))
+
+        def _maybe_dismiss(e):
+            try:
+                wx, wy = win.winfo_rootx(), win.winfo_rooty()
+                ww, wh = win.winfo_width(), win.winfo_height()
+                if not (wx <= e.x_root <= wx + ww and wy <= e.y_root <= wy + wh):
+                    if edit_mode[0] and _has_changes():
+                        result = messagebox.askyesnocancel(
+                            "Save Changes", "Save tag changes?", parent=win)
+                        if result is True:
+                            _apply()
+                            win.destroy()
+                        elif result is False:
+                            win.destroy()
+                    else:
+                        win.destroy()
+            except tk.TclError:
+                pass
+
+        rebuild()
+        win.lift()
+        bind_id = self.root.bind("<Button-1>", _maybe_dismiss, add="+")
+        win.bind("<Destroy>", lambda e: self.root.unbind("<Button-1>", bind_id))
 
     def _build_action_buttons(self, side: str, parent: tk.Frame) -> None:
         actions = tk.Frame(parent, bg=INFO_BAR_BG)
@@ -2155,7 +2436,11 @@ class App:
             else:
                 self._apply_revote(self.history_index, winner)
             self._last_ranks = prev_ranks
-            self._show_history_entry(self.history_index)
+            next_index = self.history_index + 1
+            if next_index < len(self.duel_history):
+                self._enter_history_mode(next_index)
+            else:
+                self._exit_history_mode()
             return
 
         a, b = self.current
