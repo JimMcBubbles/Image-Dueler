@@ -112,6 +112,7 @@ POOL_FILTER_OPTIONS = ["All", "Images", "GIFs", "Videos", "Videos (audio)", "Ani
 BUILD_STAMP = '2026-02-26a (tag-update-reroll)'
 
 GIF_PRELOAD_MAX_FRAMES = 120
+LOAD_TIMEOUT_MS = 8000  # ms before showing Retry/Open-File overlay on a slow load
 
 _DISLIKE_COUNTS_BY_REL_FOLDER: dict[str, int] = {}
 
@@ -1717,7 +1718,7 @@ class App:
                 if marked:
                     fg, fnt = MENU_FG_DIM, ("Segoe UI", 9, "overstrike")
                 elif protected or (is_existing and not is_new):
-                    fg, fnt = (MENU_FG_DIM if protected else MENU_FG), ("Segoe UI", 9)
+                    fg, fnt = (MENU_FG_DIM if (protected and edit_mode[0]) else MENU_FG), ("Segoe UI", 9)
                 else:
                     fg, fnt = "#4aaa88", ("Segoe UI", 9)
 
@@ -1727,7 +1728,7 @@ class App:
                 row_ws = [ck, lbl]
 
                 if not edit_mode[0]:
-                    if is_existing and not protected:
+                    if is_existing:
                         def _toggle(e=None, t=tag):
                             v = tag_vars.get(t)
                             if v:
@@ -2624,6 +2625,49 @@ class App:
             except Exception:
                 pass
 
+    def _dismiss_load_timeout(self, side: str) -> None:
+        st = self._side[side]
+        job = st.pop("load_timeout_job", None)
+        if job:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+        overlay = st.pop("load_timeout_overlay", None)
+        if overlay:
+            try:
+                overlay.destroy()
+            except Exception:
+                pass
+
+    def _show_load_timeout(self, side: str, path: str) -> None:
+        st = self._side[side]
+        container = self.left_container if side == "a" else self.right_container
+        overlay = tk.Frame(container, bg=DARK_PANEL, bd=0, highlightthickness=0)
+        overlay.place(relx=0.5, rely=0.5, anchor="center")
+        st["load_timeout_overlay"] = overlay
+
+        tk.Label(
+            overlay, text="Still loading…\nThe file may be slow or unavailable.",
+            bg=DARK_PANEL, fg=TEXT_COLOR, font=("Segoe UI", 10), justify="center",
+        ).pack(pady=(0, 10))
+
+        btn_row = tk.Frame(overlay, bg=DARK_PANEL)
+        btn_row.pack()
+
+        def _retry():
+            self._dismiss_load_timeout(side)
+            self._render_side(side)
+
+        tk.Button(
+            btn_row, text="Retry", command=_retry,
+            bg=ACCENT, fg="white", relief="flat", padx=12, pady=4, cursor="hand2",
+        ).pack(side="left", padx=(0, 8))
+        tk.Button(
+            btn_row, text="Open File", command=lambda: os.startfile(path),
+            bg="#444444", fg=TEXT_COLOR, relief="flat", padx=12, pady=4, cursor="hand2",
+        ).pack(side="left")
+
     def _render_image_or_gif(self, side: str, widget: tk.Label, path: str):
         self.root.update_idletasks()
         w = max(1, widget.winfo_width())
@@ -2637,40 +2681,78 @@ class App:
         st["gif_render_token"] = st.get("gif_render_token", 0) + 1
         render_token = st["gif_render_token"]
 
-        try:
-            im = Image.open(path)
-        except Exception as e:
-            widget.configure(text=f"Failed to load:\n{path}\n\n{e}", fg=TEXT_COLOR, bg=DARK_PANEL)
-            return
+        self._dismiss_load_timeout(side)
+        widget.configure(text="Loading…", image="", fg=TEXT_COLOR, bg=DARK_PANEL)
 
-        is_animated = (getattr(im, "is_animated", False) and getattr(im, "n_frames", 1) > 1)
+        def on_timeout():
+            st2 = self._side[side]
+            if st2.get("gif_render_token") != render_token:
+                return
+            self._show_load_timeout(side, path)
 
-        if not is_animated:
+        st["load_timeout_job"] = self.root.after(LOAD_TIMEOUT_MS, on_timeout)
+
+        def load_worker(expected_token: int, source_path: str, size_target: tuple, blur_on: bool):
+            result: dict = {}
             try:
-                try:
-                    im.seek(0)
-                except Exception:
-                    pass
-                if im.mode not in ("RGB", "RGBA"):
-                    im = im.convert("RGB")
-                im.thumbnail(target, Image.Resampling.LANCZOS)
-                if self.blur_enabled:
-                    im = self._apply_pixelate(im, pixel_size=50)
-                tk_im = ImageTk.PhotoImage(im)
-            finally:
-                im.close()
-            widget.configure(image=tk_im, text="", bg=DARK_PANEL)
-            widget.image = tk_im
-            st["last_visual_size"] = (w, h)
-            return
+                im = Image.open(source_path)
+                is_animated = (getattr(im, "is_animated", False) and getattr(im, "n_frames", 1) > 1)
+                if not is_animated:
+                    try:
+                        try:
+                            im.seek(0)
+                        except Exception:
+                            pass
+                        if im.mode not in ("RGB", "RGBA"):
+                            im = im.convert("RGB")
+                        im.thumbnail(size_target, Image.Resampling.LANCZOS)
+                        if blur_on:
+                            im = self._apply_pixelate(im, pixel_size=50)
+                        result["payload"] = (im.tobytes(), im.size, im.mode)
+                        result["animated"] = False
+                    finally:
+                        im.close()
+                else:
+                    im.close()
+                    result["animated"] = True
+            except Exception as ex:
+                result["error"] = str(ex)
 
-        # GIF path: abandon the probe handle and re-open with a context manager below.
-        im.close()
+            def apply():
+                st2 = self._side[side]
+                if st2.get("gif_render_token") != expected_token:
+                    return
+                self._dismiss_load_timeout(side)
+                if "error" in result:
+                    widget.configure(
+                        text=f"Failed to load:\n{source_path}\n\n{result['error']}",
+                        image="", fg=TEXT_COLOR, bg=DARK_PANEL,
+                    )
+                    return
+                if result.get("animated"):
+                    widget.configure(text="Loading GIF…", image="", fg=TEXT_COLOR, bg=DARK_PANEL)
+                    self._decode_gif_async(side, widget, source_path, size_target, blur_on, expected_token, w, h)
+                    return
+                payload, payload_size, payload_mode = result["payload"]
+                img = Image.frombytes(payload_mode, payload_size, payload)
+                tk_im = ImageTk.PhotoImage(img)
+                widget.configure(image=tk_im, text="", bg=DARK_PANEL)
+                widget.image = tk_im
+                st2["last_visual_size"] = (w, h)
 
-        # GIF animation (decode asynchronously to keep the UI responsive)
-        widget.configure(text="Loading GIF…", image="", fg=TEXT_COLOR, bg=DARK_PANEL)
+            self.root.after(0, apply)
 
-        def decode_worker(expected_token: int, source_path: str, size_target: tuple[int, int], blur_on: bool):
+        threading.Thread(
+            target=load_worker,
+            args=(render_token, path, target, self.blur_enabled),
+            daemon=True,
+        ).start()
+
+    def _decode_gif_async(
+        self, side: str, widget: tk.Label, path: str,
+        target: tuple, blur_on: bool, render_token: int, w: int, h: int,
+    ) -> None:
+        def decode_worker(expected_token: int, source_path: str, size_target: tuple, blur_on: bool):
             frames_payload: List[tuple[bytes, tuple[int, int], str]] = []
             delays: List[int] = []
             error: Optional[str] = None
@@ -2729,13 +2811,14 @@ class App:
 
         threading.Thread(
             target=decode_worker,
-            args=(render_token, path, target, self.blur_enabled),
+            args=(render_token, path, target, blur_on),
             daemon=True,
         ).start()
 
     def _cancel_animation(self, side: str):
         st = self._side[side]
         st["gif_render_token"] = st.get("gif_render_token", 0) + 1
+        self._dismiss_load_timeout(side)
         if st.get("anim_job"):
             try:
                 self.root.after_cancel(st["anim_job"])

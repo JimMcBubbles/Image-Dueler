@@ -14,6 +14,7 @@
 | `TAG_OPTIONS` | `["SFW","MEME","HIDE","CW"]` — mutable list; custom tags appended at runtime |
 | `carousel_size` | 6 slots |
 | `ACCENT` / `PENDING_COLOR` / `FUTURE_COLOR` | blue / amber / dark-teal |
+| `LOAD_TIMEOUT_MS` | 8000 — ms before showing Retry/Open-File overlay on a slow load |
 
 ## DB schema
 ```
@@ -61,6 +62,10 @@ self.future_queue     # List[{"a":row,"b":row,"thumb":None}] — pre-rolled upco
 | `pick_one` | 2048 | Hard-filters by required_kind + required_tags (exact frozenset match) |
 | `load_duel` | 2108 | Pops future_queue[0] or pick_two, sets live, calls _fill_future_queue |
 | `choose` | 2136 | Vote handler — edit mode: _apply_revote or record_result; live: record + load_duel |
+| `_dismiss_load_timeout` | 2628 | Cancels pending timeout job + destroys overlay for a side |
+| `_show_load_timeout` | 2643 | Creates centered overlay on container with Retry + Open-File buttons |
+| `_render_image_or_gif` | 2671 | Async image/GIF render — shows "Loading…", starts load_worker thread, schedules 8 s timeout |
+| `_decode_gif_async` | 2751 | Spawns decode_worker thread for GIF frame extraction |
 
 ## Carousel slot map encoding
 `_carousel_slot_map[i]` stores:
@@ -87,7 +92,8 @@ Carousel highlights sub-duel amber until voted. View stays on parent duel.
 - Sidecar writes: daemon thread via `update_image_metadata`
 - Thumbnail builds: daemon thread → `root.after(0, _update_carousel)` on completion
 - Video snapshot polling: daemon thread
-- GIF decode: daemon thread
+- GIF decode: daemon thread via `_decode_gif_async`
+- Static image open+thumbnail: daemon thread via `load_worker` inside `_render_image_or_gif`; 8 s timeout shows Retry/Open-File overlay
 
 ## What NOT to do
 - Don't increment `duels` in `_apply_revote`
