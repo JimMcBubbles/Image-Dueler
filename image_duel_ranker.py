@@ -647,6 +647,7 @@ class App:
         self.sidebar_toggle_btn.pack(side="right", padx=(0, 6))
         self.blur_enabled = False
         self._blur_forced_by_focus = False
+        self._window_was_focused = True
         self.blur_toggle_btn = tk.Button(self.pool_filter_row, text="Blur",
                                          command=self.toggle_blur,
                                          bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat", width=7)
@@ -2419,6 +2420,8 @@ class App:
         self._update_carousel()
 
     def choose(self, winner: Optional[str]):
+        if not self._window_was_focused:
+            return
         if not self.current:
             return
         # snapshot ranks for delta arrows
@@ -4283,6 +4286,7 @@ class App:
         # focus is leaving the top-level window entirely.
         if event and str(getattr(event, "widget", "")) != str(self.root):
             return
+        self._window_was_focused = False
         if not self.blur_enabled:
             self._blur_forced_by_focus = True
             self._set_blur_enabled(True)
@@ -4290,6 +4294,8 @@ class App:
     def _on_window_focus_in(self, event=None):
         if event and str(getattr(event, "widget", "")) != str(self.root):
             return
+        # Delay restoring the flag so Button-1 fires first and is ignored.
+        self.root.after(0, lambda: setattr(self, "_window_was_focused", True))
         if self._blur_forced_by_focus:
             self._blur_forced_by_focus = False
             self._set_blur_enabled(False)
