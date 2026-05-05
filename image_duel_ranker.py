@@ -2374,7 +2374,10 @@ class App:
         if not eligible_groups:
             return None, None
 
-        group = random.choice(eligible_groups)
+        # Weight by group size so each individual image has equal probability
+        # of appearing, regardless of how rare or common its tag set is.
+        weights = [len(g) for g in eligible_groups]
+        group = random.choices(eligible_groups, weights=weights, k=1)[0]
         a, b = random.sample(group, 2)
         return a, b
 
