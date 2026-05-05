@@ -107,6 +107,7 @@ E621_MAX_OR_TAGS = 37  # max ~ (OR) artist tags per URL; keep a few slots for co
 DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
 TAG_OPTIONS = ["SFW", "MEME", "HIDE", "CW"]
+BLUR_TAGS = {"CW", "HIDE"}  # tags whose carousel thumbnails are blurred until the duel is selected
 POOL_FILTER_OPTIONS = ["All", "Images", "GIFs", "Videos", "Videos (audio)", "Animated", "Hidden"]
 
 BUILD_STAMP = '2026-02-26a (tag-update-reroll)'
@@ -400,6 +401,8 @@ def record_result(conn: sqlite3.Connection, a: tuple, b: tuple, winner: Optional
         "b_id": b_id,
         "a_path": a_path,
         "b_path": b_path,
+        "a_tags": a[8] if len(a) > 8 else "",
+        "b_tags": b[8] if len(b) > 8 else "",
         "winner": winner,
         "comparison_id": comparison_id,
         "before_a": before_a,
@@ -1171,11 +1174,14 @@ class App:
             draw.text((8, h // 2 - 7), "N/A", fill="#d0d0d0")
             return img
 
-    def _build_duel_thumbnail(self, left_path: str, right_path: str) -> ImageTk.PhotoImage:
+    def _build_duel_thumbnail(self, left_path: str, right_path: str, sensitive: bool = False) -> ImageTk.PhotoImage:
         w, h = self.carousel_thumb_size
         left = self._make_thumb_image(left_path)
         right = self._make_thumb_image(right_path)
-        if self.blur_enabled:
+        if sensitive:
+            left = self._apply_pixelate(left, pixel_size=50)
+            right = self._apply_pixelate(right, pixel_size=50)
+        elif self.blur_enabled:
             left = self._apply_pixelate(left, pixel_size=14)
             right = self._apply_pixelate(right, pixel_size=14)
         composite = Image.new("RGB", (w * 2 + 2, h), "#000000")
@@ -1183,8 +1189,42 @@ class App:
         composite.paste(right, (w + 2, 0))
         return ImageTk.PhotoImage(composite)
 
+    def _entry_is_sensitive(self, entry: dict) -> bool:
+        a_parsed = set(self._parse_tags(entry.get("a_tags") or ""))
+        b_parsed = set(self._parse_tags(entry.get("b_tags") or ""))
+        return bool((a_parsed | b_parsed) & BLUR_TAGS)
+
+    def _pair_is_sensitive(self, row_a: tuple, row_b: tuple) -> bool:
+        a_tags = set(self._tags_for_row(row_a))
+        b_tags = set(self._tags_for_row(row_b))
+        return bool((a_tags | b_tags) & BLUR_TAGS)
+
+    def _entry_sensitive_label(self, entry: dict) -> str:
+        a_tags = set(self._parse_tags(entry.get("a_tags") or "")) & BLUR_TAGS
+        b_tags = set(self._parse_tags(entry.get("b_tags") or "")) & BLUR_TAGS
+        left  = ", ".join(sorted(a_tags)) if a_tags else self._truncate_label(Path(entry["a_path"]).name, 18)
+        right = ", ".join(sorted(b_tags)) if b_tags else self._truncate_label(Path(entry["b_path"]).name, 18)
+        return f"{left}, {right}"
+
+    def _pair_sensitive_label(self, row_a: tuple, row_b: tuple) -> str:
+        a_tags = set(self._tags_for_row(row_a)) & BLUR_TAGS
+        b_tags = set(self._tags_for_row(row_b)) & BLUR_TAGS
+        left  = ", ".join(sorted(a_tags)) if a_tags else self._truncate_label(Path(row_a[1]).name, 18)
+        right = ", ".join(sorted(b_tags)) if b_tags else self._truncate_label(Path(row_b[1]).name, 18)
+        return f"{left}, {right}"
+
     def _attach_history_thumbs(self, entry: dict) -> None:
-        entry["thumb"] = self._build_duel_thumbnail(entry["a_path"], entry["b_path"])
+        if self._entry_is_sensitive(entry):
+            # thumb = clear (used when this slot is the active/selected one),
+            # thumb_blurred = heavy pixelation (used when not selected).
+            # Build thumb without blur_enabled so it stays clear regardless of focus state.
+            saved = self.blur_enabled
+            self.blur_enabled = False
+            entry["thumb"] = self._build_duel_thumbnail(entry["a_path"], entry["b_path"])
+            self.blur_enabled = saved
+            entry["thumb_blurred"] = self._build_duel_thumbnail(entry["a_path"], entry["b_path"], sensitive=True)
+        else:
+            entry["thumb"] = self._build_duel_thumbnail(entry["a_path"], entry["b_path"])
 
     def _fetch_row(self, img_id: int) -> Optional[tuple]:
         row = self.conn.execute("""
@@ -1402,6 +1442,8 @@ class App:
             "b_id":          sub_b[0],
             "a_path":        sub_a[1],
             "b_path":        sub_b[1],
+            "a_tags":        sub_a[8] if len(sub_a) > 8 else "",
+            "b_tags":        sub_b[8] if len(sub_b) > 8 else "",
             "winner":        None,
             "comparison_id": None,   # no DB row yet; created on first vote
             "before_a":      _snapshot_stats(self.conn, sub_a[0]),
@@ -1504,15 +1546,20 @@ class App:
                         # Past history slot
                         entry = self.duel_history[vi]
                         display_num = entry.get("sub_label") or str(vi + 1)
-                        label = f"{display_num}. {self._history_label(entry)}"
                         if entry.get("thumb") is None:
                             self._attach_history_thumbs(entry)
                         is_pending = (entry.get("sub_label") and entry.get("comparison_id") is None)
                         slot_bg = PENDING_COLOR if is_pending else DARK_PANEL
-                        btn.configure(text=label, state="normal", bg=slot_bg, image=entry.get("thumb", ""))
+                        if self._entry_is_sensitive(entry):
+                            label = f"{display_num}. {self._entry_sensitive_label(entry)}"
+                            thumb = entry.get("thumb_blurred") or entry.get("thumb", "")
+                        else:
+                            label = f"{display_num}. {self._history_label(entry)}"
+                            thumb = entry.get("thumb", "")
+                        btn.configure(text=label, state="normal", bg=slot_bg, image=thumb)
                         self._carousel_slot_map[i] = vi
                     elif vi == live_virtual:
-                        # Live current slot
+                        # Live current slot — always revealed (user is actively viewing this duel)
                         label = f"★ {total + 1}. {self._pair_label(self.live_current)}"
                         if self.live_current:
                             a, b = self.live_current
@@ -1528,11 +1575,16 @@ class App:
                         # Future duel slot
                         fi = vi - total - 1
                         fentry = self.future_queue[fi]
-                        label = f"~{total + fi + 2}. {self._pair_label((fentry['a'], fentry['b']))}"
+                        fa, fb = fentry["a"], fentry["b"]
+                        future_sensitive = self._pair_is_sensitive(fa, fb)
+                        if future_sensitive:
+                            label = f"~{total + fi + 2}. {self._pair_sensitive_label(fa, fb)}"
+                        else:
+                            label = f"~{total + fi + 2}. {self._pair_label((fa, fb))}"
                         if fentry["thumb"] is None:
                             # Build thumbnail in a daemon thread to avoid blocking the UI
-                            def _build_future_thumb(fe=fentry):
-                                fe["thumb"] = self._build_duel_thumbnail(fe["a"][1], fe["b"][1])
+                            def _build_future_thumb(fe=fentry, sens=future_sensitive):
+                                fe["thumb"] = self._build_duel_thumbnail(fe["a"][1], fe["b"][1], sensitive=sens)
                                 self.root.after(0, self._update_carousel)
                             threading.Thread(target=_build_future_thumb, daemon=True).start()
                         btn.configure(text=label, state="normal", bg=FUTURE_COLOR,
@@ -1555,30 +1607,42 @@ class App:
             active_index = self.history_index
             half = self.carousel_size // 2
             win_start = max(0, active_index - half)
-            win_end   = min(total - 1, win_start + self.carousel_size - 1)
-            win_start = max(0, win_end - (self.carousel_size - 1))
-            indices = list(range(win_start, win_end + 1))
+            # Don't clamp win_end — allow indices past total so the active slot
+            # stays centered even when it's the last history entry.
+            indices = list(range(win_start, win_start + self.carousel_size))
 
-            self._update_carousel_layout(len(indices))
+            self._update_carousel_layout(self.carousel_size)
 
             for i, btn in enumerate(self.carousel_slots):
                 btn.configure(image="")
                 if i < len(indices):
                     idx = indices[i]
+                    if idx >= total:
+                        # Padding slot beyond end of history — keep it visible but empty
+                        btn.configure(text="--", image="", state="disabled", bg=DARK_PANEL)
+                        self._carousel_slot_map[i] = None
+                        if not btn.winfo_ismapped():
+                            btn.pack(**self._carousel_slot_pack_opts)
+                        continue
                     entry = self.duel_history[idx]
                     display_num = entry.get("sub_label") or str(idx + 1)
-                    label = f"{display_num}. {self._history_label(entry)}"
                     if entry.get("thumb") is None:
                         self._attach_history_thumbs(entry)
                     btn.configure(wraplength=max(120, self.carousel_thumb_size[0] * 2))
                     is_active  = (idx == active_index)
                     is_pending = (entry.get("sub_label") and entry.get("comparison_id") is None)
                     slot_bg    = ACCENT if is_active else (PENDING_COLOR if is_pending else DARK_PANEL)
+                    if not is_active and self._entry_is_sensitive(entry):
+                        label = f"{display_num}. {self._entry_sensitive_label(entry)}"
+                        thumb = entry.get("thumb_blurred") or entry.get("thumb", "")
+                    else:
+                        label = f"{display_num}. {self._history_label(entry)}"
+                        thumb = entry.get("thumb", "")
                     btn.configure(
                         text=label,
                         state="normal",
                         bg=slot_bg,
-                        image=entry.get("thumb", ""),
+                        image=thumb,
                     )
                     self._carousel_slot_map[i] = idx
                     if not btn.winfo_ismapped():
@@ -1900,7 +1964,12 @@ class App:
         rebuild()
         win.lift()
         bind_id = self.root.bind("<Button-1>", _maybe_dismiss, add="+")
-        win.bind("<Destroy>", lambda e: self.root.unbind("<Button-1>", bind_id))
+        def _cleanup_bind(e=None):
+            try:
+                self.root.unbind("<Button-1>", bind_id)
+            except tk.TclError:
+                pass
+        win.bind("<Destroy>", _cleanup_bind)
 
     def _build_action_buttons(self, side: str, parent: tk.Frame) -> None:
         actions = tk.Frame(parent, bg=INFO_BAR_BG)
@@ -4316,9 +4385,19 @@ class App:
 
         for entry in self.duel_history:
             try:
-                entry["thumb"] = self._build_duel_thumbnail(entry["a_path"], entry["b_path"])
+                if self._entry_is_sensitive(entry):
+                    # Sensitive entries keep their clear thumb; nullify so _attach_history_thumbs
+                    # rebuilds it correctly (without blur_enabled) on next carousel repaint.
+                    entry["thumb"] = None
+                else:
+                    entry["thumb"] = self._build_duel_thumbnail(entry["a_path"], entry["b_path"])
             except Exception:
                 entry["thumb"] = None
+        for fentry in self.future_queue:
+            fentry["thumb"] = None
+        # Force live-slot thumbnail to rebuild so it picks up the new blur state.
+        if hasattr(self, "_live_thumb_key"):
+            self._live_thumb_key = None
         self._update_carousel()
 
         for side in ("a", "b"):

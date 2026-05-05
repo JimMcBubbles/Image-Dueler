@@ -12,6 +12,7 @@
 | `BASE_SCORE` | 1000.0 |
 | `DOWNVOTE_PENALTY` | 12.0 |
 | `TAG_OPTIONS` | `["SFW","MEME","HIDE","CW"]` — mutable list; custom tags appended at runtime |
+| `BLUR_TAGS` | `{"CW","HIDE"}` — tags whose carousel thumbnails are blurred until that duel is selected |
 | `carousel_size` | 6 slots |
 | `ACCENT` / `PENDING_COLOR` / `FUTURE_COLOR` | blue / amber / dark-teal |
 | `LOAD_TIMEOUT_MS` | 8000 — ms before showing Retry/Open-File overlay on a slow load |
@@ -50,8 +51,13 @@ self.future_queue     # List[{"a":row,"b":row,"thumb":None}] — pre-rolled upco
 |--------|-------|---------|
 | `record_result` | 348 | Creates comparison, updates DB, returns history entry dict |
 | `_apply_revote` | 1250 | Edits existing vote — delta wins/losses only, **no duels increment** |
-| `_create_history_sub_duel` | 1325 | Tag change in edit mode → nullify vote, roll replacement, insert sub-entry |
-| `_create_live_sub_duel` | 2467 | Tag change in live mode → replace slot with fresh pick, queue sub-duel for tagged image next in future_queue |
+| `_create_history_sub_duel` | 1327 | Tag change in edit mode → nullify vote, roll replacement, insert sub-entry |
+| `_create_live_sub_duel` | 2530 | Tag change in live mode → replace slot with fresh pick, queue sub-duel for tagged image next in future_queue |
+| `_entry_is_sensitive` | 1192 | True if entry's stored a_tags/b_tags intersect BLUR_TAGS |
+| `_pair_is_sensitive` | 1196 | True if either row's tags intersect BLUR_TAGS |
+| `_entry_sensitive_label` | 1200 | "TAG, TAG" label for blurred history carousel slots |
+| `_pair_sensitive_label` | 1206 | "TAG, TAG" label for blurred future/live carousel slots |
+| `_attach_history_thumbs` | 1212 | Builds entry["thumb"]; also builds entry["thumb_blurred"] for sensitive entries |
 | `_enter_history_mode` | 1214 | Save live_current, set history_index, show entry |
 | `_exit_history_mode` | 1220 | Restore live_current display, clear history_index |
 | `_update_carousel` | 1462 | Full carousel repaint — live/edit/future branches |
