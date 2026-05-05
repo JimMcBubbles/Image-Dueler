@@ -51,6 +51,7 @@ self.future_queue     # List[{"a":row,"b":row,"thumb":None}] — pre-rolled upco
 | `record_result` | 348 | Creates comparison, updates DB, returns history entry dict |
 | `_apply_revote` | 1250 | Edits existing vote — delta wins/losses only, **no duels increment** |
 | `_create_history_sub_duel` | 1325 | Tag change in edit mode → nullify vote, roll replacement, insert sub-entry |
+| `_create_live_sub_duel` | 2467 | Tag change in live mode → replace slot with fresh pick, queue sub-duel for tagged image next in future_queue |
 | `_enter_history_mode` | 1214 | Save live_current, set history_index, show entry |
 | `_exit_history_mode` | 1220 | Restore live_current display, clear history_index |
 | `_update_carousel` | 1462 | Full carousel repaint — live/edit/future branches |
@@ -102,6 +103,7 @@ Carousel highlights sub-duel amber until voted. View stays on parent duel.
 - Don't block the main thread with thumbnail/video/file I/O
 
 ## Claude instructions
+- At the end of every response that changes files, provide a **Commit Summary** (short title) and **Description** (body explaining what changed and why) for the user to use if they decide to commit — never run `git commit` yourself
 - Keep this file updated as methods are added, removed, or relocated
 - Update line numbers in the method table after any significant edits
 - If new constants, state variables, or DB columns are added, reflect them here

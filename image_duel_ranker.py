@@ -2032,12 +2032,15 @@ class App:
                 self._create_history_sub_duel(self.history_index, updated, side)
             return
 
-        # In live duel mode, changing this side's tags should immediately reroll that side
-        # so the replacement is re-matched to the opposing side's tag profile.
+        # In live duel mode: replace the tagged slot with a fresh pick, then queue a
+        # new duel for the tagged image (with its new tags) as the next upcoming duel.
         if self.history_index is None and self.current:
             current_row = self.current[0] if side == "a" else self.current[1]
             if current_row and current_row[0] == row[0]:
-                self._replace_side_keep_other(side)
+                if updated:
+                    self._create_live_sub_duel(updated, side)
+                else:
+                    self._replace_side_keep_other(side)
                 return
 
         # Revalidate both sides against active pool/tag filters immediately.
@@ -2460,6 +2463,59 @@ class App:
         self._stop_video("a")
         self._stop_video("b")
         self.load_duel()
+
+    def _create_live_sub_duel(self, tagged_row: tuple, side: str) -> None:
+        """
+        Called when a tag is changed on the live duel image.
+
+        1. Replace the tagged slot in the current live duel with a fresh pick
+           matched to the other side's tag group.
+        2. Roll an opponent for the tagged image matched to its new tag group.
+        3. Insert that new duel at the front of future_queue (plays next).
+        """
+        if not self.current:
+            return
+        a, b = self.current
+        other = b if side == "a" else a
+
+        pool = self._pool_rows()
+        tagged_kind = self._media_kind(tagged_row[1])
+
+        replacement = self.pick_one(
+            exclude_id=other[0],
+            pool=pool,
+            required_kind=self._media_kind(other[1]),
+            required_tags=frozenset(self._tags_for_row(other)),
+        )
+
+        sub_opponent = self.pick_one(
+            exclude_id=tagged_row[0],
+            pool=pool,
+            required_kind=tagged_kind,
+            required_tags=frozenset(self._tags_for_row(tagged_row)),
+        )
+
+        if replacement:
+            self._side[side]["last_replaced_row"] = a if side == "a" else b
+            if side == "a":
+                self._set_current(replacement, other)
+            else:
+                self._set_current(other, replacement)
+            self._stop_video(side)
+            self._render_side(side)
+            self.update_sidebar()
+        else:
+            self.load_duel()
+            return
+
+        if sub_opponent:
+            if side == "a":
+                sub_entry = {"a": tagged_row, "b": sub_opponent, "thumb": None}
+            else:
+                sub_entry = {"a": sub_opponent, "b": tagged_row, "thumb": None}
+            self.future_queue.insert(0, sub_entry)
+
+        self._update_carousel()
 
     def _replace_side_keep_other(self, side: str) -> None:
         if not self.current:
