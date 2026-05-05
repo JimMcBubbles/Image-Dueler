@@ -1230,6 +1230,15 @@ class App:
         right = ", ".join(sorted(b_tags)) if b_tags else self._truncate_label(Path(row_b[1]).name, 18)
         return f"{left}, {right}"
 
+    def _tag_usage_counts(self) -> dict:
+        counts: dict = {t: 0 for t in TAG_OPTIONS}
+        for (raw_tags,) in self.conn.execute(
+            "SELECT tags FROM images WHERE tags IS NOT NULL AND tags != ''"
+        ):
+            for t in self._parse_tags(raw_tags):
+                counts[t] = counts.get(t, 0) + 1
+        return counts
+
     def _attach_history_thumbs(self, entry: dict) -> None:
         if self._entry_is_sensitive(entry):
             # thumb = clear (used when this slot is the active/selected one),
@@ -1696,10 +1705,12 @@ class App:
         self._side[side]["tag_button"] = button
 
     def _rebuild_all_tag_menus(self) -> None:
+        usage = self._tag_usage_counts()
+        sorted_tags = sorted(TAG_OPTIONS, key=lambda t: (-usage.get(t, 0), t))
         for side in ("a", "b"):
             old_vars = self._side[side].get("tag_vars", {})
             new_vars: dict = {}
-            for tag in TAG_OPTIONS:
+            for tag in sorted_tags:
                 new_vars[tag] = old_vars.get(tag, tk.BooleanVar(value=False))
             self._side[side]["tag_vars"] = new_vars
             row = self._side[side].get("row")
@@ -1711,7 +1722,7 @@ class App:
             self._set_tag_button_label(side)
         new_filter_menu = tk.Menu(self.tag_filter_btn, tearoff=0)
         new_filter_vars: dict = {}
-        for tag in TAG_OPTIONS:
+        for tag in sorted_tags:
             var = self.tag_filter_vars.get(tag) or tk.BooleanVar(value=False)
             new_filter_vars[tag] = var
             new_filter_menu.add_checkbutton(
@@ -1776,7 +1787,9 @@ class App:
                 w.destroy()
 
             # ── tag rows ──────────────────────────────────────────────
-            for tag in list(TAG_OPTIONS) + [t for t in pending_adds if t not in TAG_OPTIONS]:
+            _usage = self._tag_usage_counts()
+            _sorted = sorted(TAG_OPTIONS, key=lambda t: (-_usage.get(t, 0), t))
+            for tag in _sorted + [t for t in pending_adds if t not in TAG_OPTIONS]:
                 is_new      = tag in pending_adds
                 is_existing = tag in TAG_OPTIONS
                 protected   = is_existing and tag in PROTECTED

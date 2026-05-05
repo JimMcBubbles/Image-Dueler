@@ -53,16 +53,17 @@ self.future_queue     # List[{"a":row,"b":row,"thumb":None}] — pre-rolled upco
 | `_apply_revote` | 1250 | Edits existing vote — delta wins/losses only, **no duels increment** |
 | `_create_history_sub_duel` | 1327 | Tag change in edit mode → nullify vote, roll replacement, insert sub-entry |
 | `_create_live_sub_duel` | 2530 | Tag change in live mode → replace slot with fresh pick, queue sub-duel for tagged image next in future_queue |
-| `_entry_is_sensitive` | 1192 | True if entry's stored a_tags/b_tags intersect BLUR_TAGS |
-| `_pair_is_sensitive` | 1196 | True if either row's tags intersect BLUR_TAGS |
-| `_entry_sensitive_label` | 1200 | "TAG, TAG" label for blurred history carousel slots |
-| `_pair_sensitive_label` | 1206 | "TAG, TAG" label for blurred future/live carousel slots |
-| `_attach_history_thumbs` | 1212 | Builds entry["thumb"]; also builds entry["thumb_blurred"] for sensitive entries |
-| `_enter_history_mode` | 1214 | Save live_current, set history_index, show entry |
-| `_exit_history_mode` | 1220 | Restore live_current display, clear history_index |
-| `_update_carousel` | 1462 | Full carousel repaint — live/edit/future branches |
-| `_rebuild_all_tag_menus` | 1625 | Re-sync tag_vars/labels after TAG_OPTIONS changes; rebuilds filter tk.Menu |
-| `_show_custom_tag_menu` | 1648 | Custom overrideredirect popup mimicking tk.Menu; handles toggle + inline edit mode with text field, pending removes/adds, Save, click-outside save prompt |
+| `_entry_is_sensitive` | 1209 | True if entry's stored a_tags/b_tags intersect BLUR_TAGS |
+| `_pair_is_sensitive` | 1214 | True if either row's tags intersect BLUR_TAGS |
+| `_entry_sensitive_label` | 1219 | "TAG, TAG" label for blurred history carousel slots |
+| `_pair_sensitive_label` | 1226 | "TAG, TAG" label for blurred future/live carousel slots |
+| `_tag_usage_counts` | 1233 | Returns {tag: image_count} for all images; used to sort tag menus by usage |
+| `_attach_history_thumbs` | 1242 | Builds entry["thumb"]; also builds entry["thumb_blurred"] for sensitive entries |
+| `_enter_history_mode` | 1255 | Save live_current, set history_index, show entry |
+| `_exit_history_mode` | 1261 | Restore live_current display, clear history_index |
+| `_update_carousel` | 1472 | Full carousel repaint — live/edit/future branches |
+| `_rebuild_all_tag_menus` | 1637 | Re-sync tag_vars/labels after TAG_OPTIONS changes; rebuilds filter tk.Menu; sorts by usage |
+| `_show_custom_tag_menu` | 1662 | Custom overrideredirect popup mimicking tk.Menu; handles toggle + inline edit mode with text field, pending removes/adds, Save, click-outside save prompt; sorts by usage |
 | `_fill_future_queue` | 2006 | Top up future_queue to target size via pick_two |
 | `_jump_to_future` | 2029 | Skip live+futures[0..i-1], make future[i] the new live duel |
 | `pick_two` | 2079 | Groups pool by (frozenset(tags), media_kind); picks two from same group |
