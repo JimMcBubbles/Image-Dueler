@@ -439,6 +439,23 @@ class App:
         self.root = root
         self.conn = conn
 
+        # Restore custom tags that were saved to the DB in prior sessions.
+        # TAG_OPTIONS starts with only the 4 defaults; any extra tags stored
+        # in images.tags would be silently dropped by _parse_tags/_ordered_tags
+        # unless we add them back here before any UI or parsing happens.
+        _known: set = set(TAG_OPTIONS)
+        for (raw,) in conn.execute(
+            "SELECT DISTINCT tags FROM images WHERE tags IS NOT NULL AND tags != '[]'"
+        ):
+            try:
+                for t in json.loads(raw):
+                    t = str(t).upper()
+                    if t and t not in _known:
+                        TAG_OPTIONS.append(t)
+                        _known.add(t)
+            except Exception:
+                pass
+
         root.title(f"Image Duel Ranker — {BUILD_STAMP.split(' ')[0]}")
         root.geometry(f"{WINDOW_SIZE[0]}x{WINDOW_SIZE[1]}")
         root.configure(bg=DARK_BG)
