@@ -24,6 +24,7 @@ import subprocess
 import shutil
 import tempfile
 import threading
+import traceback
 import hashlib
 import tkinter as tk
 import tkinter.ttk as ttk
@@ -100,7 +101,12 @@ LEADERBOARD_METRIC_DEFAULT = "dislikes_adjusted"  # avg | shrunken_avg | dislike
 FOLDER_MIN_N = 1
 FOLDER_PRIOR_IMAGES = 8
 LCB_Z = 1.0
-DISLIKES_PER_FILE_PENALTY = 6.0
+DISLIKE_RATE_PENALTY = 300.0  # multiplied by dislike_rate = dislikes/(n+prior); replaces flat per-file penalty
+VOLUME_BONUS = 50.0           # max bonus for large like-count; scaled by n/(n+prior)
+
+SPARKLINE_WINDOW_DEFAULT = 60   # comparisons per folder to sample for sparkline
+SPARKLINE_WINDOWS = (20, 40, 60, 100, 200)
+SPARKLINE_BUCKETS = 7           # number of segments in each sparkline
 
 E621_MAX_TAGS = 40
 E621_MAX_OR_TAGS = 37  # max ~ (OR) artist tags per URL; keep a few slots for common tags
@@ -108,6 +114,10 @@ DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
 TAG_OPTIONS = ["SFW", "MEME", "HIDE", "CW"]
 BLUR_TAGS = {"CW", "HIDE"}  # tags whose carousel thumbnails are blurred until the duel is selected
+
+# Sentinel row placed in self.current's "b" slot for solo duels (no opponent in tag group).
+# id=-1 is never a real DB row; checked via row[0] < 0.
+_NO_OPPONENT = (-1, "\x00no_opponent", "\x00no_opponent", 0, 0, 0, 0.0, 0, "[]")
 POOL_FILTER_OPTIONS = ["All", "Images", "GIFs", "Videos", "Videos (audio)", "Animated", "Hidden"]
 
 BUILD_STAMP = '2026-02-26a (tag-update-reroll)'
@@ -163,6 +173,104 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
         conn.commit()
         conn.execute("UPDATE images SET tags='[]' WHERE tags IS NULL")
         conn.commit()
+
+# Windows file-attribute flags relevant to OneDrive "Files On-Demand" placeholders.
+# These let us tell a genuinely-missing file apart from one that merely hasn't been
+# downloaded yet (present in the directory listing, but not physically on disk).
+_FILE_ATTRIBUTE_OFFLINE               = 0x00001000
+_FILE_ATTRIBUTE_RECALL_ON_OPEN        = 0x00040000  # dehydrated placeholder (reparse point)
+_FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x00400000  # online-only (OneDrive Files On-Demand)
+
+
+def describe_file_state(path: str) -> str:
+    """Human-readable description of a media file's on-disk state, for diagnostics.
+
+    Distinguishes a genuinely missing file from a OneDrive "online-only" placeholder
+    (listed in the folder but not downloaded). Opening such a placeholder triggers a
+    network hydration that can be slow or fail — a common cause of both "file not found"
+    and "GIF won't load / load times out" symptoms under I:\\OneDrive. os.stat reads
+    metadata only and does NOT trigger hydration, so this probe is cheap and safe.
+    """
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return "MISSING (not on disk - moved, deleted, or never synced)"
+    except OSError as ex:
+        return f"STAT-FAILED ({type(ex).__name__}: {ex})"
+
+    attrs = getattr(st, "st_file_attributes", 0)
+    flags = []
+    if attrs & _FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS:
+        flags.append("ONLINE-ONLY (OneDrive placeholder, not downloaded)")
+    if attrs & _FILE_ATTRIBUTE_RECALL_ON_OPEN:
+        flags.append("dehydrated/recall-on-open")
+    if attrs & _FILE_ATTRIBUTE_OFFLINE:
+        flags.append("offline")
+    state = ", ".join(flags) if flags else "present (local)"
+    return f"{state}; {st.st_size} bytes"
+
+
+def audit_file_availability(db_path) -> set:
+    """One-shot startup diagnostic: classify every DB media path as local / online-only /
+    missing, print a summary, and return the set of image ids whose file is missing.
+
+    Explains the scope of "some files are not being found" and slow loads in one place, and
+    feeds the App's `_missing_ids` so dead rows are skipped when picking duels.
+
+    Opens its OWN sqlite connection (the App's connection is bound to the main thread) and
+    uses os.stat, which reads metadata only and never hydrates a OneDrive placeholder, so
+    this is safe to run in bulk on a background thread.
+    """
+    try:
+        c = sqlite3.connect(str(db_path))
+        rows = list(c.execute("SELECT id, path FROM images WHERE hidden=0 OR hidden IS NULL"))
+        c.close()
+    except Exception as ex:
+        print(f"[audit] could not read image paths: {ex}")
+        return set()
+
+    missing_ids: set = set()
+    missing: list = []
+    online_only: list = []
+    errored: list = []
+    local = 0
+    recall_mask = (_FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+                   | _FILE_ATTRIBUTE_RECALL_ON_OPEN
+                   | _FILE_ATTRIBUTE_OFFLINE)
+    for img_id, p in rows:
+        try:
+            st = os.stat(p)
+        except FileNotFoundError:
+            missing.append(p)
+            missing_ids.add(img_id)
+            continue
+        except OSError as ex:
+            errored.append((p, f"{type(ex).__name__}: {ex}"))
+            continue
+        if getattr(st, "st_file_attributes", 0) & recall_mask:
+            online_only.append(p)
+        else:
+            local += 1
+
+    print(f"[audit] checked {len(rows)} active files: "
+          f"{local} local, {len(online_only)} online-only (OneDrive, not downloaded), "
+          f"{len(missing)} MISSING, {len(errored)} stat-error")
+    for p in missing[:15]:
+        print(f"[audit]   MISSING: {p}")
+    if len(missing) > 15:
+        print(f"[audit]   ... and {len(missing) - 15} more missing")
+    for p in online_only[:15]:
+        print(f"[audit]   ONLINE-ONLY: {p}")
+    if len(online_only) > 15:
+        print(f"[audit]   ... and {len(online_only) - 15} more online-only")
+    for p, err in errored[:15]:
+        print(f"[audit]   STAT-ERROR: {p}  ({err})")
+    if online_only:
+        print("[audit] Tip: online-only files load slowly (and can time out / fail) because "
+              "OneDrive must download them on access. Right-click the folder in Explorer -> "
+              "'Always keep on this device' to pin them locally.")
+    return missing_ids
+
 
 def scan_images(conn: sqlite3.Connection) -> None:
     cur = conn.cursor()
@@ -248,37 +356,44 @@ def folder_leaderboard(conn: sqlite3.Connection, metric: str = LEADERBOARD_METRI
     rows: List[dict] = []
     if metric in ("avg", "shrunken_avg", "dislikes_adjusted"):
         data = conn.execute("""
-            SELECT folder, AVG(score) AS avg_s, COUNT(*) AS n
+            SELECT folder, AVG(score) AS avg_s, COUNT(*) AS n,
+                   SUM(wins) AS wins, SUM(losses) AS losses
             FROM images
             WHERE hidden=0
             GROUP BY folder
             HAVING COUNT(*) >= ?
         """, (min_n,)).fetchall()
-        for (folder, avg_s, n) in data:
+        for (folder, avg_s, n, wins, losses) in data:
             avg_s = float(avg_s); n = int(n)
+            wins = int(wins or 0); losses = int(losses or 0)
             score = ((avg_s * n + global_mu * FOLDER_PRIOR_IMAGES) / (n + FOLDER_PRIOR_IMAGES)
                      if metric in ("shrunken_avg", "dislikes_adjusted") else avg_s)
             rel_key = _relative_folder_to_root(folder, ROOT_DIR)
             dislikes_n = int(_DISLIKE_COUNTS_BY_REL_FOLDER.get(rel_key, 0))
             if metric == "dislikes_adjusted":
-                score -= dislikes_n * DISLIKES_PER_FILE_PENALTY
-            rows.append({"folder": folder, "avg": avg_s, "n": n, "score": score, "dislikes_n": dislikes_n})
+                score += (n / (n + FOLDER_PRIOR_IMAGES)) * VOLUME_BONUS
+                score -= (dislikes_n / (n + dislikes_n + FOLDER_PRIOR_IMAGES)) * DISLIKE_RATE_PENALTY
+            rows.append({"folder": folder, "avg": avg_s, "n": n, "score": score,
+                         "dislikes_n": dislikes_n, "wins": wins, "losses": losses})
     elif metric == "lcb":
         data = conn.execute("""
-            SELECT folder, COUNT(*) AS n, AVG(score) AS avg_s, AVG(score*score) AS avg_sq
+            SELECT folder, COUNT(*) AS n, AVG(score) AS avg_s, AVG(score*score) AS avg_sq,
+                   SUM(wins) AS wins, SUM(losses) AS losses
             FROM images
             WHERE hidden=0
             GROUP BY folder
             HAVING COUNT(*) >= ?
         """, (min_n,)).fetchall()
-        for (folder, n, avg_s, avg_sq) in data:
+        for (folder, n, avg_s, avg_sq, wins, losses) in data:
             n = int(n); avg_s = float(avg_s); avg_sq = float(avg_sq)
+            wins = int(wins or 0); losses = int(losses or 0)
             var = max(0.0, avg_sq - avg_s * avg_s)
             se = (var ** 0.5) / (n ** 0.5) if n > 0 else 0.0
             score = avg_s - LCB_Z * se
             rel_key = _relative_folder_to_root(folder, ROOT_DIR)
             dislikes_n = int(_DISLIKE_COUNTS_BY_REL_FOLDER.get(rel_key, 0))
-            rows.append({"folder": folder, "avg": avg_s, "n": n, "score": score, "dislikes_n": dislikes_n})
+            rows.append({"folder": folder, "avg": avg_s, "n": n, "score": score,
+                         "dislikes_n": dislikes_n, "wins": wins, "losses": losses})
     else:
         return folder_leaderboard(conn, metric="avg", min_n=min_n)
 
@@ -288,7 +403,8 @@ def folder_leaderboard(conn: sqlite3.Connection, metric: str = LEADERBOARD_METRI
         out.append({
             "folder": r["folder"], "avg": r["avg"], "n": r["n"],
             "rank": i, "score": r["score"], "metric": metric,
-            "dislikes_n": int(r.get("dislikes_n", 0))
+            "dislikes_n": int(r.get("dislikes_n", 0)),
+            "wins": r.get("wins", 0), "losses": r.get("losses", 0),
         })
     return out
 
@@ -297,6 +413,52 @@ def find_folder_rank(leader: List[dict], folder_path_str: str) -> Tuple[Optional
         if item["folder"] == folder_path_str:
             return item["rank"], item["avg"], item["n"], item["score"]
     return None, None, None, None
+
+# -------------------- Sparkline helpers --------------------
+_SPARK_CHARS = "▁▂▃▄▅▆▇█"
+
+def folder_sparkline(conn: sqlite3.Connection, folder: str,
+                     window: int = SPARKLINE_WINDOW_DEFAULT,
+                     buckets: int = SPARKLINE_BUCKETS) -> Optional[List[float]]:
+    """Win-rate per bucket over the last `window` comparisons for images in `folder`.
+    Returns list of floats in [0,1] of length `buckets`, or None if insufficient data."""
+    img_ids = [r[0] for r in conn.execute(
+        "SELECT id FROM images WHERE folder=? AND hidden=0", (folder,)
+    ).fetchall()]
+    if not img_ids:
+        return None
+    ph = ",".join("?" * len(img_ids))
+    rows = conn.execute(f"""
+        SELECT chosen_id FROM comparisons
+        WHERE (left_id IN ({ph}) OR right_id IN ({ph}))
+          AND chosen_id IS NOT NULL
+        ORDER BY ts DESC
+        LIMIT ?
+    """, (*img_ids, *img_ids, window)).fetchall()
+    if len(rows) < buckets:
+        return None
+    rows = list(reversed(rows))
+    id_set = set(img_ids)
+    results = [1 if r[0] in id_set else 0 for r in rows]
+    bucket_size = len(results) / buckets
+    rates = []
+    for b in range(buckets):
+        start = int(b * bucket_size)
+        end = max(start + 1, int((b + 1) * bucket_size))
+        chunk = results[start:end]
+        rates.append(sum(chunk) / len(chunk))
+    return rates
+
+def render_sparkline(rates: List[float]) -> str:
+    n = len(_SPARK_CHARS)
+    return "".join(_SPARK_CHARS[min(int(r * n), n - 1)] for r in rates)
+
+def _spark_tag_for_rate(rate: float) -> str:
+    if rate >= 0.72:   return "spark_h"
+    elif rate >= 0.58: return "spark_mh"
+    elif rate >= 0.42: return "spark_m"
+    elif rate >= 0.28: return "spark_ml"
+    else:              return "spark_l"
 
 # -------------------- Sidecar metadata --------------------
 def update_image_metadata(path: Path, score: float) -> None:
@@ -468,11 +630,17 @@ class App:
         self.metric = LEADERBOARD_METRIC_DEFAULT
         self.metric_var = tk.StringVar(value=self.metric)
         self._last_ranks = {r["folder"]: r["rank"] for r in folder_leaderboard(self.conn, metric=self.metric)}
+        self.sparkline_enabled = False
+        self.sparkline_window = SPARKLINE_WINDOW_DEFAULT
         self._resize_job = None
         self._audio_cache = {}
+        self._ffmpeg_exe_cache: Optional[dict] = None  # None=uncached; {"path": str|None}=cached
+        self._waveform_cache_cleaned = False
         self.duel_history: List[dict] = []
         self.history_index: Optional[int] = None
         self.future_queue: List[dict] = []  # pre-rolled upcoming duels {"a":row,"b":row,"thumb":None}
+        self._missing_ids: set = set()  # image ids whose file is gone from disk; excluded from picking
+        self.solo_mode = False  # True when the live duel has no opponent (b == _NO_OPPONENT)
         self.carousel_size = 6
         self.carousel_visible = True
         self.carousel_thumb_size = (96, 54)
@@ -695,7 +863,9 @@ class App:
         self._metric_tooltips = {
             "shrunken_avg": f"Shrunken Avg: dampens small-sample folders using prior={FOLDER_PRIOR_IMAGES}.",
             "dislikes_adjusted": (
-                f"Shrunken Avg - dislikes×{DISLIKES_PER_FILE_PENALTY:g}: applies mirrored dislikes penalty per file."
+                f"Shrunken Avg + volume bonus (max {VOLUME_BONUS:g}) "
+                f"- dislike rate×{DISLIKE_RATE_PENALTY:g}. "
+                f"Rewards large like-counts; penalizes by dislikes÷(likes+dislikes+{FOLDER_PRIOR_IMAGES})."
             ),
             "avg": "Simple Avg: plain mean score by folder.",
             "lcb": f"Lower Confidence Bound: conservative score (mean - z*SE, z={LCB_Z}).",
@@ -728,6 +898,14 @@ class App:
         self.board.tag_configure("delta_down", foreground="#ff7a7a")
         self.board.tag_configure("delta_flat", foreground="#9a9a9a")
         self.board.tag_configure("delta_new", foreground="#9bd6ff")
+        self.board.tag_configure("spark_h",  foreground="#5de05d")
+        self.board.tag_configure("spark_mh", foreground="#99d499")
+        self.board.tag_configure("spark_m",  foreground="#9a9a9a")
+        self.board.tag_configure("spark_ml", foreground="#d49999")
+        self.board.tag_configure("spark_l",  foreground="#e05d5d")
+        self.board.tag_configure("spark_none", foreground="#555555")
+        self.board.tag_configure("hl_left",  background=FUTURE_COLOR)
+        self.board.tag_configure("hl_right", background=PENDING_COLOR)
         self.nav_row = tk.Frame(self.sidebar, bg=DARK_BG)
         self.btn_prev = tk.Button(self.nav_row, text="Prev [ / PgUp", width=14,
                                   command=lambda: self.change_page(-1),
@@ -737,6 +915,26 @@ class App:
                                   bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat")
         self.btn_prev.pack(side="left", padx=(0, 6))
         self.btn_next.pack(side="right")
+
+        self.spark_controls_row = tk.Frame(self.sidebar, bg=DARK_BG)
+        self.spark_toggle_btn = tk.Button(
+            self.spark_controls_row,
+            text="Sparklines: Off",
+            font=("Segoe UI", 9),
+            fg=INFO_BAR_FG, bg=INFO_BAR_BG, activebackground=INFO_BAR_BG,
+            relief="flat", cursor="hand2",
+            command=self.toggle_sparklines,
+        )
+        self.spark_toggle_btn.pack(side="left", fill="x", expand=True)
+        self.spark_window_btn = tk.Button(
+            self.spark_controls_row,
+            text=f"W: {SPARKLINE_WINDOW_DEFAULT}",
+            font=("Segoe UI", 9),
+            fg=INFO_BAR_FG, bg=INFO_BAR_BG, activebackground=INFO_BAR_BG,
+            relief="flat", cursor="hand2",
+            command=self.cycle_sparkline_window,
+        )
+        self.spark_window_btn.pack(side="right")
 
         # ---- Counters ----
         self.counters_header = tk.Label(self.sidebar, text="Counters",
@@ -784,7 +982,8 @@ class App:
         self.leader_header.pack(anchor="w")
         self.leader_controls_row.pack(fill="x", pady=(2, 4))
         self.board.pack(fill="x", pady=(4, 6))
-        self.nav_row.pack(fill="x", pady=(0, 6))
+        self.nav_row.pack(fill="x", pady=(0, 4))
+        self.spark_controls_row.pack(fill="x", pady=(0, 6))
         tk.Frame(self.sidebar, height=1, bg=SEPARATOR_BG).pack(fill="x", pady=(0, 6))
 
         self.counters_header.pack(anchor="w", pady=(2, 0))
@@ -954,6 +1153,10 @@ class App:
 
         self._toggle_carousel()
         self.load_duel()
+
+        # Background sweep: find DB rows whose file is gone from disk, log a summary, and
+        # populate self._missing_ids so the picker skips them. Off-thread so startup is instant.
+        self._start_missing_scan()
 
     # -------------------- helpers / state --------------------
     def _ensure_ui_tooltip(self):
@@ -1185,7 +1388,10 @@ class App:
             offset = ((w - im.width) // 2, (h - im.height) // 2)
             canvas.paste(im, offset)
             return canvas
-        except Exception:
+        except Exception as ex:
+            print(f"[thumb] FAILED: {path!r}")
+            print(f"[thumb]   error: {type(ex).__name__}: {ex}")
+            print(f"[thumb]   file:  {describe_file_state(path)}")
             img = Image.new("RGB", (w, h), "#111111")
             draw = ImageDraw.Draw(img)
             draw.text((8, h // 2 - 7), "N/A", fill="#d0d0d0")
@@ -1586,15 +1792,21 @@ class App:
                         self._carousel_slot_map[i] = vi
                     elif vi == live_virtual:
                         # Live current slot — always revealed (user is actively viewing this duel)
-                        label = f"★ {total + 1}. {self._pair_label(self.live_current)}"
-                        if self.live_current:
+                        if self.solo_mode and self.live_current:
+                            solo_a = self.live_current[0]
+                            solo_name = self._truncate_label(Path(solo_a[1]).name, 22)
+                            label = f"★ {total + 1}. {solo_name} (unmatched)"
+                            btn.configure(text=label, state="normal", bg=ACCENT, image="")
+                        elif self.live_current:
                             a, b = self.live_current
+                            label = f"★ {total + 1}. {self._pair_label(self.live_current)}"
                             if not hasattr(self, "_live_thumb") or self._live_thumb_key != (a[0], b[0]):
                                 self._live_thumb = self._build_duel_thumbnail(a[1], b[1])
                                 self._live_thumb_key = (a[0], b[0])
                             btn.configure(text=label, state="normal", bg=ACCENT,
                                           image=self._live_thumb)
                         else:
+                            label = f"★ {total + 1}. ?"
                             btn.configure(text=label, state="normal", bg=ACCENT, image="")
                         self._carousel_slot_map[i] = "live"
                     else:
@@ -1602,19 +1814,26 @@ class App:
                         fi = vi - total - 1
                         fentry = self.future_queue[fi]
                         fa, fb = fentry["a"], fentry["b"]
-                        future_sensitive = self._pair_is_sensitive(fa, fb)
-                        if future_sensitive:
-                            label = f"~{total + fi + 2}. {self._pair_sensitive_label(fa, fb)}"
+                        if fb is None:
+                            # Solo placeholder: no opponent in the tag group
+                            solo_name = self._truncate_label(Path(fa[1]).name, 22)
+                            label = f"~{total + fi + 2}. {solo_name} (unmatched)"
+                            btn.configure(text=label, state="normal", bg=FUTURE_COLOR, image="")
+                            fentry["thumb"] = ""  # mark as resolved so we don't re-check
                         else:
-                            label = f"~{total + fi + 2}. {self._pair_label((fa, fb))}"
-                        if fentry["thumb"] is None:
-                            # Build thumbnail in a daemon thread to avoid blocking the UI
-                            def _build_future_thumb(fe=fentry, sens=future_sensitive):
-                                fe["thumb"] = self._build_duel_thumbnail(fe["a"][1], fe["b"][1], sensitive=sens)
-                                self.root.after(0, self._update_carousel)
-                            threading.Thread(target=_build_future_thumb, daemon=True).start()
-                        btn.configure(text=label, state="normal", bg=FUTURE_COLOR,
-                                      image=fentry["thumb"] or "")
+                            future_sensitive = self._pair_is_sensitive(fa, fb)
+                            if future_sensitive:
+                                label = f"~{total + fi + 2}. {self._pair_sensitive_label(fa, fb)}"
+                            else:
+                                label = f"~{total + fi + 2}. {self._pair_label((fa, fb))}"
+                            if fentry["thumb"] is None:
+                                # Build thumbnail in a daemon thread to avoid blocking the UI
+                                def _build_future_thumb(fe=fentry, sens=future_sensitive):
+                                    fe["thumb"] = self._build_duel_thumbnail(fe["a"][1], fe["b"][1], sensitive=sens)
+                                    self.root.after(0, self._update_carousel)
+                                threading.Thread(target=_build_future_thumb, daemon=True).start()
+                            btn.configure(text=label, state="normal", bg=FUTURE_COLOR,
+                                          image=fentry["thumb"] or "")
                         self._carousel_slot_map[i] = ("future", fi)
                     if not btn.winfo_ismapped():
                         btn.pack(**self._carousel_slot_pack_opts)
@@ -2064,6 +2283,8 @@ class App:
         return ordered
 
     def _write_tags(self, image_id: int, tags: set, hidden: Optional[int] = None) -> None:
+        if image_id < 0:
+            return
         ordered = self._ordered_tags(tags)
         payload = json.dumps(ordered, ensure_ascii=False)
         if hidden is None:
@@ -2093,7 +2314,7 @@ class App:
 
     def _on_tag_change(self, side: str) -> None:
         row = self._side[side].get("row")
-        if not row:
+        if not row or row[0] < 0:
             return
         tag_vars = self._side[side].get("tag_vars", {})
         tags = {tag for tag, var in tag_vars.items() if var.get()}
@@ -2198,6 +2419,8 @@ class App:
                 except Exception:
                     has_audio = False
             else:
+                # ffprobe not available — fall back to parsing ffmpeg's info banner.
+                # Imprecise: "audio:" appears in unrelated output lines; ffprobe is preferred.
                 cmd = [ffmpeg, "-hide_banner", "-i", path]
                 try:
                     r = subprocess.run(
@@ -2245,7 +2468,7 @@ class App:
                 data = json.loads(sidecar_path.read_text(encoding="utf-8"))
             except Exception:
                 data = {}
-        data["audio"] = "Y" if has_audio else "N"
+        data["audio"] = bool(has_audio)
         try:
             sidecar_path.write_text(
                 json.dumps(data, ensure_ascii=False, indent=2),
@@ -2331,11 +2554,48 @@ class App:
             SELECT id, path, folder, duels, wins, losses, score, hidden, tags
             FROM images
         """))
+        if self._missing_ids:
+            rows = [r for r in rows if r[0] not in self._missing_ids]
         random.shuffle(rows)
         if self.pool_filter_var.get() == "Videos (audio)":
             return self._pool_rows_videos_with_audio(rows)
         rows = [r for r in rows if self._row_matches_filter(r)]
         return rows
+
+    def _start_missing_scan(self) -> None:
+        """Spawn a daemon thread that audits the DB for files missing from disk and applies
+        the result on the main thread. Uses its own sqlite connection (see audit_file_availability)."""
+        def worker():
+            try:
+                missing = audit_file_availability(DB_PATH)
+            except Exception as ex:
+                print(f"[audit] missing-file scan failed: {ex}")
+                return
+            self.root.after(0, lambda: self._apply_missing_scan(missing))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_missing_scan(self, missing_ids: set) -> None:
+        """Main-thread: record missing ids and purge them from the live duel / future queue
+        so a row whose file is already gone never lingers on screen or in the pre-roll."""
+        self._missing_ids = set(missing_ids)
+        if not missing_ids:
+            return
+        # Drop any pre-rolled future duels that reference a now-known-missing file.
+        self.future_queue = [
+            fe for fe in self.future_queue
+            if fe["a"][0] not in missing_ids and (fe["b"] is None or fe["b"][0] not in missing_ids)
+        ]
+        # If the LIVE duel itself references a missing file, roll a fresh one. (Leave
+        # history/edit mode alone — past duels are fixed, and the load will show a notice.)
+        if self.history_index is None and self.current:
+            a, b = self.current
+            if (a[0] >= 0 and a[0] in missing_ids) or (b[0] >= 0 and b[0] in missing_ids):
+                self._stop_video("a")
+                self._stop_video("b")
+                self.load_duel()
+                return
+        self._fill_future_queue()
+        self._update_carousel()
 
     def on_pool_filter_change(self):
         self.pool_filter.configure(text=self.pool_filter_var.get())
@@ -2378,14 +2638,21 @@ class App:
                 changed = True
 
         if not a or not b:
+            self.future_queue = []
             self.load_duel()
             return
 
         if changed:
+            if self.solo_mode and b and b[0] >= 0:
+                self.solo_mode = False
             self._set_current(a, b)
+            self.live_current = self.current
             self._render_side("a")
             self._render_side("b")
+        self.future_queue = []
+        self._fill_future_queue()
         self.update_sidebar()
+        self._update_carousel()
 
     # -------------------- future queue --------------------
     def _fill_future_queue(self, target: Optional[int] = None) -> None:
@@ -2395,10 +2662,11 @@ class App:
         # IDs already committed to (live current + existing future entries)
         used_ids: set = set()
         if self.live_current:
-            used_ids.update(r[0] for r in self.live_current)
+            used_ids.update(r[0] for r in self.live_current if r[0] >= 0)
         for fe in self.future_queue:
             used_ids.add(fe["a"][0])
-            used_ids.add(fe["b"][0])
+            if fe["b"] is not None:
+                used_ids.add(fe["b"][0])
         attempts = 0
         while len(self.future_queue) < target and attempts < target * 6:
             attempts += 1
@@ -2419,6 +2687,11 @@ class App:
         # Discard everything up to and including fi; the skipped pairs get no Elo change
         self.future_queue = self.future_queue[fi + 1:]
         a, b = fentry["a"], fentry["b"]
+        if b is None:
+            self.solo_mode = True
+            b = _NO_OPPONENT
+        else:
+            self.solo_mode = False
         self._set_current(a, b)
         self.live_current = self.current
         self._stop_video("a")
@@ -2500,20 +2773,34 @@ class App:
             a, b = fentry["a"], fentry["b"]
         else:
             a, b = self.pick_two()
-        if not a or not b:
+        if not a:
             messagebox.showerror("No images", "Not enough items in the selected pool (need at least 2).")
             self.quit()
             return
+        if b is None:
+            # Solo duel: no opponent exists in this tag group
+            self.solo_mode = True
+            b = _NO_OPPONENT
+        elif not b:
+            messagebox.showerror("No images", "Not enough items in the selected pool (need at least 2).")
+            self.quit()
+            return
+        else:
+            self.solo_mode = False
 
         self._set_current(a, b)
         self.live_current = self.current
         self._update_info_bars(a, b)
         self.prev_artists.appendleft(a[2])
-        self.prev_artists.appendleft(b[2])
+        if b[0] >= 0:
+            self.prev_artists.appendleft(b[2])
 
         print("[duel] showing:")
         print(f"  LEFT:  {a[1]} (score={a[6]:.2f}, duels={a[3]}, W={a[4]}, L={a[5]})")
-        print(f"  RIGHT: {b[1]} (score={b[6]:.2f}, duels={b[3]}, W={b[4]}, L={b[5]})")
+        if b[0] >= 0:
+            print(f"  RIGHT: {b[1]} (score={b[6]:.2f}, duels={b[3]}, W={b[4]}, L={b[5]})")
+        else:
+            print("  RIGHT: (no opponent — solo duel)")
 
         self._render_side("a")
         self._render_side("b")
@@ -2525,6 +2812,13 @@ class App:
         if not self._window_was_focused:
             return
         if not self.current:
+            return
+        if self.solo_mode:
+            # No opponent — any click just advances to the next duel with no scoring
+            self.solo_mode = False
+            self._stop_video("a")
+            self._stop_video("b")
+            self.load_duel()
             return
         # snapshot ranks for delta arrows
         prev_ranks = {r["folder"]: r["rank"] for r in folder_leaderboard(self.conn, metric=self.metric)}
@@ -2572,7 +2866,7 @@ class App:
         2. Roll an opponent for the tagged image matched to its new tag group.
         3. Insert that new duel at the front of future_queue (plays next).
         """
-        if not self.current:
+        if not self.current or self.solo_mode:
             return
         a, b = self.current
         other = b if side == "a" else a
@@ -2594,6 +2888,17 @@ class App:
             required_tags=frozenset(self._tags_for_row(tagged_row)),
         )
 
+        if sub_opponent:
+            if side == "a":
+                sub_entry = {"a": tagged_row, "b": sub_opponent, "thumb": None}
+            else:
+                sub_entry = {"a": sub_opponent, "b": tagged_row, "thumb": None}
+        else:
+            # no opponent in the new tag group — queue a solo placeholder so the
+            # user can see and skip the image rather than it silently disappearing
+            sub_entry = {"a": tagged_row, "b": None, "thumb": None}
+        self.future_queue.insert(0, sub_entry)
+
         if replacement:
             self._side[side]["last_replaced_row"] = a if side == "a" else b
             if side == "a":
@@ -2607,17 +2912,10 @@ class App:
             self.load_duel()
             return
 
-        if sub_opponent:
-            if side == "a":
-                sub_entry = {"a": tagged_row, "b": sub_opponent, "thumb": None}
-            else:
-                sub_entry = {"a": sub_opponent, "b": tagged_row, "thumb": None}
-            self.future_queue.insert(0, sub_entry)
-
         self._update_carousel()
 
     def _replace_side_keep_other(self, side: str) -> None:
-        if not self.current:
+        if not self.current or self.solo_mode:
             return
         a, b = self.current
         outgoing = a if side == "a" else b
@@ -2644,8 +2942,27 @@ class App:
         self._render_side(side)
         self.update_sidebar()
 
+    def _handle_missing_side(self, side: str, source_path: str) -> None:
+        """A media file failed to open because it's gone from disk. Mark its DB id so the
+        picker skips it from now on; in live mode auto-swap the slot for a fresh pick so the
+        user isn't stranded on a 'Failed to load' panel. In history/edit mode (or solo) the
+        view is fixed, so just leave a short notice."""
+        st = self._side[side]
+        row = st.get("row")
+        if row and row[0] >= 0:
+            self._missing_ids.add(row[0])
+        if self.history_index is None and not self.solo_mode and self.current:
+            print(f"[load] auto-skipping missing file ({side}): {source_path}")
+            self._replace_side_keep_other(side)
+        else:
+            widget = self.left_panel if side == "a" else self.right_panel
+            widget.configure(
+                text=f"File not found:\n{source_path}\n\n(removed from rotation)",
+                image="", fg=TEXT_COLOR, bg=DARK_PANEL,
+            )
+
     def downvote_side(self, side: str) -> None:
-        if not self.current:
+        if not self.current or self.solo_mode:
             return
         a, b = self.current
         target = a if side == "a" else b
@@ -2663,7 +2980,7 @@ class App:
         self._replace_side_keep_other(side)
 
     def undo_side_tag_hide(self, side: str) -> None:
-        if not self.current:
+        if not self.current or self.solo_mode:
             return
         candidate = self._side[side].get("last_replaced_row") or self._side[side].get("row")
         if not candidate:
@@ -2694,7 +3011,7 @@ class App:
         self.update_sidebar()
 
     def hide_side(self, side: str):
-        if not self.current:
+        if not self.current or self.solo_mode:
             return
         a, b = self.current
         target = a if side == "a" else b
@@ -2743,6 +3060,17 @@ class App:
             panel = self.right_panel
             container = self.right_container
             vframe = self.right_video
+
+        # Solo-duel placeholder: no opponent in this tag group
+        if row[0] < 0:
+            self._cancel_animation(side)
+            self._stop_video(side)
+            vframe.place_forget()
+            panel.place(relx=0, rely=0, relwidth=1, relheight=1)
+            panel.configure(image="", text="No match found\nin this tag group\n\nClick to skip",
+                            compound="center", font=("Segoe UI", 14), fg="#666666", bg=DARK_BG)
+            self._sync_tag_controls(side)
+            return
 
         # cancel gif animation
         self._cancel_animation(side)
@@ -2846,6 +3174,8 @@ class App:
             st2 = self._side[side]
             if st2.get("gif_render_token") != render_token:
                 return
+            print(f"[load] TIMEOUT after {LOAD_TIMEOUT_MS} ms ({side}): {path!r}")
+            print(f"[load]   file: {describe_file_state(path)}")
             self._show_load_timeout(side, path)
 
         st["load_timeout_job"] = self.root.after(LOAD_TIMEOUT_MS, on_timeout)
@@ -2874,23 +3204,45 @@ class App:
                     im.close()
                     result["animated"] = True
             except Exception as ex:
-                result["error"] = str(ex)
+                state = describe_file_state(source_path)
+                print(f"[load] FAILED ({side}): {source_path!r}")
+                print(f"[load]   error: {type(ex).__name__}: {ex}")
+                print(f"[load]   file:  {state}")
+                missing = isinstance(ex, FileNotFoundError) or state.startswith("MISSING")
+                if missing:
+                    result["missing"] = True
+                    result["error"] = (
+                        "File not found.\nIt may have been moved, deleted,\n"
+                        "or not yet downloaded (OneDrive)."
+                    )
+                else:
+                    # Genuine decode/corruption error — capture full stack for diagnosis.
+                    traceback.print_exc()
+                    result["error"] = f"{type(ex).__name__}: {ex}"
 
             def apply():
                 st2 = self._side[side]
                 if st2.get("gif_render_token") != expected_token:
                     return
-                self._dismiss_load_timeout(side)
                 if "error" in result:
-                    widget.configure(
-                        text=f"Failed to load:\n{source_path}\n\n{result['error']}",
-                        image="", fg=TEXT_COLOR, bg=DARK_PANEL,
-                    )
+                    self._dismiss_load_timeout(side)
+                    if result.get("missing"):
+                        # File is gone from disk — mark it so the picker skips it and, in
+                        # live mode, auto-swap this slot instead of stranding the user.
+                        self._handle_missing_side(side, source_path)
+                    else:
+                        widget.configure(
+                            text=f"Failed to load:\n{source_path}\n\n{result['error']}",
+                            image="", fg=TEXT_COLOR, bg=DARK_PANEL,
+                        )
                     return
                 if result.get("animated"):
+                    # Keep the load-timeout armed through GIF frame decode (the slow part);
+                    # _decode_gif_async dismisses it once frames are ready or on error.
                     widget.configure(text="Loading GIF…", image="", fg=TEXT_COLOR, bg=DARK_PANEL)
                     self._decode_gif_async(side, widget, source_path, size_target, blur_on, expected_token, w, h)
                     return
+                self._dismiss_load_timeout(side)
                 payload, payload_size, payload_mode = result["payload"]
                 img = Image.frombytes(payload_mode, payload_size, payload)
                 tk_im = ImageTk.PhotoImage(img)
@@ -2928,18 +3280,28 @@ class App:
                         frames_payload.append((fr.tobytes(), fr.size, fr.mode))
             except Exception as ex:
                 error = str(ex)
+                print(f"[gif] DECODE FAILED ({side}) after {len(frames_payload)} frame(s): {source_path!r}")
+                print(f"[gif]   error: {type(ex).__name__}: {ex}")
+                print(f"[gif]   file:  {describe_file_state(source_path)}")
+                traceback.print_exc()
 
             def apply_result():
                 st2 = self._side[side]
                 if st2.get("gif_render_token") != expected_token:
                     return
+                # Frames are ready (or failed) — clear the load-timeout/overlay armed by
+                # _render_image_or_gif, which we deliberately left running across the decode.
+                self._dismiss_load_timeout(side)
                 if error:
                     widget.configure(text=f"Failed to load:\n{source_path}\n\n{error}", fg=TEXT_COLOR, bg=DARK_PANEL)
                     return
                 if not frames_payload:
+                    print(f"[gif] NO FRAMES decoded ({side}): {source_path!r}")
+                    print(f"[gif]   file: {describe_file_state(source_path)}")
                     widget.configure(text=f"Failed to load:\n{source_path}\n\nNo GIF frames available.", fg=TEXT_COLOR, bg=DARK_PANEL)
                     return
 
+                print(f"[gif] decoded {len(frames_payload)} frame(s) ({side}): {source_path}")
                 frames: List[ImageTk.PhotoImage] = []
                 for payload, payload_size, payload_mode in frames_payload:
                     img = Image.frombytes(payload_mode, payload_size, payload)
@@ -3338,8 +3700,10 @@ class App:
         st.setdefault("waveform_src", None)    # PIL image source (unscaled)
         st.setdefault("waveform_img_size", None)  # (w,h) of current PhotoImage
         st.setdefault("waveform_status", "")      # "", "loading", "no-audio", "error"
-        st.setdefault("waveform_key", None)    # cache key
-        st.setdefault("waveform_job", None)    # background thread guard
+        st.setdefault("waveform_key", None)        # cache key
+        st.setdefault("waveform_job", None)        # background thread guard
+        st.setdefault("waveform_job_key", None)    # key the running job was launched for
+        st.setdefault("waveform_resize_job", None) # after() id for debounced resize redraws
         st.setdefault("pending_seek_frac", None)
 
         # Hover show/hide
@@ -3364,7 +3728,7 @@ class App:
         wave.bind("<ButtonRelease-1>", lambda e: self._wave_release(side, e))
         wave.bind("<Motion>", lambda e: self._wave_motion(side, e))
         wave.bind("<Leave>", lambda e: self._hide_wave_tooltip())
-        wave.bind("<Configure>", lambda e: self._redraw_waveform(side))
+        wave.bind("<Configure>", lambda e: self._redraw_waveform_debounced(side))
 
         # Speed changes
         speed_box.bind("<<ComboboxSelected>>", lambda e: self.set_speed_from_ui(side))
@@ -3631,21 +3995,52 @@ class App:
 
     # -------------------- waveform + scrub canvas --------------------
     def _ffmpeg_exe(self) -> Optional[str]:
-        # Try imageio-ffmpeg first (recommended), fallback to PATH.
+        if self._ffmpeg_exe_cache is not None:
+            return self._ffmpeg_exe_cache.get("path")
+        result: Optional[str] = None
         try:
             import imageio_ffmpeg
             exe = imageio_ffmpeg.get_ffmpeg_exe()
             if exe and os.path.exists(exe):
-                return exe
+                result = exe
         except Exception:
             pass
+        if result is None:
+            try:
+                exe = shutil.which("ffmpeg")
+                if exe:
+                    result = exe
+            except Exception:
+                pass
+        self._ffmpeg_exe_cache = {"path": result}
+        return result
+
+    def _cleanup_waveform_cache(self):
         try:
-            exe = shutil.which("ffmpeg")
-            if exe:
-                return exe
+            out_dir = Path(tempfile.gettempdir()) / "image_duel_ranker_waveforms"
+            if not out_dir.exists():
+                return
+            stamp = out_dir / "cache_v4.stamp"
+            if not stamp.exists():
+                # One-time wipe: old PNGs were generated with a broken ffmpeg command
+                # and a broken blank-detection heuristic; none should be trusted.
+                for f in out_dir.glob("wave_*.png"):
+                    try:
+                        f.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                stamp.touch()
+            else:
+                # Ongoing: evict PNGs older than 7 days.
+                cutoff = time.time() - 7 * 86400
+                for f in out_dir.glob("wave_*.png"):
+                    try:
+                        if f.stat().st_mtime < cutoff:
+                            f.unlink(missing_ok=True)
+                    except Exception:
+                        pass
         except Exception:
             pass
-        return None
 
     def _maybe_request_waveform(self, side: str):
         st = self._side[side]
@@ -3675,8 +4070,15 @@ class App:
         st["waveform_img_size"] = None
         st["waveform_status"] = "loading"
 
-        # Avoid duplicate jobs
-        if st.get("waveform_job") is not None:
+        # Clean up stale cached PNGs once per session (runs on a background thread).
+        if not self._waveform_cache_cleaned:
+            self._waveform_cache_cleaned = True
+            threading.Thread(target=self._cleanup_waveform_cache, daemon=True).start()
+
+        # Only skip if the running job is already working on this exact key.
+        # If the key changed (new media), fall through and start a new thread; the old
+        # thread self-aborts in its done() callback when it sees waveform_key != its key.
+        if st.get("waveform_job") is not None and st.get("waveform_job_key") == key:
             return
 
         exe = self._ffmpeg_exe()
@@ -3685,6 +4087,7 @@ class App:
 
         t = threading.Thread(target=self._waveform_worker, args=(side, path, key, exe), daemon=True)
         st["waveform_job"] = t
+        st["waveform_job_key"] = key
         t.start()
 
     def _waveform_worker(self, side: str, path: str, key: str, exe: str):
@@ -3694,15 +4097,30 @@ class App:
             h = hashlib.md5(key.encode("utf-8")).hexdigest()
             out_png = out_dir / f"wave_{h}.png"
 
+            r = None
+            name = Path(path).name
             if not out_png.exists():
+                # [0:a] explicitly routes the first audio stream into showwavespic.
+                # Without it, ffmpeg can't always auto-connect for video container inputs
+                # and may silently write a blank PNG.
                 cmd = [
                     exe, "-hide_banner", "-loglevel", "error",
                     "-i", path,
-                    "-filter_complex", "showwavespic=s=800x60:split_channels=0",
+                    "-filter_complex", "[0:a]showwavespic=s=800x200:split_channels=0:scale=cbrt:draw=full[v]",
+                    "-map", "[v]",
                     "-frames:v", "1",
                     "-y", str(out_png)
                 ]
                 r = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                print(f"[waveform] {name}: rc={r.returncode} png={out_png.exists()}")
+                if r.stderr.strip():
+                    print(f"[waveform] {name}: stderr={r.stderr.strip()[:300]}")
+                # If ffmpeg returned non-zero, delete any partial output so it isn't cached.
+                if r.returncode != 0 and out_png.exists():
+                    try:
+                        out_png.unlink()
+                    except Exception:
+                        pass
 
             # If ffmpeg failed (commonly: no audio stream), we still proceed and show a placeholder.
             if not out_png.exists():
@@ -3715,33 +4133,35 @@ class App:
                         status = "no-audio"
                 except Exception:
                     pass
+                print(f"[waveform] {name}: no png → status={status}")
             else:
                 img = Image.open(str(out_png)).convert("RGBA")
                 status = ""
-                # Detect "blank" waveforms and tint for visibility on dark UI.
+                # Blank-detection: showwavespic draws white waveform on black background, so
+                # the max pixel value should be near 255 for any video with real audio.
+                # Only treat as blank if the max is essentially zero (truly no waveform drawn).
+                # NOTE: do NOT use p95 here — for a normal waveform <95% of pixels are
+                # non-black, so the 95th-percentile value is always 0 regardless of audio.
                 try:
                     gray = img.convert("L")
                     mx = int(gray.getextrema()[1] or 0)
-                    hist = gray.histogram()
-                    total = sum(hist) or 1
-                    cutoff = int(total * 0.95)
-                    acc = 0
-                    p95 = 0
-                    for i, count in enumerate(hist):
-                        acc += count
-                        if acc >= cutoff:
-                            p95 = i
-                            break
-                    if mx < 8 or p95 < 8:
+                    print(f"[waveform] {name}: png loaded, max_pixel={mx}")
+                    if mx < 8:
+                        # Truly blank — evict from cache so next load retries ffmpeg.
+                        try:
+                            out_png.unlink(missing_ok=True)
+                        except Exception:
+                            pass
                         img = None
                         status = "no-audio"
+                        print(f"[waveform] {name}: blank png evicted")
                     else:
                         hx = ACCENT.lstrip("#")
                         if len(hx) == 3:
                             hx = "".join([c*2 for c in hx])
                         r0, g0, b0 = int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16)
-                        noise_floor = max(10, int(p95 * 0.25))
-                        alpha = gray.point(lambda p: 0 if p <= noise_floor else min(255, int((p - noise_floor) * 5)))
+                        noise_floor = 4   # suppress near-black background pixels
+                        alpha = gray.point(lambda p: 0 if p <= noise_floor else min(255, int((p - noise_floor) * 3)))
                         # Thicken + smooth for better readability at small UI heights.
                         try:
                             alpha = alpha.filter(ImageFilter.MaxFilter(5))
@@ -3775,13 +4195,14 @@ class App:
                 if not ui:
                     return
 
-                                # Store source image; scale on-demand in _redraw_waveform
+                # Store source image; scale on-demand in _redraw_waveform
                 st["waveform_src"] = img
                 st["waveform_img"] = None
                 st["waveform_img_size"] = None
                 st["waveform_ready"] = True
                 st["waveform_status"] = status
                 st["waveform_job"] = None
+                st["waveform_job_key"] = None
                 self._redraw_waveform(side)
 
             self.root.after(0, done)
@@ -3790,10 +4211,21 @@ class App:
                 st = self._side.get(side)
                 if st:
                     st["waveform_job"] = None
+                    st["waveform_job_key"] = None
             try:
                 self.root.after(0, clear)
             except Exception:
                 pass
+
+    def _redraw_waveform_debounced(self, side: str):
+        st = self._side[side]
+        job = st.get("waveform_resize_job")
+        if job:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+        st["waveform_resize_job"] = self.root.after(40, lambda: self._redraw_waveform(side))
 
     def _redraw_waveform(self, side: str):
         st = self._side[side]
@@ -4001,7 +4433,7 @@ class App:
         return {
             "avg": "Simple Avg",
             "shrunken_avg": f"Shrunken Avg (prior={FOLDER_PRIOR_IMAGES})",
-            "dislikes_adjusted": f"Shrunken Avg - dislikes×{DISLIKES_PER_FILE_PENALTY:g}",
+            "dislikes_adjusted": f"Shrunken Avg + volume − dislike rate",
             "lcb": f"Lower Conf. Bound (z={LCB_Z})"
         }.get(key, key)
 
@@ -4029,6 +4461,21 @@ class App:
         self.page = (self.page + delta) % total_pages
         self.update_sidebar()
 
+    def toggle_sparklines(self):
+        self.sparkline_enabled = not self.sparkline_enabled
+        if self.sparkline_enabled:
+            self.spark_toggle_btn.configure(text="Sparklines: On", fg=ACCENT)
+        else:
+            self.spark_toggle_btn.configure(text="Sparklines: Off", fg=INFO_BAR_FG)
+        self.update_sidebar()
+
+    def cycle_sparkline_window(self):
+        idx = list(SPARKLINE_WINDOWS).index(self.sparkline_window) if self.sparkline_window in SPARKLINE_WINDOWS else 0
+        self.sparkline_window = SPARKLINE_WINDOWS[(idx + 1) % len(SPARKLINE_WINDOWS)]
+        self.spark_window_btn.configure(text=f"W: {self.sparkline_window}")
+        if self.sparkline_enabled:
+            self.update_sidebar()
+
     def _format_delta(self, folder: str, leader: List[dict]) -> str:
         old = self._last_ranks.get(folder)
         now, _, _, _ = find_folder_rank(leader, folder)
@@ -4043,7 +4490,8 @@ class App:
         if not self.current:
             return
         a, b = self.current
-        folder_left, folder_right = a[2], b[2]
+        folder_left = a[2]
+        folder_right = b[2] if b[0] >= 0 else None
 
         leader = folder_leaderboard(self.conn, metric=self.metric)
         total = len(leader)
@@ -4059,11 +4507,43 @@ class App:
         def trunc(name: str) -> str:
             return name if len(name) <= LEAF_MAX else (name[:LEAF_MAX - 1] + "…")
 
+        # Build display list — pin off-page current artists to top or bottom based on their rank
+        _vis         = int(self.board.cget('height'))  # visible row count in board widget
+        page_rows    = list(leader[start:end])
+        page_folders = {r["folder"] for r in page_rows}
+        pin_left  = folder_left  is not None and folder_left  not in page_folders
+        pin_right = folder_right is not None and folder_right not in page_folders
+        page_top_rank = page_rows[0]["rank"] if page_rows else 0
+
+        display_rows = list(page_rows)
+        if display_rows:
+            last_vis = min(len(display_rows) - 1, _vis - 1)
+            pins = []
+            for folder, do_pin in ((folder_left, pin_left), (folder_right, pin_right)):
+                if do_pin:
+                    row = next((r for r in leader if r["folder"] == folder), None)
+                    if row:
+                        pins.append(row)
+            # Above-page artists: better rank first → slots 0, 1, …
+            above = sorted([r for r in pins if r["rank"] < page_top_rank], key=lambda r: r["rank"])
+            for i, row in enumerate(above):
+                if i <= last_vis:
+                    display_rows[i] = row
+            # Below-page artists: worse rank last → slots last_vis, last_vis-1, …
+            below = sorted([r for r in pins if r["rank"] >= page_top_rank], key=lambda r: r["rank"], reverse=True)
+            for i, row in enumerate(below):
+                ri = last_vis - i
+                if ri >= 0:
+                    display_rows[ri] = row
+
         lines = []
         deltas: List[Tuple[int, str]] = []
-        for idx, row in enumerate(leader[start:end]):
+        spark_info: List[Optional[Tuple[int, List[str]]]] = []  # (col_start, per-char tags)
+
+        # First pass: collect raw values so we can compute per-column max widths
+        row_parts = []
+        for idx, row in enumerate(display_rows):
             leaf = trunc(Path(row["folder"]).name)
-            marker = "  ◀" if row["folder"] in {folder_left, folder_right} else ""
             old_rank = self._last_ranks.get(row["folder"])
             if old_rank is None:
                 ticker, ticker_tag = "▲", "delta_new"
@@ -4075,19 +4555,53 @@ class App:
                     ticker, ticker_tag = "▼", "delta_down"
                 else:
                     ticker, ticker_tag = "•", "delta_flat"
+            row_parts.append((idx, row, ticker, ticker_tag, leaf))
+
+        def _col_w(p): return len(str(p[1].get("wins", 0)))
+        def _col_l(p): return len(str(p[1].get("losses", 0)))
+        def _col_d(p): return len(str(p[1].get("dislikes_n", 0)))
+        def _col_n(p): return len(str(p[1]["n"]))
+        mw    = max((_col_w(p) for p in row_parts), default=1)
+        ml    = max((_col_l(p) for p in row_parts), default=1)
+        md    = max((_col_d(p) for p in row_parts), default=1)
+        mn    = max((_col_n(p) for p in row_parts), default=1)
+        mleaf = max((len(p[4]) for p in row_parts), default=1)
+
+        # Second pass: build lines with per-column aligned stats
+        highlight_lines: List[Tuple[int, str]] = []  # (line_idx, tag)
+        for (idx, row, ticker, ticker_tag, leaf) in row_parts:
             if self.metric == "avg":
-                line = f"{ticker} {row['rank']:>3}. {leaf:<{LEAF_MAX}} {row['avg']:6.1f}  (n={row['n']}){marker}"
-            elif self.metric == "dislikes_adjusted":
-                line = (
-                    f"{ticker} {row['rank']:>3}. {leaf:<{LEAF_MAX}} {row['score']:6.1f}  "
-                    f"avg={row['avg']:5.1f} d={row.get('dislikes_n', 0)} (n={row['n']}){marker}"
-                )
-            elif self.metric == "shrunken_avg":
-                line = f"{ticker} {row['rank']:>3}. {leaf:<{LEAF_MAX}} {row['score']:6.1f}  avg={row['avg']:5.1f} (n={row['n']}){marker}"
+                pre = f"{ticker} {row['rank']:>3}. {leaf:<{mleaf}} {row['avg']:6.1f}  "
             else:
-                line = f"{ticker} {row['rank']:>3}. {leaf:<{LEAF_MAX}} {row['score']:6.1f}  avg={row['avg']:5.1f} (n={row['n']}){marker}"
+                pre = f"{ticker} {row['rank']:>3}. {leaf:<{mleaf}} {row['score']:6.1f}  "
+            w  = str(row.get("wins",       0))
+            lo = str(row.get("losses",     0))
+            d  = str(row.get("dislikes_n", 0))
+            n  = str(row["n"])
+            if self.metric == "dislikes_adjusted":
+                stats = f"▲={w:<{mw}} ▼={lo:<{ml}} d={d:<{md}} n={n:<{mn}}"
+            else:
+                stats = f"▲={w:<{mw}} ▼={lo:<{ml}} n={n:<{mn}}"
+            if self.sparkline_enabled:
+                rates = folder_sparkline(self.conn, row["folder"], window=self.sparkline_window)
+                if rates:
+                    spark_str = render_sparkline(rates)
+                    stags     = [_spark_tag_for_rate(r) for r in rates]
+                else:
+                    spark_str = "·" * SPARKLINE_BUCKETS
+                    stags     = ["spark_none"] * SPARKLINE_BUCKETS
+                col_start = len(pre) + len(stats) + 1
+                line = pre + stats + " " + spark_str
+                spark_info.append((col_start, stags))
+            else:
+                line = pre + stats
+                spark_info.append(None)
             lines.append(line)
             deltas.append((idx, ticker_tag))
+            if row["folder"] == folder_left:
+                highlight_lines.append((idx, "hl_left"))
+            elif row["folder"] == folder_right:
+                highlight_lines.append((idx, "hl_right"))
 
         self.board.configure(state="normal")
         self.board.delete("1.0", "end")
@@ -4095,6 +4609,15 @@ class App:
             self.board.insert("1.0", "\n".join(lines))
             for row_idx, tag in deltas:
                 self.board.tag_add(tag, f"{row_idx + 1}.0", f"{row_idx + 1}.1")
+            for row_idx, si in enumerate(spark_info):
+                if si is not None:
+                    col_start, stags = si
+                    for ci, stag in enumerate(stags):
+                        self.board.tag_add(stag,
+                            f"{row_idx + 1}.{col_start + ci}",
+                            f"{row_idx + 1}.{col_start + ci + 1}")
+            for line_idx, hl_tag in highlight_lines:
+                self.board.tag_add(hl_tag, f"{line_idx + 1}.0", f"{line_idx + 1}.end")
         else:
             self.board.insert("1.0", "No folders yet.")
         self.board.configure(state="disabled")
@@ -4150,6 +4673,8 @@ class App:
     def _update_info_bars(self, a: tuple, b: tuple):
         """Populate the top overlay info bars for left/right panels."""
         def fmt(row: tuple) -> str:
+            if row and row[0] < 0:
+                return "(no opponent in this tag group)"
             folder = Path(row[2]).name if row and len(row) > 2 else "(unknown)"
             p = Path(row[1]) if row and len(row) > 1 else Path("")
             ext = p.suffix.lower().lstrip(".")
@@ -4165,31 +4690,11 @@ class App:
             pass
 
     def _counters_block(self, a: tuple, b: tuple) -> str:
-        # per-image
         def img_line(prefix: str, row: tuple) -> str:
-            return (f"{prefix}: duels={row[3]:>4}  W={row[4]:>4}  L={row[5]:>4}  score={row[6]:7.2f}")
-
-        # per-artist
-        def artist_totals(folder: str) -> Tuple[int, int, int, int]:
-            # (images, shown, wins, losses)
-            res = self.conn.execute("""
-                SELECT COUNT(*), COALESCE(SUM(duels),0), COALESCE(SUM(wins),0), COALESCE(SUM(losses),0)
-                FROM images WHERE folder=?
-            """, (folder,)).fetchone()
-            imgs, shown, w, l = (int(res[0]), int(res[1]), int(res[2]), int(res[3])) if res else (0, 0, 0, 0)
-            return imgs, shown, w, l
-
-        la = Path(a[2]).name
-        ra = Path(b[2]).name
-        la_imgs, la_shown, la_w, la_l = artist_totals(a[2])
-        ra_imgs, ra_shown, ra_w, ra_l = artist_totals(b[2])
-
-        return "\n".join([
-            img_line("LeftImg ", a),
-            img_line("RightImg", b),
-            f"LeftArt : {la}  imgs={la_imgs}  shown={la_shown}  decisions={la_w+la_l}  W={la_w} L={la_l}",
-            f"RightArt: {ra}  imgs={ra_imgs}  shown={ra_shown}  decisions={ra_w+ra_l}  W={ra_w} L={ra_l}",
-        ])
+            return f"{prefix}: duels={row[3]:>4}  W={row[4]:>4}  L={row[5]:>4}  score={row[6]:7.2f}"
+        if b[0] < 0:
+            return f"{img_line('Left ', a)}\nRight: (no opponent)"
+        return "\n".join([img_line("Left ", a), img_line("Right", b)])
 
     def _keybind_text(self) -> str:
         return "\n".join([

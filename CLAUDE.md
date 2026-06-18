@@ -16,6 +16,11 @@
 | `carousel_size` | 6 slots |
 | `ACCENT` / `PENDING_COLOR` / `FUTURE_COLOR` | blue / amber / dark-teal |
 | `LOAD_TIMEOUT_MS` | 8000 — ms before showing Retry/Open-File overlay on a slow load |
+| `DISLIKE_RATE_PENALTY` | 300.0 — multiplied by `dislikes_n / (n + FOLDER_PRIOR_IMAGES)`; rate-based dislike penalty |
+| `VOLUME_BONUS` | 50.0 — max bonus for large like-count; scaled by `n/(n+FOLDER_PRIOR_IMAGES)` |
+| `SPARKLINE_WINDOW_DEFAULT` | 60 — default rolling comparisons window for sparklines |
+| `SPARKLINE_WINDOWS` | `(20, 40, 60, 100, 200)` — cycle targets for "W: N" button |
+| `SPARKLINE_BUCKETS` | 7 — number of segments per sparkline |
 
 ## DB schema
 ```
@@ -31,6 +36,7 @@ self.live_current     # (row_a, row_b) of the active live duel (preserved during
 self.duel_history     # List[dict] — past voted duels
 self.history_index    # None = live mode; int = edit/history mode
 self.future_queue     # List[{"a":row,"b":row,"thumb":None}] — pre-rolled upcoming duels
+self._missing_ids     # set[int] — image ids whose file is gone from disk; excluded by _pool_rows
 ```
 
 ## duel_history entry shape
@@ -72,8 +78,21 @@ self.future_queue     # List[{"a":row,"b":row,"thumb":None}] — pre-rolled upco
 | `choose` | 2136 | Vote handler — edit mode: _apply_revote or record_result; live: record + load_duel |
 | `_dismiss_load_timeout` | 2628 | Cancels pending timeout job + destroys overlay for a side |
 | `_show_load_timeout` | 2643 | Creates centered overlay on container with Retry + Open-File buttons |
-| `_render_image_or_gif` | 2671 | Async image/GIF render — shows "Loading…", starts load_worker thread, schedules 8 s timeout |
-| `_decode_gif_async` | 2751 | Spawns decode_worker thread for GIF frame extraction |
+| `_render_image_or_gif` | 3157 | Async image/GIF render — shows "Loading…", starts load_worker thread, schedules 8 s timeout. Timeout now stays armed **through** GIF frame decode (dismissed in `_decode_gif_async`). On a missing-file open error calls `_handle_missing_side` instead of just printing "Failed to load" |
+| `_decode_gif_async` | 3261 | Spawns decode_worker thread for GIF frame extraction; `apply_result` dismisses the load-timeout left armed by `_render_image_or_gif` |
+| `_pool_rows` | 2552 | Builds the duel pool from DB; **excludes `self._missing_ids`** so deleted/moved files are never picked; applies pool filter |
+| `_start_missing_scan` | 2565 | Daemon-thread launcher: runs `audit_file_availability(DB_PATH)`, posts result to `_apply_missing_scan` via root.after. Called at end of `__init__` |
+| `_apply_missing_scan` | 2577 | Main-thread: sets `self._missing_ids`, purges missing-referencing entries from `future_queue`, reloads the live duel if it references a missing file |
+| `_handle_missing_side` | 2945 | Render-time miss: adds the row id to `_missing_ids`; live mode → `_replace_side_keep_other` (auto-skip); history/solo → shows "File not found (removed from rotation)" |
+| `_ffmpeg_exe` | 3795 | Returns ffmpeg path (cached after first call) via imageio-ffmpeg or PATH |
+| `_cleanup_waveform_cache` | 3816 | Removes wave PNGs older than 7 days from temp dir; runs once per session on background thread |
+| `_maybe_request_waveform` | 3831 | Launches background waveform generation for current media; guards against duplicate jobs per key |
+| `_waveform_worker` | 3879 | ffmpeg showwavespic → tinted PIL image; posts result back via root.after |
+| `_redraw_waveform_debounced` | 3992 | Debounces `_redraw_waveform` calls (40 ms) to prevent main-thread thrash on window resize |
+| `_redraw_waveform` | 4002 | Scales waveform source image to canvas size and draws playhead |
+| `_update_playhead` | 4043 | Draws YouTube-style progress track + playhead line on the wave canvas |
+| `toggle_sparklines` | ~4230 | Toggles sparkline mode on/off, updates button label/color, refreshes sidebar |
+| `cycle_sparkline_window` | ~4238 | Cycles sparkline_window through SPARKLINE_WINDOWS; refreshes sidebar if sparklines on |
 
 ## Carousel slot map encoding
 `_carousel_slot_map[i]` stores:
@@ -101,13 +120,40 @@ Carousel highlights sub-duel amber until voted. View stays on parent duel.
 - Thumbnail builds: daemon thread → `root.after(0, _update_carousel)` on completion
 - Video snapshot polling: daemon thread
 - GIF decode: daemon thread via `_decode_gif_async`
-- Static image open+thumbnail: daemon thread via `load_worker` inside `_render_image_or_gif`; 8 s timeout shows Retry/Open-File overlay
+- Static image open+thumbnail: daemon thread via `load_worker` inside `_render_image_or_gif`; 8 s timeout shows Retry/Open-File overlay (timeout now spans GIF frame decode too)
+- Missing-file scan: daemon thread via `_start_missing_scan` → `audit_file_availability` → `root.after(0, _apply_missing_scan)`
+
+## Diagnostics & logging (load/file-not-found troubleshooting)
+- **`describe_file_state(path)`** (module-level, ~line 185): OneDrive-aware probe. Uses
+  `os.stat` (metadata only — never hydrates a placeholder) to return `present (local)`,
+  `ONLINE-ONLY (OneDrive placeholder…)`, `offline`, or `MISSING`. Reused by all the log sites.
+- **`audit_file_availability(db_path)`** (module-level, ~line 213): one-shot audit launched on a
+  daemon thread by the App's `_start_missing_scan` (own sqlite connection — App conn is
+  main-thread-bound). Reads all non-hidden `(id, path)`, classifies each, prints an `[audit]`
+  summary (local / online-only / MISSING / stat-error counts + example paths), and **returns the
+  set of MISSING image ids** (fed into `self._missing_ids`). Safe to call standalone:
+  `python -c "import image_duel_ranker as m; m.audit_file_availability(m.DB_PATH)"`.
+- **Missing-file skipping**: `_pool_rows` excludes `self._missing_ids` so dead rows never reach a
+  duel; `_start_missing_scan`/`_apply_missing_scan` populate it at startup; `_handle_missing_side`
+  adds to it lazily when a file fails to open at render time (and auto-skips in live mode).
+  Nothing is deleted from the DB — rows persist and re-resolve if the file reappears.
+- **OneDrive flag constants** (~line 180): `_FILE_ATTRIBUTE_OFFLINE` 0x1000,
+  `_FILE_ATTRIBUTE_RECALL_ON_OPEN` 0x40000, `_FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS` 0x400000.
+- **Console log tags**: `[load]` (static-image open failure + timeout, in `_render_image_or_gif`),
+  `[gif]` (decode failure / no-frames / success-frame-count, in `_decode_gif_async`),
+  `[thumb]` (carousel thumbnail failure, in `_make_thumb_image`), `[audit]` (startup audit).
+  Each failure line prints the path, `type(ex).__name__: ex`, and the `describe_file_state` result.
+- **Known finding**: "files not found" / failed loads are dominated by **stale DB rows** whose
+  files were deleted/moved off disk (DB path no longer resolves) — *not* OneDrive online-only
+  files. These are now skipped at runtime (see "Missing-file skipping"); the DB rows are kept,
+  not deleted.
 
 ## What NOT to do
 - Don't increment `duels` in `_apply_revote`
 - Don't use worktrees
 - Don't fall back across tag groups in `pick_one` when `required_tags` is set
 - Don't block the main thread with thumbnail/video/file I/O
+- Don't DELETE missing rows from the DB (files may reappear / comparisons reference their ids) — skip them via `_missing_ids` instead
 
 ## Claude instructions
 - At the end of every response that changes files, provide a **Commit Summary** (short title) and **Description** (body explaining what changed and why) for the user to use if they decide to commit — never run `git commit` yourself
