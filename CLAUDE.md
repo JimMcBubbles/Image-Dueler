@@ -78,21 +78,21 @@ self._missing_ids     # set[int] — image ids whose file is gone from disk; exc
 | `choose` | 2136 | Vote handler — edit mode: _apply_revote or record_result; live: record + load_duel |
 | `_dismiss_load_timeout` | 2628 | Cancels pending timeout job + destroys overlay for a side |
 | `_show_load_timeout` | 2643 | Creates centered overlay on container with Retry + Open-File buttons |
-| `_render_image_or_gif` | 3157 | Async image/GIF render — shows "Loading…", starts load_worker thread, schedules 8 s timeout. Timeout now stays armed **through** GIF frame decode (dismissed in `_decode_gif_async`). On a missing-file open error calls `_handle_missing_side` instead of just printing "Failed to load" |
-| `_decode_gif_async` | 3261 | Spawns decode_worker thread for GIF frame extraction; `apply_result` dismisses the load-timeout left armed by `_render_image_or_gif` |
+| `_render_image_or_gif` | 3157 | Async image/GIF render — shows "Loading…", starts load_worker thread, schedules 8 s timeout. Timeout now stays armed **through** GIF frame decode (dismissed in `_decode_gif_async`). On a missing-file open error calls `_handle_missing_side` instead of just printing "Failed to load". **Sets `st["last_visual_size"]=(w,h)` up-front** (at render-commit, not decode-completion) so resize/`<Configure>` ticks arriving mid-GIF-decode hit `_refresh_visuals_only`'s size guard and skip — prevents the "Loading…"/"Loading GIF…" flicker loop |
+| `_decode_gif_async` | 3269 | Spawns decode_worker thread for GIF frame extraction; `apply_result` dismisses the load-timeout left armed by `_render_image_or_gif` |
 | `_pool_rows` | 2552 | Builds the duel pool from DB; **excludes `self._missing_ids`** so deleted/moved files are never picked; applies pool filter |
 | `_start_missing_scan` | 2565 | Daemon-thread launcher: runs `audit_file_availability(DB_PATH)`, posts result to `_apply_missing_scan` via root.after. Called at end of `__init__` |
 | `_apply_missing_scan` | 2577 | Main-thread: sets `self._missing_ids`, purges missing-referencing entries from `future_queue`, reloads the live duel if it references a missing file |
 | `_handle_missing_side` | 2945 | Render-time miss: adds the row id to `_missing_ids`; live mode → `_replace_side_keep_other` (auto-skip); history/solo → shows "File not found (removed from rotation)" |
-| `_ffmpeg_exe` | 3795 | Returns ffmpeg path (cached after first call) via imageio-ffmpeg or PATH |
-| `_cleanup_waveform_cache` | 3816 | Removes wave PNGs older than 7 days from temp dir; runs once per session on background thread |
-| `_maybe_request_waveform` | 3831 | Launches background waveform generation for current media; guards against duplicate jobs per key |
-| `_waveform_worker` | 3879 | ffmpeg showwavespic → tinted PIL image; posts result back via root.after |
-| `_redraw_waveform_debounced` | 3992 | Debounces `_redraw_waveform` calls (40 ms) to prevent main-thread thrash on window resize |
-| `_redraw_waveform` | 4002 | Scales waveform source image to canvas size and draws playhead |
-| `_update_playhead` | 4043 | Draws YouTube-style progress track + playhead line on the wave canvas |
-| `toggle_sparklines` | ~4230 | Toggles sparkline mode on/off, updates button label/color, refreshes sidebar |
-| `cycle_sparkline_window` | ~4238 | Cycles sparkline_window through SPARKLINE_WINDOWS; refreshes sidebar if sparklines on |
+| `_ffmpeg_exe` | 3803 | Returns ffmpeg path (cached after first call) via imageio-ffmpeg or PATH |
+| `_cleanup_waveform_cache` | 3824 | Removes wave PNGs older than 7 days from temp dir; runs once per session on background thread |
+| `_maybe_request_waveform` | 3839 | Launches background waveform generation for current media; guards against duplicate jobs per key |
+| `_waveform_worker` | 3887 | ffmpeg showwavespic → tinted PIL image; posts result back via root.after |
+| `_redraw_waveform_debounced` | 4000 | Debounces `_redraw_waveform` calls (40 ms) to prevent main-thread thrash on window resize |
+| `_redraw_waveform` | 4010 | Scales waveform source image to canvas size and draws playhead |
+| `_update_playhead` | 4051 | Draws YouTube-style progress track + playhead line on the wave canvas |
+| `toggle_sparklines` | ~4238 | Toggles sparkline mode on/off, updates button label/color, refreshes sidebar |
+| `cycle_sparkline_window` | ~4246 | Cycles sparkline_window through SPARKLINE_WINDOWS; refreshes sidebar if sparklines on |
 
 ## Carousel slot map encoding
 `_carousel_slot_map[i]` stores:

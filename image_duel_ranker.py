@@ -3167,6 +3167,15 @@ class App:
         st["gif_render_token"] = st.get("gif_render_token", 0) + 1
         render_token = st["gif_render_token"]
 
+        # Record the size we're committing to render NOW, before the (possibly slow, two-stage)
+        # async decode. _refresh_visuals_only re-renders a side only when last_visual_size !=
+        # current panel size. GIF decode sets last_visual_size only on completion, so a stream of
+        # <Configure> ticks (carousel thumbnails arriving, layout settling) arriving mid-decode
+        # would each see a stale size, re-render, and cancel the in-flight decode — an endless
+        # "Loading…"/"Loading GIF…" flicker. Setting it up-front makes those redundant same-size
+        # refreshes skip, so the decode can finish. Static images already settle fast; GIFs didn't.
+        st["last_visual_size"] = (w, h)
+
         self._dismiss_load_timeout(side)
         widget.configure(text="Loading…", image="", fg=TEXT_COLOR, bg=DARK_PANEL)
 
