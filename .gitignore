@@ -1,0 +1,20 @@
+# Derived score export — regenerable from the DB (python image_duel_ranker.py --regen-sidecars)
+.image_duel_sidecars/
+
+# SQLite source-of-truth DB + its WAL/SHM sidecars and one-time migration backup
+.image_ranking.sqlite
+.image_ranking.sqlite-wal
+.image_ranking.sqlite-shm
+.image_ranking.sqlite.prehistory.bak
+*.bak
+
+# Durable rotated backups (point restic/kopia/OneDrive here for off-machine copies)
+backups/
+
+# Python bytecode cache
+__pycache__/
+
+# Bundled Python installer / stray artifacts that shouldn't be in git
+python-3.11.9-amd64.exe
+image_duel_report.csv
+py
