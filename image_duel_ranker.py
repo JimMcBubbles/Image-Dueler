@@ -112,8 +112,11 @@ E621_MAX_TAGS = 40
 E621_MAX_OR_TAGS = 37  # max ~ (OR) artist tags per URL; keep a few slots for common tags
 DEFAULT_COMMON_TAGS = "order:created_asc date:28_months_ago -voted:everything"
 
-TAG_OPTIONS = ["SFW", "MEME", "HIDE", "CW"]
+TAG_OPTIONS = ["SFW", "MEME", "HIDE", "CW", "FAVORITE"]
 BLUR_TAGS = {"CW", "HIDE"}  # tags whose carousel thumbnails are blurred until the duel is selected
+FAVORITE_TAG = "FAVORITE"          # marker tag toggled by the heart button (replaces "Upvote")
+NON_MATCH_TAGS = {FAVORITE_TAG}    # tags excluded from duel matchmaking grouping (pure markers)
+FAVORITE_COLOR = "#e25555"         # heart color when an image is favorited
 
 # Sentinel row placed in self.current's "b" slot for solo duels (no opponent in tag group).
 # id=-1 is never a real DB row; checked via row[0] < 0.
@@ -124,6 +127,13 @@ BUILD_STAMP = '2026-02-26a (tag-update-reroll)'
 
 GIF_PRELOAD_MAX_FRAMES = 120
 LOAD_TIMEOUT_MS = 8000  # ms before showing Retry/Open-File overlay on a slow load
+
+# -------------------- History / rollback / backups --------------------
+SESSION_GAP_SECONDS = 1800        # >30 min between consecutive comparisons => new session (backfill grouping)
+SNAPSHOT_SCHEMA_VERSION = 1       # bump if the snapshots.payload JSON format changes
+BACKUP_DIR = SCRIPT_DIR / "backups"
+BACKUP_KEEP = 20                  # number of rotated VACUUM-INTO backups to retain (--backup)
+DB_PREHISTORY_BAK = Path(str(DB_PATH) + ".prehistory.bak")  # one-time copy taken before first history migration
 
 _DISLIKE_COUNTS_BY_REL_FOLDER: dict[str, int] = {}
 
@@ -152,14 +162,25 @@ def init_db() -> sqlite3.Connection:
             left_id INTEGER,
             right_id INTEGER,
             chosen_id INTEGER,
-            ts INTEGER
+            ts INTEGER,
+            outcome TEXT,
+            left_score_before REAL,
+            right_score_before REAL,
+            left_score_after REAL,
+            right_score_after REAL,
+            session_id INTEGER,
+            active INTEGER DEFAULT 1
         )
     """)
     conn.commit()
     migrate_schema(conn)
+    retire_tie_downvote_once(conn)
     return conn
 
 def migrate_schema(conn: sqlite3.Connection) -> None:
+    # One-time copy of the live DB before any structural change (idempotent — only if absent).
+    _backup_db_once()
+
     cols = [row[1] for row in conn.execute("PRAGMA table_info(images)")]
     if "hidden" not in cols:
         print("[migrate] adding 'hidden' column to images")
@@ -173,6 +194,71 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
         conn.commit()
         conn.execute("UPDATE images SET tags='[]' WHERE tags IS NULL")
         conn.commit()
+
+    # ---- comparisons: make every duel reversible & complete going forward ----
+    ccols = [row[1] for row in conn.execute("PRAGMA table_info(comparisons)")]
+    for name, decl in (
+        ("outcome", "TEXT"),
+        ("left_score_before", "REAL"),
+        ("right_score_before", "REAL"),
+        ("left_score_after", "REAL"),
+        ("right_score_after", "REAL"),
+        ("session_id", "INTEGER"),
+        ("active", "INTEGER DEFAULT 1"),
+    ):
+        if name not in ccols:
+            print(f"[migrate] adding '{name}' column to comparisons")
+            conn.execute(f"ALTER TABLE comparisons ADD COLUMN {name} {decl}")
+    conn.commit()
+
+    # Backfill outcome for legacy rows from chosen_id. NOTE: chosen_id=NULL was historically
+    # written for BOTH 'tie/skip' AND 'downvote', so the two are indistinguishable in old rows;
+    # classify every NULL-chosen legacy row as 'tie' (best-effort). New rows store an exact outcome.
+    conn.execute("""
+        UPDATE comparisons SET outcome =
+            CASE
+                WHEN chosen_id IS NOT NULL AND chosen_id = left_id  THEN 'left'
+                WHEN chosen_id IS NOT NULL AND chosen_id = right_id THEN 'right'
+                ELSE 'tie'
+            END
+        WHERE outcome IS NULL
+    """)
+    conn.execute("UPDATE comparisons SET active=1 WHERE active IS NULL")
+    conn.commit()
+
+    # ---- sessions & snapshots tables (rollback addressing) ----
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY,
+            started_ts INTEGER,
+            ended_ts INTEGER,
+            label TEXT,
+            start_comparison_id INTEGER,
+            note TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS snapshots (
+            id INTEGER PRIMARY KEY,
+            ts INTEGER,
+            label TEXT,
+            kind TEXT,
+            session_id INTEGER,
+            max_comparison_id INTEGER,
+            payload TEXT
+        )
+    """)
+    conn.commit()
+
+    # One-time backfill: group existing comparisons into sessions by time gap so old history is
+    # rollback-addressable. Runs only while the sessions table is still empty.
+    if conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0:
+        _backfill_sessions(conn)
+
+    # One-time migration baseline snapshot: a guaranteed restore point for the pre-feature scoring
+    # state. Runs only while the snapshots table is still empty.
+    if conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0] == 0:
+        _take_snapshot(conn, kind="baseline", label="pre-history-feature migration baseline", session_id=None)
 
 # Windows file-attribute flags relevant to OneDrive "Files On-Demand" placeholders.
 # These let us tell a genuinely-missing file apart from one that merely hasn't been
@@ -509,7 +595,8 @@ def _snapshot_stats(conn: sqlite3.Connection, img_id: int) -> dict:
         "last_seen": int(row[4] or 0),
     }
 
-def record_result(conn: sqlite3.Connection, a: tuple, b: tuple, winner: Optional[str]) -> dict:
+def record_result(conn: sqlite3.Connection, a: tuple, b: tuple, winner: Optional[str],
+                  session_id: Optional[int] = None) -> dict:
     a_id, a_path, a_folder, a_duels, a_wins, a_losses, a_score, a_hidden = a[:8]
     b_id, b_path, b_folder, b_duels, b_wins, b_losses, b_score, b_hidden = b[:8]
 
@@ -534,6 +621,9 @@ def record_result(conn: sqlite3.Connection, a: tuple, b: tuple, winner: Optional
     else:  # skip/tie
         new_a, new_b = elo_update(a_score, b_score, None)
 
+    # outcome is the exact, replay-complete record (left/right/tie/downvote); a==left, b==right.
+    outcome = {"a": "left", "b": "right", "downvote": "downvote"}.get(winner, "tie")
+
     ts = int(time.time())
     cur = conn.cursor()
     cur.execute(
@@ -545,8 +635,11 @@ def record_result(conn: sqlite3.Connection, a: tuple, b: tuple, winner: Optional
         (new_b, b_wins_inc, b_losses_inc, ts, b_id),
     )
     cur.execute(
-        "INSERT INTO comparisons(left_id, right_id, chosen_id, ts) VALUES (?,?,?,?)",
-        (a_id, b_id, chosen_id, ts),
+        "INSERT INTO comparisons(left_id, right_id, chosen_id, ts, outcome, "
+        "left_score_before, right_score_before, left_score_after, right_score_after, session_id, active) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,1)",
+        (a_id, b_id, chosen_id, ts, outcome,
+         before_a["score"], before_b["score"], float(new_a), float(new_b), session_id),
     )
     comparison_id = cur.lastrowid
     conn.commit()
@@ -570,6 +663,444 @@ def record_result(conn: sqlite3.Connection, a: tuple, b: tuple, winner: Optional
         "before_a": before_a,
         "before_b": before_b,
     }
+
+# -------------------- History: sessions, snapshots, rollback, backups --------------------
+# Design: the `images` table is the exact source of truth. New duels are fully logged in
+# `comparisons` (outcome + before/after scores + session_id) so they can be reversed exactly.
+# Snapshots store the whole `images` scoring state as JSON; rollbacks restore a snapshot and
+# flip the `comparisons.active` flag (never DELETE) so every rollback is itself undoable.
+
+def _backup_db_once() -> None:
+    """One-time file copy of the live DB before the first history migration. Idempotent."""
+    try:
+        if DB_PATH.exists() and not DB_PREHISTORY_BAK.exists():
+            shutil.copy2(str(DB_PATH), str(DB_PREHISTORY_BAK))
+            print(f"[migrate] one-time pre-history backup written: {DB_PREHISTORY_BAK}")
+    except Exception as ex:
+        print(f"[migrate] pre-history backup failed (continuing): {ex}")
+
+
+def _backfill_sessions(conn: sqlite3.Connection) -> int:
+    """Group existing comparisons into sessions by ts gap (> SESSION_GAP_SECONDS => new session)."""
+    rows = conn.execute("SELECT id, ts FROM comparisons ORDER BY ts, id").fetchall()
+    if not rows:
+        return 0
+    groups: List[list] = []
+    cur_group = [rows[0]]
+    for prev, row in zip(rows, rows[1:]):
+        prev_ts, ts = (prev[1] or 0), (row[1] or 0)
+        if ts - prev_ts > SESSION_GAP_SECONDS:
+            groups.append(cur_group)
+            cur_group = [row]
+        else:
+            cur_group.append(row)
+    groups.append(cur_group)
+
+    cur = conn.cursor()
+    for g in groups:
+        ids = [r[0] for r in g]
+        tss = [r[1] for r in g if r[1] is not None]
+        started = min(tss) if tss else None
+        ended = max(tss) if tss else None
+        cur.execute(
+            "INSERT INTO sessions(started_ts, ended_ts, label, start_comparison_id, note) VALUES (?,?,?,?,?)",
+            (started, ended, "backfill", min(ids), f"{len(ids)} duels"),
+        )
+        sid = cur.lastrowid
+        ph = ",".join("?" * len(ids))
+        cur.execute(f"UPDATE comparisons SET session_id=? WHERE id IN ({ph})", (sid, *ids))
+    conn.commit()
+    print(f"[migrate] backfilled {len(groups)} sessions from {len(rows)} comparisons")
+    return len(groups)
+
+
+def _images_state_payload(conn: sqlite3.Connection) -> str:
+    """Compact JSON of every image's (id, score, wins, losses, duels)."""
+    rows = conn.execute("SELECT id, score, wins, losses, duels FROM images").fetchall()
+    return json.dumps(
+        {"v": SNAPSHOT_SCHEMA_VERSION,
+         "rows": [[int(r[0]), float(r[1]), int(r[2]), int(r[3]), int(r[4])] for r in rows]},
+        separators=(",", ":"),
+    )
+
+
+def _take_snapshot(conn: sqlite3.Connection, kind: str, label: str = "",
+                   session_id: Optional[int] = None) -> int:
+    """Insert a snapshot of the full images scoring state. Returns the new snapshot id."""
+    ts = int(time.time())
+    max_cid = int(conn.execute("SELECT COALESCE(MAX(id), 0) FROM comparisons").fetchone()[0])
+    payload = _images_state_payload(conn)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO snapshots(ts, label, kind, session_id, max_comparison_id, payload) VALUES (?,?,?,?,?,?)",
+        (ts, label, kind, session_id, max_cid, payload),
+    )
+    conn.commit()
+    sid = cur.lastrowid
+    print(f"[snapshot] #{sid} kind={kind} label={label!r} max_cid={max_cid} bytes={len(payload)}")
+    return sid
+
+
+def _restore_images_from_payload(conn: sqlite3.Connection, payload: str) -> int:
+    """Write a snapshot payload back into the images table (score/wins/losses/duels only)."""
+    data = json.loads(payload)
+    rows = data["rows"] if isinstance(data, dict) else data
+    conn.executemany(
+        "UPDATE images SET score=?, wins=?, losses=?, duels=? WHERE id=?",
+        [(float(r[1]), int(r[2]), int(r[3]), int(r[4]), int(r[0])) for r in rows],
+    )
+    conn.commit()
+    return len(rows)
+
+
+def regenerate_all_sidecars(conn: sqlite3.Connection, progress=None) -> int:
+    """Rebuild every per-file sidecar JSON from images.score. Safe to run anytime (idempotent)."""
+    rows = conn.execute("SELECT path, score FROM images").fetchall()
+    total = len(rows)
+    done = 0
+    for path, score in rows:
+        try:
+            update_image_metadata(Path(path), float(score))
+        except Exception:
+            pass
+        done += 1
+        if progress and done % 200 == 0:
+            progress(done, total)
+    if progress:
+        progress(done, total)
+    print(f"[sidecars] regenerated {done}/{total} sidecars")
+    return done
+
+
+def backup_db(keep: int = BACKUP_KEEP) -> Optional[Path]:
+    """VACUUM INTO a timestamped copy under backups/ and rotate to the last `keep`."""
+    try:
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        dest = BACKUP_DIR / f"image_ranking_{stamp}.sqlite"
+        src = sqlite3.connect(str(DB_PATH))
+        try:
+            src.execute("VACUUM INTO ?", (str(dest),))
+        finally:
+            src.close()
+        if keep and keep > 0:
+            backups = sorted(BACKUP_DIR.glob("image_ranking_*.sqlite"))
+            for old in backups[:-keep]:
+                try:
+                    old.unlink()
+                except Exception:
+                    pass
+        size = dest.stat().st_size if dest.exists() else 0
+        print(f"[backup] wrote {dest} ({size} bytes); retaining last {keep}")
+        return dest
+    except Exception as ex:
+        print(f"[backup] failed: {ex}")
+        return None
+
+
+def undo_last_comparisons(conn: sqlite3.Connection, n: int = 1,
+                          session_id: Optional[int] = None) -> dict:
+    """Reverse the last `n` fully-logged active comparisons using their stored before-scores +
+    outcome. Restores both images' score, decrements duels, undoes win/loss, and flags the rows
+    inactive (never DELETE). Exact and O(n). Takes a pre-rollback snapshot first (undoable).
+
+    Only rows with stored before-scores are eligible (legacy rows lack them); reversing newest
+    first makes contiguous before-scores chain back to the exact pre-vote state.
+    """
+    rows = conn.execute(
+        "SELECT id, left_id, right_id, outcome, left_score_before, right_score_before "
+        "FROM comparisons "
+        "WHERE active=1 AND left_score_before IS NOT NULL AND right_score_before IS NOT NULL "
+        "ORDER BY id DESC LIMIT ?",
+        (int(n),),
+    ).fetchall()
+    if not rows:
+        return {"undone": 0, "pre_snapshot_id": None, "ids": [], "affected": []}
+
+    pre = _take_snapshot(conn, kind="pre-rollback", label=f"before undo_last({n})", session_id=session_id)
+    cur = conn.cursor()
+    affected: set = set()
+    for cid, lid, rid, outcome, lsb, rsb in rows:
+        cur.execute("UPDATE images SET score=? WHERE id=?", (float(lsb), lid))
+        cur.execute("UPDATE images SET score=? WHERE id=?", (float(rsb), rid))
+        cur.execute("UPDATE images SET duels=max(0, duels-1) WHERE id IN (?,?)", (lid, rid))
+        if outcome == "left":
+            cur.execute("UPDATE images SET wins=max(0, wins-1) WHERE id=?", (lid,))
+            cur.execute("UPDATE images SET losses=max(0, losses-1) WHERE id=?", (rid,))
+        elif outcome == "right":
+            cur.execute("UPDATE images SET wins=max(0, wins-1) WHERE id=?", (rid,))
+            cur.execute("UPDATE images SET losses=max(0, losses-1) WHERE id=?", (lid,))
+        elif outcome == "downvote":
+            cur.execute("UPDATE images SET losses=max(0, losses-1) WHERE id IN (?,?)", (lid, rid))
+        # 'tie': no win/loss change
+        cur.execute("UPDATE comparisons SET active=0 WHERE id=?", (cid,))
+        affected.add(lid)
+        affected.add(rid)
+    conn.commit()
+    return {"undone": len(rows), "pre_snapshot_id": pre,
+            "ids": [r[0] for r in rows], "affected": sorted(affected)}
+
+
+def restore_snapshot_db(conn: sqlite3.Connection, snapshot_id: int,
+                        session_id: Optional[int] = None) -> dict:
+    """Restore a snapshot's images payload, then recompute comparisons.active as a deterministic
+    function of the restored point (active iff id <= snapshot.max_comparison_id). Takes a
+    pre-rollback snapshot first so the operation is itself exactly undoable."""
+    snap = conn.execute(
+        "SELECT id, max_comparison_id, payload FROM snapshots WHERE id=?", (int(snapshot_id),)
+    ).fetchone()
+    if not snap:
+        return {"ok": False, "error": "snapshot not found"}
+    pre = _take_snapshot(conn, kind="pre-rollback", label=f"before restore #{snapshot_id}", session_id=session_id)
+    restored = _restore_images_from_payload(conn, snap[2])
+    max_cid = int(snap[1] or 0)
+    conn.execute("UPDATE comparisons SET active = CASE WHEN id <= ? THEN 1 ELSE 0 END", (max_cid,))
+    conn.commit()
+    return {"ok": True, "restored_rows": restored, "pre_snapshot_id": pre, "max_comparison_id": max_cid}
+
+
+def _session_start_snapshot_id(conn: sqlite3.Connection, session_id: int) -> Optional[int]:
+    """The snapshot representing the start of a session: the earliest auto/baseline/manual snapshot
+    stamped with that session_id (smallest max_comparison_id)."""
+    row = conn.execute(
+        "SELECT id FROM snapshots WHERE session_id=? AND kind IN ('auto','baseline','manual') "
+        "ORDER BY max_comparison_id ASC, id ASC LIMIT 1",
+        (int(session_id),),
+    ).fetchone()
+    return int(row[0]) if row else None
+
+
+def rollback_to_session_db(conn: sqlite3.Connection, session_id: int, where: str = "start",
+                           live_session_id: Optional[int] = None) -> dict:
+    """Roll the images state back to the start or end of a session by restoring the matching
+    snapshot. 'start' = that session's start snapshot; 'end' = the next session's start snapshot.
+    Only sessions recorded under the history feature have exact snapshots; backfilled sessions fall
+    back to the nearest baseline at/before their start (or report no exact snapshot)."""
+    srow = conn.execute(
+        "SELECT id, started_ts, start_comparison_id FROM sessions WHERE id=?", (int(session_id),)
+    ).fetchone()
+    if not srow:
+        return {"ok": False, "error": "session not found"}
+
+    snap_id: Optional[int] = None
+    if where == "start":
+        snap_id = _session_start_snapshot_id(conn, session_id)
+        if snap_id is None:
+            start_cid = int(srow[2] or 0)
+            row = conn.execute(
+                "SELECT id FROM snapshots WHERE max_comparison_id <= ? "
+                "ORDER BY max_comparison_id DESC, id DESC LIMIT 1",
+                (start_cid,),
+            ).fetchone()
+            snap_id = int(row[0]) if row else None
+    else:  # 'end' == start of the next session (by time)
+        nxt = conn.execute(
+            "SELECT id FROM sessions WHERE started_ts > ? ORDER BY started_ts ASC, id ASC LIMIT 1",
+            (srow[1] or 0,),
+        ).fetchone()
+        if nxt:
+            snap_id = _session_start_snapshot_id(conn, int(nxt[0]))
+
+    if snap_id is None:
+        return {"ok": False, "error": "no exact snapshot for that session boundary"}
+    res = restore_snapshot_db(conn, snap_id, session_id=live_session_id)
+    res["snapshot_id"] = snap_id
+    return res
+
+
+# ----- Per-comparison edit (drill into a session, change/undo one vote) -----
+# These use DELTA math on the current image scores (score += new_after - old_after), so they are
+# correct for a comparison anywhere in history — not just the tail — without re-cascading later
+# duels (same non-cascading approximation as the live `_apply_revote`). They NEVER touch `duels`
+# on a revote (revote rule). Only fully-logged comparisons (stored before/after) are editable.
+
+def _outcome_increments(outcome: str):
+    """win/loss increments (left_w, left_l, right_w, right_l) implied by an outcome."""
+    if outcome == "left":     return (1, 0, 0, 1)
+    if outcome == "right":    return (0, 1, 1, 0)
+    if outcome == "downvote": return (0, 1, 0, 1)
+    return (0, 0, 0, 0)  # tie
+
+
+def _outcome_after_scores(lb: float, rb: float, outcome: str):
+    """Scores both sides would have AFTER a duel with the given outcome, from before-scores lb/rb."""
+    if outcome == "left":     return elo_update(lb, rb, True)
+    if outcome == "right":    return elo_update(lb, rb, False)
+    if outcome == "downvote": return (lb - DOWNVOTE_PENALTY, rb - DOWNVOTE_PENALTY)
+    return elo_update(lb, rb, None)  # tie
+
+
+def _fetch_editable_comparison(conn: sqlite3.Connection, comparison_id: int):
+    row = conn.execute(
+        "SELECT id, left_id, right_id, outcome, left_score_before, right_score_before, "
+        "left_score_after, right_score_after, active FROM comparisons WHERE id=?",
+        (int(comparison_id),),
+    ).fetchone()
+    if not row:
+        return None, {"ok": False, "error": "comparison not found"}
+    if row[4] is None or row[5] is None or row[6] is None or row[7] is None:
+        return None, {"ok": False, "error": "legacy duel (no stored scores) — not individually editable"}
+    return row, None
+
+
+def revote_comparison_db(conn: sqlite3.Connection, comparison_id: int, new_outcome: str) -> dict:
+    """Change one duel's outcome. Adjusts both images' current score by the delta vs the old
+    outcome, fixes win/loss, rewrites the comparison row. Never changes `duels`."""
+    row, err = _fetch_editable_comparison(conn, comparison_id)
+    if err:
+        return err
+    cid, lid, rid, old_outcome, lb, rb, la, ra, active = row
+    if not active:
+        return {"ok": False, "error": "duel is archived (undone) — restore it before re-voting"}
+    if new_outcome == old_outcome:
+        return {"ok": True, "changed": False, "left_id": lid, "right_id": rid}
+    new_la, new_ra = _outcome_after_scores(float(lb), float(rb), new_outcome)
+    dL, dR = (new_la - float(la)), (new_ra - float(ra))
+    olw, oll, orw, orl = _outcome_increments(old_outcome)
+    nlw, nll, nrw, nrl = _outcome_increments(new_outcome)
+    chosen = lid if new_outcome == "left" else (rid if new_outcome == "right" else None)
+    cur = conn.cursor()
+    cur.execute("UPDATE images SET score=score+?, wins=max(0,wins+?), losses=max(0,losses+?) WHERE id=?",
+                (dL, nlw - olw, nll - oll, lid))
+    cur.execute("UPDATE images SET score=score+?, wins=max(0,wins+?), losses=max(0,losses+?) WHERE id=?",
+                (dR, nrw - orw, nrl - orl, rid))
+    cur.execute("UPDATE comparisons SET outcome=?, chosen_id=?, left_score_after=?, right_score_after=? WHERE id=?",
+                (new_outcome, chosen, float(new_la), float(new_ra), cid))
+    conn.commit()
+    return {"ok": True, "changed": True, "left_id": lid, "right_id": rid,
+            "old_outcome": old_outcome, "new_outcome": new_outcome}
+
+
+def undo_comparison_db(conn: sqlite3.Connection, comparison_id: int) -> dict:
+    """Remove one duel's contribution: subtract its (after-before) score delta from both images,
+    decrement `duels`, undo win/loss, flag the row inactive (never DELETE)."""
+    row, err = _fetch_editable_comparison(conn, comparison_id)
+    if err:
+        return err
+    cid, lid, rid, old_outcome, lb, rb, la, ra, active = row
+    if not active:
+        return {"ok": True, "already_undone": True, "left_id": lid, "right_id": rid}
+    dL, dR = (float(la) - float(lb)), (float(ra) - float(rb))
+    olw, oll, orw, orl = _outcome_increments(old_outcome)
+    cur = conn.cursor()
+    cur.execute("UPDATE images SET score=score-?, wins=max(0,wins-?), losses=max(0,losses-?), "
+                "duels=max(0,duels-1) WHERE id=?", (dL, olw, oll, lid))
+    cur.execute("UPDATE images SET score=score-?, wins=max(0,wins-?), losses=max(0,losses-?), "
+                "duels=max(0,duels-1) WHERE id=?", (dR, orw, orl, rid))
+    cur.execute("UPDATE comparisons SET active=0 WHERE id=?", (cid,))
+    conn.commit()
+    return {"ok": True, "left_id": lid, "right_id": rid}
+
+
+def restore_comparison_db(conn: sqlite3.Connection, comparison_id: int) -> dict:
+    """Re-activate a previously-undone duel: re-apply its stored (after-before) delta, re-increment
+    duels and win/loss, set active=1. Inverse of undo_comparison_db."""
+    row, err = _fetch_editable_comparison(conn, comparison_id)
+    if err:
+        return err
+    cid, lid, rid, old_outcome, lb, rb, la, ra, active = row
+    if active:
+        return {"ok": True, "already_active": True, "left_id": lid, "right_id": rid}
+    dL, dR = (float(la) - float(lb)), (float(ra) - float(rb))
+    olw, oll, orw, orl = _outcome_increments(old_outcome)
+    cur = conn.cursor()
+    cur.execute("UPDATE images SET score=score+?, wins=max(0,wins+?), losses=max(0,losses+?), "
+                "duels=duels+1 WHERE id=?", (dL, olw, oll, lid))
+    cur.execute("UPDATE images SET score=score+?, wins=max(0,wins+?), losses=max(0,losses+?), "
+                "duels=duels+1 WHERE id=?", (dR, orw, orl, rid))
+    cur.execute("UPDATE comparisons SET active=1 WHERE id=?", (cid,))
+    conn.commit()
+    return {"ok": True, "left_id": lid, "right_id": rid}
+
+
+def rebuild_scores_from_log(conn: sqlite3.Connection, dry_run: bool = False,
+                            recall_map: Optional[dict] = None) -> dict:
+    """Replay every ACTIVE comparison in chronological order (ts, id) from BASE_SCORE, recomputing
+    each image's score/wins/losses/duels and **writing before/after scores into every comparison row**
+    (so all legacy duels become individually editable). Original timestamps are untouched.
+
+    Each duel uses its stored `outcome`; pass `recall_map={comparison_id: outcome}` to override
+    specific ones (e.g. recalling an old NULL tie/downvote). Ambiguous legacy duels whose outcome is
+    unknown stay 'tie' (their original downvote penalties are unrecoverable). Returns drift stats;
+    when `dry_run` is False, applies the rebuild. Caller should snapshot first (reversible)."""
+    recall_map = recall_map or {}
+    rows = conn.execute(
+        "SELECT id, left_id, right_id, outcome FROM comparisons WHERE active=1 ORDER BY ts, id"
+    ).fetchall()
+    cur_scores = {int(i): float(s) for (i, s) in conn.execute("SELECT id, score FROM images")}
+
+    scores: dict = {}
+    W: dict = {}
+    L: dict = {}
+    D: dict = {}
+
+    def gs(i):
+        return scores.get(i, BASE_SCORE)
+
+    writes = []
+    for (cid, lid, rid, outcome) in rows:
+        oc = recall_map.get(cid, outcome) or "tie"
+        lb, rb = gs(lid), gs(rid)
+        la, ra = _outcome_after_scores(lb, rb, oc)
+        scores[lid], scores[rid] = la, ra
+        lw, ll, rw, rl = _outcome_increments(oc)
+        W[lid] = W.get(lid, 0) + lw; L[lid] = L.get(lid, 0) + ll; D[lid] = D.get(lid, 0) + 1
+        W[rid] = W.get(rid, 0) + rw; L[rid] = L.get(rid, 0) + rl; D[rid] = D.get(rid, 0) + 1
+        writes.append((float(lb), float(rb), float(la), float(ra), oc, cid))
+
+    all_ids = set(cur_scores) | set(scores)
+    drift = [abs(scores.get(i, BASE_SCORE) - cur_scores.get(i, BASE_SCORE)) for i in all_ids]
+    stats = {
+        "duels": len(rows),
+        "images": len(all_ids),
+        "moved": sum(1 for x in drift if x > 1.0),
+        "max_drift": max(drift) if drift else 0.0,
+        "mean_drift": (sum(drift) / len(drift)) if drift else 0.0,
+        "recalled": len(recall_map),
+        "applied": not dry_run,
+    }
+    if dry_run:
+        return stats
+
+    cur = conn.cursor()
+    cur.executemany(
+        "UPDATE comparisons SET left_score_before=?, right_score_before=?, "
+        "left_score_after=?, right_score_after=?, outcome=? WHERE id=?",
+        writes,
+    )
+    cur.executemany(
+        "UPDATE images SET score=?, wins=?, losses=?, duels=? WHERE id=?",
+        [(scores.get(i, BASE_SCORE), W.get(i, 0), L.get(i, 0), D.get(i, 0), i) for i in all_ids],
+    )
+    conn.commit()
+    return stats
+
+
+def retire_tie_downvote_once(conn: sqlite3.Connection) -> int:
+    """One-time policy change: ties/downvotes are retired as a feature. Archive every active
+    tie/downvote comparison (never DELETE — they stay recoverable) and rebuild scores from the
+    surviving decisive duels. Backs up the DB first. Self-guarding: once there are no active
+    tie/downvote duels it is a permanent no-op (the UI no longer creates any)."""
+    n = conn.execute(
+        "SELECT COUNT(*) FROM comparisons WHERE active=1 AND outcome IN ('tie','downvote')"
+    ).fetchone()[0]
+    if n == 0:
+        return 0
+    print(f"[retire] ties/downvotes retired: archiving {n} active tie/downvote duels")
+    try:
+        dest = backup_db()
+        print(f"[retire] pre-change backup: {dest}")
+    except Exception as ex:
+        print(f"[retire] backup failed (continuing — snapshot still taken): {ex}")
+    _take_snapshot(conn, kind="pre-rollback", label="before retiring tie/downvote duels")
+    conn.execute("UPDATE comparisons SET active=0 WHERE active=1 AND outcome IN ('tie','downvote')")
+    conn.commit()
+    stats = rebuild_scores_from_log(conn)
+    print(f"[retire] archived {n} duels; rebuilt scores from decisive duels only "
+          f"({stats['moved']} images moved >1pt, max {stats['max_drift']:.1f}). Reversible via the "
+          f"'before retiring tie/downvote duels' snapshot or the backup.")
+    return n
+
 
 def set_image_hidden(conn: sqlite3.Connection, img_id: int, hidden: int) -> None:
     conn.execute("UPDATE images SET hidden=?, last_seen=? WHERE id=?", (hidden, int(time.time()), img_id))
@@ -640,6 +1171,10 @@ class App:
         self.history_index: Optional[int] = None
         self.future_queue: List[dict] = []  # pre-rolled upcoming duels {"a":row,"b":row,"thumb":None}
         self._missing_ids: set = set()  # image ids whose file is gone from disk; excluded from picking
+        self.session_id: Optional[int] = None   # current live session row; stamps every new comparison
+        self._session_closed = True             # guards _close_session against double-stamping
+        self._hm_win = None                      # History/Rollback manager Toplevel (singleton)
+        self._sd_win = None                      # Session-detail drill-in Toplevel (singleton)
         self.solo_mode = False  # True when the live duel has no opponent (b == _NO_OPPONENT)
         self.carousel_size = 6
         self.carousel_visible = True
@@ -731,7 +1266,6 @@ class App:
         # Make info bars behave like the image/video panel for clicks
         for w in (self.left_info_bar, self.left_info_text):
             w.bind("<Button-1>", lambda e: self.choose("a"))
-            w.bind("<Shift-Button-1>", lambda e: self._on_shift_downvote("a", e))
             w.bind("<Control-Button-1>", lambda e: self._on_ctrl_options("a", e))
             w.bind("<Button-3>", lambda e: self.skip_side("a"))
             w.bind("<Button-2>", lambda e: self.hide_side("a"))
@@ -739,7 +1273,6 @@ class App:
 
         for w in (self.right_info_bar, self.right_info_text):
             w.bind("<Button-1>", lambda e: self.choose("b"))
-            w.bind("<Shift-Button-1>", lambda e: self._on_shift_downvote("b", e))
             w.bind("<Control-Button-1>", lambda e: self._on_ctrl_options("b", e))
             w.bind("<Button-3>", lambda e: self.skip_side("b"))
             w.bind("<Button-2>", lambda e: self.hide_side("b"))
@@ -969,6 +1502,9 @@ class App:
         self.db_stats_btn = tk.Button(self.sidebar, text="DB stats (I)",
                                       command=self.show_db_stats,
                                       bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat")
+        self.history_btn = tk.Button(self.sidebar, text="History / Rollback (H)",
+                                     command=self.show_history_manager,
+                                     bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat")
 
         self.export_status = tk.Label(self.sidebar, text="", font=("Segoe UI", 9), fg=TEXT_COLOR, bg=DARK_BG)
 
@@ -999,7 +1535,8 @@ class App:
         tk.Frame(self.sidebar, height=1, bg=SEPARATOR_BG).pack(fill="x", pady=(0, 6))
 
         self.view_links_btn.pack(fill="x", pady=(0, 2))
-        self.db_stats_btn.pack(fill="x", pady=(0, 6))
+        self.db_stats_btn.pack(fill="x", pady=(0, 2))
+        self.history_btn.pack(fill="x", pady=(0, 6))
         self.export_status.pack(anchor="w", pady=(0, 6))
         tk.Frame(self.sidebar, height=1, bg=SEPARATOR_BG).pack(fill="x", pady=(0, 6))
 
@@ -1106,8 +1643,6 @@ class App:
         # ---- Mouse controls ----
         self.left_panel.bind("<Button-1>", lambda e: self.choose("a"))
         self.right_panel.bind("<Button-1>", lambda e: self.choose("b"))
-        self.left_panel.bind("<Shift-Button-1>", lambda e: self._on_shift_downvote("a", e))
-        self.right_panel.bind("<Shift-Button-1>", lambda e: self._on_shift_downvote("b", e))
         self.left_panel.bind("<Control-Button-1>", lambda e: self._on_ctrl_options("a", e))
         self.right_panel.bind("<Control-Button-1>", lambda e: self._on_ctrl_options("b", e))
         self.left_panel.bind("<Double-Button-1>", self.open_left)
@@ -1122,7 +1657,6 @@ class App:
         # Also allow click on video frames
         for w, side in [(self.left_video, "a"), (self.right_video, "b")]:
             w.bind("<Control-Button-1>", lambda e, s=side: self._on_ctrl_options(s, e))
-            w.bind("<Shift-Button-1>", lambda e, s=side: self._on_shift_downvote(s, e))
             w.bind("<Double-Button-1>", self.open_left if side == "a" else self.open_right)
             w.bind("<Button-1>", lambda e, s=side: self.choose("a" if s == "a" else "b"))
             w.bind("<Button-3>", lambda e, s=side: self.skip_side(s))
@@ -1132,8 +1666,6 @@ class App:
         root.bind("1", lambda e: self.choose("a"))
         root.bind("2", lambda e: self.choose("b"))
         root.bind("3", lambda e: self.focus_side("a"))
-        root.bind("4", lambda e: self.downvote_side("a"))
-        root.bind("5", lambda e: self.downvote_side("b"))
         root.bind("6", lambda e: self.focus_side("b"))
         root.bind("7", lambda e: self.skip_side("a"))
         root.bind("8", lambda e: self.skip_side("b"))
@@ -1142,14 +1674,20 @@ class App:
         root.bind(".", lambda e: self.toggle_blur())
 
         root.bind("q", lambda e: self.quit())
+        root.bind("h", lambda e: self.show_history_manager())
 
         root.bind("<Configure>", self._on_configure)
         root.bind("<FocusOut>", self._on_window_focus_out, add="+")
         root.bind("<FocusIn>", self._on_window_focus_in, add="+")
+        # Route the window-close (X) button through quit() so the session is closed cleanly.
+        root.protocol("WM_DELETE_WINDOW", self.quit)
 
         # Start periodic UI tick (scrub/time updates)
         self._tick_job = None
         self._tick()
+
+        # Open a live session (stamps every new comparison) + take an auto start-of-session snapshot.
+        self._open_session()
 
         self._toggle_carousel()
         self.load_duel()
@@ -1575,9 +2113,13 @@ class App:
             (new_b, b_wins_delta, b_losses_delta, ts, b_id),
         )
         if entry.get("comparison_id"):
+            # Keep the reversible-log columns consistent on a revote. before-scores are fixed at
+            # record time and must NOT change here; only outcome + after-scores move. duels is never
+            # touched (revote rule).
+            outcome = {"a": "left", "b": "right", "downvote": "downvote"}.get(winner, "tie")
             self.conn.execute(
-                "UPDATE comparisons SET chosen_id=?, ts=? WHERE id=?",
-                (chosen_id, ts, entry["comparison_id"]),
+                "UPDATE comparisons SET chosen_id=?, outcome=?, left_score_after=?, right_score_after=?, ts=? WHERE id=?",
+                (chosen_id, outcome, float(new_a), float(new_b), ts, entry["comparison_id"]),
             )
         self.conn.commit()
         entry["winner"] = winner
@@ -1627,7 +2169,7 @@ class App:
             exclude_id=other_id,
             pool=pool,
             required_kind=tagged_kind,
-            required_tags=frozenset(self._tags_for_row(other_row)),
+            required_tags=self._match_tags(other_row),
         )
 
         # New opponent for the sub-duel (matched to the tagged file's new tags).
@@ -1635,7 +2177,7 @@ class App:
             exclude_id=tagged_row[0],
             pool=pool,
             required_kind=tagged_kind,
-            required_tags=frozenset(self._tags_for_row(tagged_row)),
+            required_tags=self._match_tags(tagged_row),
         )
 
         # 3. Patch the parent entry so it shows the replacement instead of the tagged file.
@@ -2224,14 +2766,27 @@ class App:
         actions = tk.Frame(parent, bg=INFO_BAR_BG)
         actions.grid(row=0, column=1, sticky="e", padx=(0, 8), pady=2)
 
-        spec = [
-            ("Upvote", lambda s=side: self.choose(s)),
-            ("Downvote", lambda s=side: self.downvote_side(s)),
-            ("Skip", lambda s=side: self.skip_side(s)),
-            ("Hide", lambda s=side: self.hide_side(s)),
-        ]
         buttons: dict = {}
-        for text, cmd in spec:
+        # Favorite (heart) — replaces the old "Upvote" button. Toggles the FAVORITE marker tag.
+        heart = tk.Button(
+            actions,
+            text="♡",
+            command=lambda s=side: self.toggle_favorite(s),
+            bg=INFO_BAR_BG,
+            fg=INFO_BAR_FG,
+            activebackground=DARK_PANEL,
+            activeforeground=FAVORITE_COLOR,
+            relief="flat",
+            padx=6,
+            pady=0,
+            font=("Segoe UI", 11),
+            cursor="hand2",
+        )
+        heart.pack(side="left", padx=(0, 2))
+        buttons["favorite"] = heart
+
+        for text, cmd in (("Skip", lambda s=side: self.skip_side(s)),
+                          ("Hide", lambda s=side: self.hide_side(s))):
             btn = tk.Button(
                 actions,
                 text=text,
@@ -2249,6 +2804,7 @@ class App:
             btn.pack(side="left", padx=(0, 2))
             buttons[text.lower()] = btn
         self._side[side]["action_buttons"] = buttons
+        self._update_favorite_button(side)
 
 
     def _ordered_tags(self, tags: set) -> List[str]:
@@ -2282,6 +2838,11 @@ class App:
             self._write_tags(row[0], set(ordered), hidden=hidden)
         return ordered
 
+    def _match_tags(self, row: tuple) -> frozenset:
+        """Tag set used for DUEL MATCHMAKING — excludes marker tags (FAVORITE) so favoriting an
+        image never moves it out of its duel group. Display/filter code uses _tags_for_row."""
+        return frozenset(self._tags_for_row(row)) - NON_MATCH_TAGS
+
     def _write_tags(self, image_id: int, tags: set, hidden: Optional[int] = None) -> None:
         if image_id < 0:
             return
@@ -2303,6 +2864,46 @@ class App:
             var.set(tag in tags)
         self._side[side]["tags"] = tags
         self._set_tag_button_label(side)
+        self._update_favorite_button(side)
+
+    def toggle_favorite(self, side: str) -> None:
+        """Heart button: toggle the FAVORITE marker tag on the displayed image. Does NOT reroll the
+        duel or change scoring — FAVORITE is excluded from matchmaking (see _match_tags)."""
+        if not self.current:
+            return
+        row = self._side[side].get("row")
+        if not row or row[0] < 0:
+            return
+        tags = set(self._tags_for_row(row))
+        if FAVORITE_TAG in tags:
+            tags.discard(FAVORITE_TAG)
+        else:
+            tags.add(FAVORITE_TAG)
+        self._write_tags(row[0], tags)
+        updated = self._fetch_row(row[0])
+        if updated:
+            self._side[side]["row"] = updated
+            if self.current:
+                a, b = self.current
+                if side == "a" and a and a[0] == row[0]:
+                    self.current = (updated, b)
+                elif side == "b" and b and b[0] == row[0]:
+                    self.current = (a, updated)
+                if self.history_index is None:
+                    self.live_current = self.current
+        self._sync_tag_controls(side)
+
+    def _update_favorite_button(self, side: str) -> None:
+        btns = self._side[side].get("action_buttons") or {}
+        heart = btns.get("favorite")
+        if not heart:
+            return
+        row = self._side[side].get("row")
+        fav = bool(row and row[0] >= 0 and FAVORITE_TAG in set(self._tags_for_row(row)))
+        try:
+            heart.config(text=("♥" if fav else "♡"), fg=(FAVORITE_COLOR if fav else INFO_BAR_FG))
+        except Exception:
+            pass
 
     def _set_tag_button_label(self, side: str) -> None:
         button = self._side[side].get("tag_button")
@@ -2320,6 +2921,18 @@ class App:
         tags = {tag for tag, var in tag_vars.items() if var.get()}
         prev_tags = set(self._side[side].get("tags", []))
         if tags == prev_tags:
+            return
+        # Marker-only change (e.g. FAVORITE) doesn't alter the matchmaking group — just persist and
+        # refresh the controls; never reroll/sub-duel.
+        changed = tags ^ prev_tags
+        if changed and changed <= NON_MATCH_TAGS:
+            self._write_tags(row[0], tags)
+            self._side[side]["tags"] = self._ordered_tags(tags)
+            self._set_tag_button_label(side)
+            updated = self._fetch_row(row[0])
+            if updated:
+                self._side[side]["row"] = updated
+            self._update_favorite_button(side)
             return
         wants_hide = "HIDE" in tags
         had_hide = "HIDE" in prev_tags
@@ -2621,7 +3234,7 @@ class App:
                 exclude_id=b[0],
                 pool=pool,
                 required_kind=self._media_kind(b[1]),
-                required_tags=frozenset(self._tags_for_row(b)),
+                required_tags=self._match_tags(b),
             )
             if na:
                 a = na
@@ -2631,7 +3244,7 @@ class App:
                 exclude_id=a[0],
                 pool=pool,
                 required_kind=self._media_kind(a[1]),
-                required_tags=frozenset(self._tags_for_row(a)),
+                required_tags=self._match_tags(a),
             )
             if nb:
                 b = nb
@@ -2728,7 +3341,7 @@ class App:
         if not candidates:
             return None
         if required_tags is not None:
-            tag_matched = [r for r in candidates if frozenset(self._tags_for_row(r)) == required_tags]
+            tag_matched = [r for r in candidates if self._match_tags(r) == required_tags]
             if not tag_matched:
                 return None  # refuse to pair across different tag groups
             candidates = tag_matched
@@ -2744,7 +3357,7 @@ class App:
         # frozenset) form their own group.
         groups: dict = {}
         for row in pool:
-            key = (frozenset(self._tags_for_row(row)), self._media_kind(row[1]))
+            key = (self._match_tags(row), self._media_kind(row[1]))
             groups.setdefault(key, []).append(row)
 
         eligible_groups = [rows for rows in groups.values() if len(rows) >= 2]
@@ -2820,6 +3433,19 @@ class App:
             self._stop_video("b")
             self.load_duel()
             return
+        # Skip (no winner): ties/downvotes are retired, so a skip never affects score — just advance.
+        if winner not in ("a", "b"):
+            if self.history_index is not None:
+                next_index = self.history_index + 1
+                if next_index < len(self.duel_history):
+                    self._enter_history_mode(next_index)
+                else:
+                    self._exit_history_mode()
+            else:
+                self._stop_video("a")
+                self._stop_video("b")
+                self.load_duel()
+            return
         # snapshot ranks for delta arrows
         prev_ranks = {r["folder"]: r["rank"] for r in folder_leaderboard(self.conn, metric=self.metric)}
 
@@ -2830,7 +3456,7 @@ class App:
                 a = self._fetch_row(entry["a_id"])
                 b = self._fetch_row(entry["b_id"])
                 if a and b:
-                    result = record_result(self.conn, a, b, winner)
+                    result = record_result(self.conn, a, b, winner, session_id=self.session_id)
                     entry["comparison_id"] = result["comparison_id"]
                     entry["winner"]        = winner
                     entry["before_a"]      = result["before_a"]
@@ -2847,7 +3473,7 @@ class App:
             return
 
         a, b = self.current
-        entry = record_result(self.conn, a, b, winner)
+        entry = record_result(self.conn, a, b, winner, session_id=self.session_id)
         self._attach_history_thumbs(entry)
         self.duel_history.append(entry)
         self._last_ranks = prev_ranks
@@ -2878,14 +3504,14 @@ class App:
             exclude_id=other[0],
             pool=pool,
             required_kind=self._media_kind(other[1]),
-            required_tags=frozenset(self._tags_for_row(other)),
+            required_tags=self._match_tags(other),
         )
 
         sub_opponent = self.pick_one(
             exclude_id=tagged_row[0],
             pool=pool,
             required_kind=tagged_kind,
-            required_tags=frozenset(self._tags_for_row(tagged_row)),
+            required_tags=self._match_tags(tagged_row),
         )
 
         if sub_opponent:
@@ -2927,7 +3553,7 @@ class App:
             exclude_id=other[0],
             pool=pool,
             required_kind=self._media_kind(other[1]),
-            required_tags=frozenset(self._tags_for_row(other)),
+            required_tags=self._match_tags(other),
         )
         if not replacement:
             self.load_duel()
@@ -2962,16 +3588,9 @@ class App:
             )
 
     def downvote_side(self, side: str) -> None:
-        if not self.current or self.solo_mode:
+        # Downvote retired as a feature — behaves as a no-score skip if any legacy path reaches it.
+        if not self.current:
             return
-        a, b = self.current
-        target = a if side == "a" else b
-        now_ts = int(time.time())
-        self.conn.execute(
-            "UPDATE images SET score=score-?, duels=duels+1, losses=losses+1, last_seen=? WHERE id=?",
-            (DOWNVOTE_PENALTY, now_ts, target[0]),
-        )
-        self.conn.commit()
         self._replace_side_keep_other(side)
 
     def skip_side(self, side: str) -> None:
@@ -4712,25 +5331,19 @@ class App:
             "R Click: Skip",
             "M Click: Hide",
             "",
-            "Shift + L Click: Downvote",
             "Ctrl + L Click: More Options",
             "",
             "1: Vote Left",
             "2: Vote Right",
             "3: Focus Left",
-            "4: Downvote Left",
-            "5: Downvote Right",
             "6: Focus Right",
             "7: Skip Left",
             "8: Skip Right",
-            "9: Toggle Focus",
-            "0: Skip Both",
+            "9: Toggle Sidebar",
+            "0: Skip Both (no score)",
             ".: Toggle Blur",
+            "h: History / Rollback",
         ])
-
-    def _on_shift_downvote(self, side: str, _event=None):
-        self.downvote_side(side)
-        return "break"
 
     def _on_ctrl_options(self, side: str, event=None):
         self.show_side_options(side, event)
@@ -4745,8 +5358,6 @@ class App:
 
     def show_side_options(self, side: str, event=None) -> None:
         menu = tk.Menu(self.root, tearoff=0)
-        menu.add_command(label="Upvote", command=lambda s=side: self.choose(s))
-        menu.add_command(label="Downvote", command=lambda s=side: self.downvote_side(s))
         menu.add_command(label="Skip", command=lambda s=side: self.skip_side(s))
         menu.add_command(label="Hide", command=lambda s=side: self.hide_side(s))
         menu.add_command(label="Undo tag/hide", command=lambda s=side: self.undo_side_tag_hide(s))
@@ -4758,6 +5369,7 @@ class App:
         menu.add_command(label="Toggle leaderboard metric", command=self.toggle_metric)
         menu.add_command(label="View/open e621 links", command=self.show_links_view)
         menu.add_command(label="DB stats", command=self.show_db_stats)
+        menu.add_command(label="History / Rollback…", command=self.show_history_manager)
         menu.add_command(label="Toggle blur", command=self.toggle_blur)
         try:
             if event is not None:
@@ -5316,6 +5928,758 @@ class App:
         except Exception as e:
             messagebox.showerror("Open file failed", str(e))
 
+    # -------------------- Sessions / snapshots / rollback --------------------
+    def _open_session(self) -> None:
+        """Open a live session row and take an auto start-of-session snapshot."""
+        try:
+            ts = int(time.time())
+            max_cid = int(self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM comparisons").fetchone()[0])
+            cur = self.conn.cursor()
+            cur.execute(
+                "INSERT INTO sessions(started_ts, ended_ts, label, start_comparison_id, note) VALUES (?,?,?,?,?)",
+                (ts, None, "live", max_cid, None),
+            )
+            self.conn.commit()
+            self.session_id = cur.lastrowid
+            self._session_closed = False
+            _take_snapshot(self.conn, kind="auto", label="session start", session_id=self.session_id)
+            print(f"[session] opened #{self.session_id} (after comparison #{max_cid})")
+        except Exception as ex:
+            print(f"[session] open failed: {ex}")
+            self.session_id = None
+
+    def _close_session(self) -> None:
+        """Stamp ended_ts on the live session. Idempotent (guards against double-close)."""
+        if getattr(self, "_session_closed", True):
+            return
+        self._session_closed = True
+        try:
+            if self.session_id is not None:
+                self.conn.execute(
+                    "UPDATE sessions SET ended_ts=? WHERE id=? AND ended_ts IS NULL",
+                    (int(time.time()), self.session_id),
+                )
+                self.conn.commit()
+                print(f"[session] closed #{self.session_id}")
+        except Exception as ex:
+            print(f"[session] close failed: {ex}")
+
+    def undo_last(self, n: int = 1) -> dict:
+        """Reverse the last n duels (exact, via stored before-scores) and refresh the UI."""
+        res = undo_last_comparisons(self.conn, n=n, session_id=self.session_id)
+        if res["undone"]:
+            self._reload_after_rollback()
+            for img_id in res.get("affected", []):
+                row = self.conn.execute("SELECT path, score FROM images WHERE id=?", (img_id,)).fetchone()
+                if row:
+                    try:
+                        threading.Thread(target=update_image_metadata,
+                                         args=(Path(row[0]), float(row[1])), daemon=True).start()
+                    except Exception:
+                        pass
+        return res
+
+    def restore_snapshot(self, snapshot_id: int) -> dict:
+        """Restore a snapshot's scoring state and refresh the UI (pre-rollback snapshot taken first)."""
+        res = restore_snapshot_db(self.conn, snapshot_id, session_id=self.session_id)
+        if res.get("ok"):
+            self._reload_after_rollback()
+        return res
+
+    def rollback_to_session(self, session_id: int, where: str = "start") -> dict:
+        """Roll back to the start/end of a session and refresh the UI."""
+        res = rollback_to_session_db(self.conn, session_id, where=where, live_session_id=self.session_id)
+        if res.get("ok"):
+            self._reload_after_rollback()
+        return res
+
+    def rebuild_from_log(self, recall_map: Optional[dict] = None) -> dict:
+        """Pre-rollback snapshot, then replay the whole log to recompute scores + backfill before/after
+        on every duel (unlocks legacy duels for editing), then refresh the UI."""
+        _take_snapshot(self.conn, kind="pre-rollback", label="before rebuild-from-log",
+                       session_id=self.session_id)
+        stats = rebuild_scores_from_log(self.conn, dry_run=False, recall_map=recall_map)
+        self._reload_after_rollback()
+        return stats
+
+    def _reload_after_rollback(self) -> None:
+        """Scores changed underneath the live duel — drop volatile in-memory state and rebuild."""
+        try:
+            self._stop_video("a")
+            self._stop_video("b")
+        except Exception:
+            pass
+        self.history_index = None
+        self.duel_history = []
+        self.future_queue = []
+        self.solo_mode = False
+        try:
+            self._last_ranks = {r["folder"]: r["rank"] for r in folder_leaderboard(self.conn, metric=self.metric)}
+        except Exception:
+            pass
+        try:
+            self.load_duel()
+        except Exception as ex:
+            print(f"[rollback] load_duel failed: {ex}")
+        try:
+            self.update_sidebar()
+        except Exception:
+            pass
+
+    def _regen_sidecars_async(self, status_cb=None) -> None:
+        """Rebuild all sidecars from the DB on a background thread (own sqlite connection)."""
+        def worker():
+            try:
+                rconn = sqlite3.connect(str(DB_PATH))
+                def prog(done, total):
+                    if status_cb:
+                        self.root.after(0, lambda d=done, t=total: status_cb(f"Regenerating sidecars… {d}/{t}"))
+                regenerate_all_sidecars(rconn, progress=prog)
+                rconn.close()
+                if status_cb:
+                    self.root.after(0, lambda: status_cb("Sidecars regenerated from DB."))
+            except Exception as ex:
+                if status_cb:
+                    self.root.after(0, lambda: status_cb(f"Sidecar regen failed: {ex}"))
+        threading.Thread(target=worker, daemon=True).start()
+
+    # -------------------- History / Rollback manager window --------------------
+    def show_history_manager(self) -> None:
+        if self._hm_win is not None:
+            try:
+                if self._hm_win.winfo_exists():
+                    self._hm_win.lift()
+                    self._hm_win.focus_force()
+                    self._hm_refresh()
+                    return
+            except Exception:
+                pass
+            self._hm_win = None
+
+        win = tk.Toplevel(self.root)
+        self._hm_win = win
+        win.title("History / Rollback")
+        win.configure(bg=DARK_BG)
+        win.geometry("840x680")
+
+        def _on_close():
+            self._hm_win = None
+            win.destroy()
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+
+        self._hm_stats = tk.Label(win, text="", justify="left", anchor="w",
+                                  font=("Consolas", 10), fg=TEXT_COLOR, bg=DARK_BG)
+        self._hm_stats.pack(fill="x", padx=10, pady=(10, 6))
+
+        actions = tk.Frame(win, bg=DARK_BG)
+        actions.pack(fill="x", padx=10, pady=(0, 6))
+        tk.Label(actions, text="Undo last", fg=TEXT_COLOR, bg=DARK_BG).pack(side="left")
+        self._hm_undo_n = tk.IntVar(value=1)
+        tk.Spinbox(actions, from_=1, to=9999, width=5, textvariable=self._hm_undo_n,
+                   bg=DARK_PANEL, fg=TEXT_COLOR, relief="flat").pack(side="left", padx=4)
+        tk.Label(actions, text="duel(s)", fg=TEXT_COLOR, bg=DARK_BG).pack(side="left")
+        tk.Button(actions, text="Undo", command=self._hm_do_undo,
+                  bg=DARK_PANEL, fg=TEXT_COLOR, relief="flat").pack(side="left", padx=(8, 16))
+        tk.Button(actions, text="Take snapshot", command=self._hm_take_snapshot,
+                  bg=DARK_PANEL, fg=TEXT_COLOR, relief="flat").pack(side="left", padx=4)
+        tk.Button(actions, text="Backup DB now", command=self._hm_backup,
+                  bg=DARK_PANEL, fg=TEXT_COLOR, relief="flat").pack(side="left", padx=4)
+        tk.Button(actions, text="Regenerate sidecars", command=self._hm_regen,
+                  bg=DARK_PANEL, fg=TEXT_COLOR, relief="flat").pack(side="left", padx=4)
+        tk.Button(actions, text="Rebuild from log…", command=self._hm_rebuild,
+                  bg=DARK_PANEL, fg=TEXT_COLOR, relief="flat").pack(side="left", padx=4)
+
+        lists = tk.Frame(win, bg=DARK_BG)
+        lists.pack(fill="both", expand=True, padx=10, pady=4)
+
+        sframe = tk.Frame(lists, bg=DARK_BG)
+        sframe.pack(side="left", fill="both", expand=True, padx=(0, 5))
+        tk.Label(sframe, text="Sessions (newest first)", fg=ACCENT, bg=DARK_BG,
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        self._hm_sessions = tk.Listbox(sframe, bg=DARK_PANEL, fg=TEXT_COLOR, selectbackground=ACCENT,
+                                       font=("Consolas", 9), activestyle="none", height=16)
+        self._hm_sessions.pack(fill="both", expand=True)
+        self._hm_sessions.bind("<Double-Button-1>", lambda e: self._hm_open_session_detail())
+        srow = tk.Frame(sframe, bg=DARK_BG)
+        srow.pack(fill="x", pady=3)
+        tk.Button(srow, text="Open / edit duels →", command=self._hm_open_session_detail,
+                  bg=DARK_PANEL, fg=TEXT_COLOR, relief="flat").pack(side="left", padx=2)
+        tk.Button(srow, text="Roll back to START", command=lambda: self._hm_rollback_session("start"),
+                  bg=DARK_PANEL, fg=TEXT_COLOR, relief="flat").pack(side="left", padx=2)
+        tk.Button(srow, text="to END", command=lambda: self._hm_rollback_session("end"),
+                  bg=DARK_PANEL, fg=TEXT_COLOR, relief="flat").pack(side="left", padx=2)
+
+        nframe = tk.Frame(lists, bg=DARK_BG)
+        nframe.pack(side="left", fill="both", expand=True, padx=(5, 0))
+        tk.Label(nframe, text="Snapshots (newest first)", fg=ACCENT, bg=DARK_BG,
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        self._hm_snaps = tk.Listbox(nframe, bg=DARK_PANEL, fg=TEXT_COLOR, selectbackground=ACCENT,
+                                    font=("Consolas", 9), activestyle="none", height=16)
+        self._hm_snaps.pack(fill="both", expand=True)
+        tk.Button(nframe, text="Restore selected snapshot", command=self._hm_restore_snapshot,
+                  bg=DARK_PANEL, fg=TEXT_COLOR, relief="flat").pack(fill="x", pady=3)
+
+        self._hm_status = tk.Label(win, text="Tip: every rollback first takes a 'pre-rollback' "
+                                   "snapshot, so any rollback can itself be undone.",
+                                   justify="left", anchor="w", wraplength=800,
+                                   font=("Segoe UI", 9), fg=ACCENT, bg=DARK_BG)
+        self._hm_status.pack(fill="x", padx=10, pady=(0, 8))
+
+        self._hm_session_ids: List[int] = []
+        self._hm_snap_ids: List[int] = []
+        self._hm_refresh()
+
+    def _hm_set_status(self, text: str) -> None:
+        if getattr(self, "_hm_status", None) is not None:
+            try:
+                self._hm_status.config(text=text)
+            except Exception:
+                pass
+
+    def _hm_refresh(self) -> None:
+        if self._hm_win is None:
+            return
+        fmt = lambda t: "n/a" if not t else datetime.fromtimestamp(int(t)).strftime("%Y-%m-%d %H:%M")
+        ni = self.conn.execute("SELECT COUNT(*) FROM images").fetchone()[0]
+        nc = self.conn.execute("SELECT COUNT(*) FROM comparisons").fetchone()[0]
+        na = self.conn.execute("SELECT COUNT(*) FROM comparisons WHERE active=1").fetchone()[0]
+        ns = self.conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        nsnap = self.conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
+        self._hm_stats.config(text=(
+            f"Images: {ni}    Comparisons: {nc}  (active {na}, archived {nc - na})\n"
+            f"Sessions: {ns}    Snapshots: {nsnap}    Current live session: #{self.session_id}"
+        ))
+
+        self._hm_sessions.delete(0, "end")
+        self._hm_session_ids = []
+        for (sid, st, et, label, _scid, _note) in self.conn.execute(
+            "SELECT id, started_ts, ended_ts, label, start_comparison_id, note FROM sessions ORDER BY id DESC"
+        ):
+            cnt = self.conn.execute("SELECT COUNT(*) FROM comparisons WHERE session_id=?", (sid,)).fetchone()[0]
+            live = " (live)" if sid == self.session_id else ""
+            self._hm_sessions.insert("end", f"#{sid:<4} {fmt(st)} – {fmt(et)}  {cnt:>4} duels  [{label}]{live}")
+            self._hm_session_ids.append(sid)
+
+        self._hm_snaps.delete(0, "end")
+        self._hm_snap_ids = []
+        for (sid, ts, label, kind, _ssid, mcid) in self.conn.execute(
+            "SELECT id, ts, label, kind, session_id, max_comparison_id FROM snapshots ORDER BY id DESC LIMIT 300"
+        ):
+            self._hm_snaps.insert("end", f"#{sid:<4} {fmt(ts)}  {kind:<12} cid≤{mcid:<6} {label or ''}")
+            self._hm_snap_ids.append(sid)
+
+    def _hm_selected(self, listbox, ids):
+        sel = listbox.curselection()
+        if not sel:
+            return None
+        return ids[sel[0]]
+
+    def _hm_do_undo(self) -> None:
+        try:
+            n = max(1, int(self._hm_undo_n.get() or 1))
+        except Exception:
+            n = 1
+        avail = self.conn.execute(
+            "SELECT COUNT(*) FROM comparisons WHERE active=1 AND left_score_before IS NOT NULL"
+        ).fetchone()[0]
+        if avail == 0:
+            self._hm_set_status("Nothing to undo (no fully-logged active comparisons).")
+            return
+        n = min(n, avail)
+        if not messagebox.askyesno(
+            "Undo", f"Reverse the last {n} duel(s)?\nA pre-rollback snapshot is taken first (undoable).",
+            parent=self._hm_win,
+        ):
+            return
+        res = self.undo_last(n)
+        self._hm_refresh()
+        self._hm_set_status(f"Undid {res['undone']} duel(s). Pre-rollback snapshot #{res.get('pre_snapshot_id')}.")
+
+    def _hm_take_snapshot(self) -> None:
+        sid = _take_snapshot(self.conn, kind="manual", label="manual snapshot", session_id=self.session_id)
+        self._hm_refresh()
+        self._hm_set_status(f"Snapshot #{sid} taken.")
+
+    def _hm_backup(self) -> None:
+        self._hm_set_status("Backing up…")
+        if self._hm_win:
+            self._hm_win.update_idletasks()
+        dest = backup_db()
+        self._hm_set_status(f"Backup written: {dest}" if dest else "Backup failed (see console).")
+
+    def _hm_regen(self) -> None:
+        self._regen_sidecars_async(status_cb=self._hm_set_status)
+        self._hm_set_status("Regenerating sidecars in background…")
+
+    def _hm_rebuild(self) -> None:
+        dry = rebuild_scores_from_log(self.conn, dry_run=True)
+        amb = self.conn.execute(
+            "SELECT COUNT(*) FROM comparisons WHERE active=1 AND left_score_before IS NULL AND chosen_id IS NULL"
+        ).fetchone()[0]
+        legacy = self.conn.execute(
+            "SELECT COUNT(*) FROM comparisons WHERE active=1 AND left_score_before IS NULL"
+        ).fetchone()[0]
+        msg = (
+            f"Replay all {dry['duels']} active duels in time order to recompute scores?\n\n"
+            f"• {dry['moved']} of {dry['images']} images would move >1 pt "
+            f"(max {dry['max_drift']:.1f}, mean {dry['mean_drift']:.2f} pts).\n"
+            f"• {legacy} legacy duels become individually editable afterward (re-vote to 'recall' them).\n"
+            f"• {amb} unknown tie/downvote duels replay as TIES — their original downvote\n"
+            f"  penalties can't be recovered; recall the ones you remember by re-voting.\n"
+            f"• Original dates/times are kept.\n\n"
+            f"A pre-rollback snapshot is taken first, so this is fully reversible."
+        )
+        if not messagebox.askyesno("Rebuild scores from log", msg, parent=self._hm_win):
+            return
+        self._hm_set_status("Rebuilding… (a pre-rollback snapshot is being taken)")
+        if self._hm_win:
+            self._hm_win.update_idletasks()
+        stats = self.rebuild_from_log()
+        self._hm_refresh()
+        self._hm_set_status(
+            f"Rebuilt from {stats['duels']} duels. {stats['moved']} images moved >1pt "
+            f"(max {stats['max_drift']:.1f}). All duels are now editable — re-vote any to recall it. "
+            f"Reverse via the latest 'pre-rollback' snapshot."
+        )
+
+    def _hm_rollback_session(self, where: str) -> None:
+        sid = self._hm_selected(self._hm_sessions, self._hm_session_ids)
+        if sid is None:
+            self._hm_set_status("Select a session first.")
+            return
+        if not messagebox.askyesno(
+            "Roll back",
+            f"Roll back to the {where.upper()} of session #{sid}?\n"
+            f"A pre-rollback snapshot is taken first (undoable).",
+            parent=self._hm_win,
+        ):
+            return
+        res = self.rollback_to_session(sid, where=where)
+        self._hm_refresh()
+        if res.get("ok"):
+            self._hm_set_status(
+                f"Rolled back to {where} of session #{sid} (restored snapshot #{res.get('snapshot_id')}). "
+                f"Pre-rollback snapshot #{res.get('pre_snapshot_id')}."
+            )
+        else:
+            self._hm_set_status(f"Rollback failed: {res.get('error')}")
+
+    def _hm_restore_snapshot(self) -> None:
+        sid = self._hm_selected(self._hm_snaps, self._hm_snap_ids)
+        if sid is None:
+            self._hm_set_status("Select a snapshot first.")
+            return
+        if not messagebox.askyesno(
+            "Restore snapshot",
+            f"Restore snapshot #{sid}?\nA pre-rollback snapshot is taken first (undoable).",
+            parent=self._hm_win,
+        ):
+            return
+        res = self.restore_snapshot(sid)
+        self._hm_refresh()
+        if res.get("ok"):
+            self._hm_set_status(
+                f"Restored snapshot #{sid} ({res.get('restored_rows')} images). "
+                f"Pre-rollback snapshot #{res.get('pre_snapshot_id')}."
+            )
+        else:
+            self._hm_set_status(f"Restore failed: {res.get('error')}")
+
+    # -------------------- Session drill-in (edit/undo individual duels + tags) --------------------
+    def _hm_open_session_detail(self) -> None:
+        sid = self._hm_selected(self._hm_sessions, self._hm_session_ids)
+        if sid is None:
+            self._hm_set_status("Select a session first, then 'Open / edit duels'.")
+            return
+        self.show_session_detail(sid)
+
+    def _open_path(self, path: str) -> None:
+        try:
+            os.startfile(path)  # type: ignore[attr-defined]
+        except Exception as ex:
+            self._sd_set_status(f"Open failed: {ex}")
+
+    def show_session_detail(self, session_id: int) -> None:
+        """Open a drill-in window listing every duel in a session, with per-duel re-vote / undo /
+        restore and per-image tag editing. Thumbnails for every row (built async, bounded pool)."""
+        # Close any prior drill-in window (singleton).
+        if self._sd_win is not None:
+            try:
+                self._sd_cancel.set()
+            except Exception:
+                pass
+            try:
+                if self._sd_win.winfo_exists():
+                    self._sd_win.destroy()
+            except Exception:
+                pass
+            self._sd_win = None
+
+        self._sd_session_id = session_id
+        self._sd_selected_cid = None
+        self._sd_pre_edit_done = False
+        self._sd_cancel = threading.Event()
+        self._sd_rows: List[dict] = []
+        self._sd_thumb_refs: List = []
+
+        win = tk.Toplevel(self.root)
+        self._sd_win = win
+        win.title(f"Session #{session_id} — duels")
+        win.configure(bg=DARK_BG)
+        win.geometry("1100x740")
+
+        def _on_close():
+            try:
+                self._sd_cancel.set()
+            except Exception:
+                pass
+            self._sd_win = None
+            win.destroy()
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+
+        self._sd_header = tk.Label(win, justify="left", anchor="w", font=("Consolas", 10),
+                                   fg=TEXT_COLOR, bg=DARK_BG)
+        self._sd_header.pack(fill="x", padx=10, pady=(8, 4))
+
+        body = tk.Frame(win, bg=DARK_BG)
+        body.pack(fill="both", expand=True, padx=10, pady=4)
+
+        # Left: scrollable list of duel rows
+        left = tk.Frame(body, bg=DARK_BG)
+        left.pack(side="left", fill="both", expand=True)
+        canvas = tk.Canvas(left, bg=DARK_BG, highlightthickness=0)
+        vsb = tk.Scrollbar(left, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        inner = tk.Frame(canvas, bg=DARK_BG)
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        self._sd_canvas = canvas
+        self._sd_inner = inner
+        _wheel = lambda e: canvas.yview_scroll(int(-(e.delta) / 120), "units")
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _wheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+        # Right: per-duel editor panel
+        editor = tk.Frame(body, bg=DARK_PANEL, width=390)
+        editor.pack(side="right", fill="y", padx=(8, 0))
+        editor.pack_propagate(False)
+        self._sd_editor = editor
+
+        self._sd_status = tk.Label(win, justify="left", anchor="w", wraplength=1060,
+                                   font=("Segoe UI", 9), fg=ACCENT, bg=DARK_BG)
+        self._sd_status.pack(fill="x", padx=10, pady=(0, 8))
+
+        self._sd_build_rows()
+        self._sd_render_editor(None)
+        self._sd_start_thumb_workers()
+
+    def _sd_set_status(self, text: str) -> None:
+        if getattr(self, "_sd_status", None) is not None:
+            try:
+                self._sd_status.config(text=text)
+            except Exception:
+                pass
+
+    def _sd_is_hidden(self, img_id: int) -> bool:
+        r = self.conn.execute("SELECT hidden FROM images WHERE id=?", (img_id,)).fetchone()
+        return bool(r and r[0])
+
+    def _sd_build_rows(self) -> None:
+        sid = self._sd_session_id
+        rows = self.conn.execute(
+            "SELECT c.id, c.left_id, c.right_id, c.outcome, c.left_score_before, c.right_score_before, "
+            "c.left_score_after, c.right_score_after, c.active, c.ts, li.path, ri.path, li.tags, ri.tags "
+            "FROM comparisons c "
+            "LEFT JOIN images li ON li.id = c.left_id "
+            "LEFT JOIN images ri ON ri.id = c.right_id "
+            "WHERE c.session_id=? ORDER BY c.id ASC",
+            (sid,),
+        ).fetchall()
+        total = len(rows)
+        editable = sum(1 for r in rows if r[4] is not None and r[6] is not None)
+        self._sd_header.config(text=(
+            f"Session #{sid}: {total} duels  ({editable} editable, {total - editable} legacy/view-only).  "
+            f"Click a duel to edit it.\n"
+            f"Legend:  ◀L = left won   R▶ = right won   = tie   ⬇ downvote   [undone] = archived"
+        ))
+        for r in rows:
+            (cid, lid, rid, outcome, lb, rb, la, ra, active, ts, lpath, rpath, ltags, rtags) = r
+            legacy = (lb is None or rb is None or la is None or ra is None)
+            d = {"cid": cid, "lid": lid, "rid": rid, "outcome": outcome,
+                 "lb": lb, "rb": rb, "la": la, "ra": ra, "active": active, "ts": ts,
+                 "lpath": lpath or "", "rpath": rpath or "",
+                 "ltags": ltags or "[]", "rtags": rtags or "[]", "legacy": legacy, "thumb": None}
+            frame = tk.Frame(self._sd_inner, bg=DARK_PANEL)
+            frame.pack(fill="x", pady=1)
+            thumb_lbl = tk.Label(frame, bg="#111111")
+            thumb_lbl.pack(side="left", padx=2, pady=2)
+            text_lbl = tk.Label(frame, justify="left", anchor="w", font=("Consolas", 9),
+                                fg=TEXT_COLOR, bg=DARK_PANEL)
+            text_lbl.pack(side="left", fill="x", expand=True, padx=4)
+            d["frame"] = frame
+            d["thumb_lbl"] = thumb_lbl
+            d["text_lbl"] = text_lbl
+            for w in (frame, thumb_lbl, text_lbl):
+                w.bind("<Button-1>", lambda e, c=cid: self._sd_select(c))
+            self._sd_rows.append(d)
+            self._sd_update_row_text(d)
+
+    def _sd_update_row_text(self, d: dict) -> None:
+        def nm(p):
+            n = Path(p).name if p else "(missing)"
+            return (n[:22] + "…") if len(n) > 23 else n
+        mark = {"left": "◀L ", "right": " R▶", "tie": " =  ", "downvote": " ⬇  "}.get(d["outcome"], " ?  ")
+        t = time.strftime("%H:%M", time.localtime(d["ts"])) if d["ts"] else "--:--"
+        la = f"{d['la']:.0f}" if d["la"] is not None else "·"
+        ra = f"{d['ra']:.0f}" if d["ra"] is not None else "·"
+        pre = "" if d["active"] else "[undone] "
+        suf = "   (legacy: view only)" if d["legacy"] else ""
+        d["text_lbl"].config(
+            text=f"{pre}#{d['cid']}  {t}  {mark}  L:{nm(d['lpath'])}({la})  R:{nm(d['rpath'])}({ra}){suf}",
+            fg=("#8a8a8a" if (d["legacy"] or not d["active"]) else TEXT_COLOR),
+        )
+        sel = (d["cid"] == self._sd_selected_cid)
+        bg = ACCENT if sel else DARK_PANEL
+        try:
+            d["frame"].config(bg=bg)
+            d["text_lbl"].config(bg=bg)
+        except Exception:
+            pass
+
+    def _sd_select(self, cid: int) -> None:
+        self._sd_selected_cid = cid
+        for d in self._sd_rows:
+            self._sd_update_row_text(d)
+        d = next((x for x in self._sd_rows if x["cid"] == cid), None)
+        self._sd_render_editor(d)
+
+    def _sd_render_editor(self, d: Optional[dict]) -> None:
+        E = self._sd_editor
+        for w in E.winfo_children():
+            w.destroy()
+        if d is None:
+            tk.Label(E, text="Select a duel on the left to re-vote, undo, or edit its tags.",
+                     fg=TEXT_COLOR, bg=DARK_PANEL, wraplength=360, justify="left").pack(anchor="w", padx=10, pady=10)
+            return
+        tk.Label(E, text=f"Duel #{d['cid']}", font=("Segoe UI", 11, "bold"),
+                 fg=ACCENT, bg=DARK_PANEL).pack(anchor="w", padx=10, pady=(10, 2))
+        if d["legacy"]:
+            tk.Label(E, text="Legacy duel (pre-history-feature): no stored before/after scores, so it "
+                     "can't be re-voted or undone individually. Use snapshot rollback for coarse changes.",
+                     fg="#d0a000", bg=DARK_PANEL, wraplength=360, justify="left").pack(anchor="w", padx=10, pady=4)
+        else:
+            tk.Label(E, text="Re-vote:", fg=TEXT_COLOR, bg=DARK_PANEL).pack(anchor="w", padx=10, pady=(6, 0))
+            orow = tk.Frame(E, bg=DARK_PANEL)
+            orow.pack(fill="x", padx=10, pady=2)
+            for label, oc in (("◀ Left", "left"), ("Right ▶", "right")):
+                cur = (d["outcome"] == oc)
+                b = tk.Button(orow, text=label + (" ✓" if cur else ""),
+                              command=lambda o=oc: self._sd_revote(o),
+                              bg=(ACCENT if cur else DARK_BG), fg=TEXT_COLOR, relief="flat")
+                b.pack(side="left", padx=2)
+                if not d["active"]:
+                    b.config(state="disabled")
+            urow = tk.Frame(E, bg=DARK_PANEL)
+            urow.pack(fill="x", padx=10, pady=(4, 2))
+            if d["active"]:
+                tk.Button(urow, text="Undo this duel", command=lambda c=d["cid"]: self._sd_undo(c),
+                          bg=DARK_BG, fg=TEXT_COLOR, relief="flat").pack(side="left", padx=2)
+            else:
+                tk.Label(urow, text="(undone)", fg="#d08000", bg=DARK_PANEL).pack(side="left", padx=2)
+                tk.Button(urow, text="Restore this duel", command=lambda c=d["cid"]: self._sd_restore(c),
+                          bg=DARK_BG, fg=TEXT_COLOR, relief="flat").pack(side="left", padx=2)
+        tk.Frame(E, height=1, bg=SEPARATOR_BG).pack(fill="x", padx=10, pady=8)
+        tk.Label(E, text="Tags (apply to the image's current state, globally):",
+                 fg="#aaaaaa", bg=DARK_PANEL, wraplength=360, justify="left").pack(anchor="w", padx=10)
+        self._sd_tag_vars = {"left": {}, "right": {}}
+        self._sd_hidden_vars = {}
+        self._sd_build_tag_editor(E, "left", d["lid"], d["lpath"], d["ltags"])
+        self._sd_build_tag_editor(E, "right", d["rid"], d["rpath"], d["rtags"])
+
+    def _sd_build_tag_editor(self, parent, side: str, img_id: int, path: str, tags_raw: str) -> None:
+        cur_tags = set(self._parse_tags(tags_raw))
+        title = ("Left" if side == "left" else "Right") + " — " + (Path(path).name[:28] if path else "(missing)")
+        box = tk.LabelFrame(parent, text=title, fg=TEXT_COLOR, bg=DARK_PANEL, labelanchor="nw")
+        box.pack(fill="x", padx=10, pady=4)
+        grid = tk.Frame(box, bg=DARK_PANEL)
+        grid.pack(fill="x", padx=4, pady=2)
+        self._sd_tag_vars[side] = {}
+        for i, tag in enumerate(TAG_OPTIONS):
+            v = tk.BooleanVar(value=(tag in cur_tags))
+            self._sd_tag_vars[side][tag] = v
+            tk.Checkbutton(grid, text=tag, variable=v, fg=TEXT_COLOR, bg=DARK_PANEL,
+                           selectcolor=DARK_BG, activebackground=DARK_PANEL,
+                           activeforeground=TEXT_COLOR).grid(row=i // 3, column=i % 3, sticky="w", padx=2)
+        hv = tk.BooleanVar(value=self._sd_is_hidden(img_id))
+        self._sd_hidden_vars[side] = hv
+        brow = tk.Frame(box, bg=DARK_PANEL)
+        brow.pack(fill="x", padx=4, pady=2)
+        tk.Checkbutton(brow, text="Hidden", variable=hv, fg=TEXT_COLOR, bg=DARK_PANEL, selectcolor=DARK_BG,
+                       activebackground=DARK_PANEL, activeforeground=TEXT_COLOR).pack(side="left")
+        tk.Button(brow, text="Save tags", command=lambda s=side, iid=img_id: self._sd_save_tags(s, iid),
+                  bg=DARK_BG, fg=TEXT_COLOR, relief="flat").pack(side="right", padx=2)
+        if path:
+            tk.Button(brow, text="Open", command=lambda p=path: self._open_path(p),
+                      bg=DARK_BG, fg=TEXT_COLOR, relief="flat").pack(side="right", padx=2)
+
+    def _sd_ensure_pre_edit_snapshot(self) -> None:
+        if getattr(self, "_sd_pre_edit_done", False):
+            return
+        try:
+            _take_snapshot(self.conn, kind="pre-rollback",
+                           label=f"before editing session #{self._sd_session_id}", session_id=self.session_id)
+            self._sd_pre_edit_done = True
+        except Exception as ex:
+            print(f"[session-edit] pre-edit snapshot failed: {ex}")
+
+    def _sd_revote(self, new_outcome: str) -> None:
+        cid = self._sd_selected_cid
+        if cid is None:
+            return
+        self._sd_ensure_pre_edit_snapshot()
+        res = revote_comparison_db(self.conn, cid, new_outcome)
+        if not res.get("ok"):
+            self._sd_set_status(f"Cannot re-vote: {res.get('error')}")
+            return
+        d = next((x for x in self._sd_rows if x["cid"] == cid), None)
+        if d:
+            rr = self.conn.execute(
+                "SELECT outcome, left_score_after, right_score_after, active FROM comparisons WHERE id=?",
+                (cid,)).fetchone()
+            d["outcome"], d["la"], d["ra"], d["active"] = rr
+            self._sd_update_row_text(d)
+            self._sd_render_editor(d)
+        self._sd_set_status(f"Re-voted duel #{cid} → {new_outcome}."
+                            + ("" if res.get("changed") else " (no change)"))
+        self._after_comparison_edit()
+
+    def _sd_undo(self, cid: int) -> None:
+        self._sd_ensure_pre_edit_snapshot()
+        res = undo_comparison_db(self.conn, cid)
+        if not res.get("ok"):
+            self._sd_set_status(f"Cannot undo: {res.get('error')}")
+            return
+        d = next((x for x in self._sd_rows if x["cid"] == cid), None)
+        if d:
+            d["active"] = 0
+            self._sd_update_row_text(d)
+            self._sd_render_editor(d)
+        self._sd_set_status(f"Undid duel #{cid} (archived; click Restore to re-apply).")
+        self._after_comparison_edit()
+
+    def _sd_restore(self, cid: int) -> None:
+        self._sd_ensure_pre_edit_snapshot()
+        res = restore_comparison_db(self.conn, cid)
+        if not res.get("ok"):
+            self._sd_set_status(f"Cannot restore: {res.get('error')}")
+            return
+        d = next((x for x in self._sd_rows if x["cid"] == cid), None)
+        if d:
+            d["active"] = 1
+            self._sd_update_row_text(d)
+            self._sd_render_editor(d)
+        self._sd_set_status(f"Restored duel #{cid}.")
+        self._after_comparison_edit()
+
+    def _sd_save_tags(self, side: str, img_id: int) -> None:
+        tags = {t for t, v in self._sd_tag_vars[side].items() if v.get()}
+        hidden = 1 if self._sd_hidden_vars[side].get() else 0
+        self._write_tags(img_id, tags, hidden=hidden)
+        # Re-read canonical stored tags and refresh any row dicts referencing this image.
+        row = self.conn.execute("SELECT tags FROM images WHERE id=?", (img_id,)).fetchone()
+        raw = row[0] if row else json.dumps(sorted(tags))
+        for d in self._sd_rows:
+            changed = False
+            if d["lid"] == img_id:
+                d["ltags"] = raw; changed = True
+            if d["rid"] == img_id:
+                d["rtags"] = raw; changed = True
+            if changed:
+                self._sd_update_row_text(d)
+        self._sd_set_status(f"Saved tags for image #{img_id}: {', '.join(self._ordered_tags(tags)) or '(none)'}"
+                            + ("  [Hidden]" if hidden else ""))
+        # If this image is on screen in the live duel, keep its tag controls in sync.
+        try:
+            for s in ("a", "b"):
+                r = self._side[s].get("row")
+                if r and r[0] == img_id:
+                    fresh = self._fetch_row(img_id)
+                    if fresh:
+                        self._side[s]["row"] = fresh
+                    self._sync_tag_controls(s)
+        except Exception:
+            pass
+
+    def _after_comparison_edit(self) -> None:
+        self._refresh_live_scores_after_edit()
+        if self._hm_win is not None:
+            try:
+                self._hm_refresh()
+            except Exception:
+                pass
+
+    def _refresh_live_scores_after_edit(self) -> None:
+        """A historical edit may have changed an image that's on screen or in the leaderboard."""
+        try:
+            if self.current and self.history_index is None and not self.solo_mode:
+                a, b = self.current
+                na, nb = self._fetch_row(a[0]), self._fetch_row(b[0])
+                if na and nb:
+                    self.current = (na, nb)
+                    self.live_current = (na, nb)
+                    self._update_info_bars(na, nb)
+        except Exception:
+            pass
+        try:
+            self._last_ranks = {r["folder"]: r["rank"] for r in folder_leaderboard(self.conn, metric=self.metric)}
+            self.update_sidebar()
+        except Exception:
+            pass
+
+    def _sd_start_thumb_workers(self, n: int = 4) -> None:
+        self._sd_thumb_idx = 0
+        self._sd_thumb_lock = threading.Lock()
+        w2 = self.carousel_thumb_size[0] * 2 + 2
+        h = self.carousel_thumb_size[1]
+        try:
+            self._sd_placeholder = ImageTk.PhotoImage(Image.new("RGB", (w2, h), "#111111"))
+            for d in self._sd_rows:
+                d["thumb_lbl"].config(image=self._sd_placeholder)
+        except Exception:
+            pass
+
+        def worker():
+            while not self._sd_cancel.is_set():
+                with self._sd_thumb_lock:
+                    i = self._sd_thumb_idx
+                    if i >= len(self._sd_rows):
+                        return
+                    self._sd_thumb_idx += 1
+                d = self._sd_rows[i]
+                try:
+                    sensitive = bool((set(self._parse_tags(d["ltags"])) | set(self._parse_tags(d["rtags"]))) & BLUR_TAGS)
+                    thumb = self._build_duel_thumbnail(d["lpath"], d["rpath"], sensitive=sensitive)
+                except Exception:
+                    thumb = None
+                if thumb is not None and not self._sd_cancel.is_set():
+                    self._sd_thumb_refs.append(thumb)
+                    d["thumb"] = thumb
+                    self.root.after(0, lambda dd=d, th=thumb: self._sd_apply_thumb(dd, th))
+
+        for _ in range(max(1, n)):
+            threading.Thread(target=worker, daemon=True).start()
+
+    def _sd_apply_thumb(self, d: dict, thumb) -> None:
+        if self._sd_win is None:
+            return
+        try:
+            if d["thumb_lbl"].winfo_exists():
+                d["thumb_lbl"].config(image=thumb)
+        except Exception:
+            pass
+
     # -------------------- DB stats --------------------
     def show_db_stats(self):
         n_images = self.conn.execute("SELECT COUNT(*) FROM images").fetchone()[0]
@@ -5328,9 +6692,13 @@ class App:
         sums = self.conn.execute("SELECT COALESCE(SUM(duels),0), COALESCE(SUM(wins),0), COALESCE(SUM(losses),0) FROM images").fetchone()
         sum_duels, sum_wins, sum_losses = int(sums[0]), int(sums[1]), int(sums[2])
 
+        n_active = self.conn.execute("SELECT COUNT(*) FROM comparisons WHERE active=1").fetchone()[0]
+        n_sessions = self.conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        n_snaps = self.conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
+
         msg = "\n".join([
             f"Images: {n_images} (hidden: {n_hidden})",
-            f"Comparisons: {n_comp}",
+            f"Comparisons: {n_comp}  (active {n_active}, archived {n_comp - n_active})",
             f"First duel: {fmt(tmin)}",
             f"Last duel:  {fmt(tmax)}",
             "",
@@ -5339,7 +6707,10 @@ class App:
             f"SUM(images.losses)  = {sum_losses}",
             f"Comparisons * 2     = {n_comp * 2}",
             "",
+            f"Sessions: {n_sessions}    Snapshots: {n_snaps}    Live session: #{self.session_id}",
+            "",
             "A reset usually shows as: comparisons near 0 and first/last duel very recent.",
+            "Press 'h' (or the History/Rollback button) to undo duels or roll back a session.",
         ])
         messagebox.showinfo("DB stats", msg)
 
@@ -5376,6 +6747,8 @@ class App:
             self._stop_video("b")
         except Exception:
             pass
+        # Close the live session (stamp ended_ts) BEFORE closing the connection.
+        self._close_session()
         try:
             self.conn.close()
         except Exception:
@@ -5420,17 +6793,38 @@ def run():
     app = App(root, conn)
     root.mainloop()
 
-    # optional report
+    # optional report — use a fresh connection: App.quit() closes `conn` on exit.
+    rconn = None
     try:
+        rconn = sqlite3.connect(str(DB_PATH))
         csv_path = Path(ROOT_DIR) / "image_duel_report.csv"
-        export_csv(conn, csv_path)
+        export_csv(rconn, csv_path)
         print(f"[report] CSV written: {csv_path}")
     except Exception:
         pass
     try:
-        show_folder_chart(conn)
+        if rconn is not None:
+            show_folder_chart(rconn)
     except Exception:
         pass
+    finally:
+        try:
+            if rconn is not None:
+                rconn.close()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
-    run()
+    # CLI utilities (no GUI):
+    #   python image_duel_ranker.py --backup          -> VACUUM INTO backups/, rotate to last N
+    #   python image_duel_ranker.py --regen-sidecars  -> rebuild every sidecar JSON from the DB
+    if "--backup" in sys.argv:
+        backup_db()
+    elif "--regen-sidecars" in sys.argv:
+        _c = init_db()
+        try:
+            regenerate_all_sidecars(_c, progress=lambda d, t: print(f"[sidecars] {d}/{t}"))
+        finally:
+            _c.close()
+    else:
+        run()
