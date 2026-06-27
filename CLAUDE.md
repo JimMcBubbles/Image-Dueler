@@ -28,10 +28,11 @@
 | `FAVORITE_TAG` / `NON_MATCH_TAGS` | `"FAVORITE"` / `{"FAVORITE"}` — marker tag toggled by the heart button; **excluded from duel matchmaking** (`_match_tags`) so favoriting never changes who an image duels |
 | `FAVORITE_COLOR` | `#e25555` — heart color when an image is favorited |
 | `carousel_size` | 6 slots |
-| `ACCENT` / `PENDING_COLOR` / `FUTURE_COLOR` | blue / amber / dark-teal |
+| `ACCENT` / `PENDING_COLOR` / `FUTURE_COLOR` / `SKIPPED_COLOR` | blue / amber / dark-teal / muted-purple (held skips) |
 | `LOAD_TIMEOUT_MS` | 8000 — ms before showing Retry/Open-File overlay on a slow load |
-| `DISLIKE_RATE_PENALTY` | 300.0 — multiplied by `dislikes_n / (n + FOLDER_PRIOR_IMAGES)`; rate-based dislike penalty |
+| `DISLIKE_RATE_PENALTY` | 300.0 — multiplied by the **prior-shrunk** dislike rate `(dislikes_n + r0·DISLIKE_PRIOR_IMAGES) / (n + dislikes_n + DISLIKE_PRIOR_IMAGES)`, where `r0` = population baseline dislike rate computed live in `folder_leaderboard` |
 | `VOLUME_BONUS` | 50.0 — max bonus for large like-count; scaled by `n/(n+FOLDER_PRIOR_IMAGES)` |
+| `DISLIKE_PRIOR_IMAGES` | 20 — pseudo-image prior on the dislike rate. A folder is assumed to carry the population baseline dislike rate until it shows ~this many images with few dislikes, so tiny zero-dislike folders **regress to neutral** instead of topping the leaderboard. Higher = more skeptical of small samples |
 | `SPARKLINE_WINDOW_DEFAULT` | 60 — default rolling comparisons window for sparklines |
 | `SPARKLINE_WINDOWS` | `(20, 40, 60, 100, 200)` — cycle targets for "W: N" button |
 | `SPARKLINE_BUCKETS` | 7 — number of segments per sparkline |
@@ -82,12 +83,13 @@ self._sd_cancel       # threading.Event — set on drill-in close to stop thumbn
 ## duel_history entry shape
 ```python
 {
-  "comparison_id": int | None,   # None = sub-duel not yet voted
+  "comparison_id": int | None,   # None = unlogged: sub-duel not yet voted OR a held skip
   "a_id", "b_id": int,
   "a_path", "b_path": str,
   "before_a", "before_b": {"score","wins","losses","duels"},  # snapshot at duel time
-  "winner": "a"|"b"|"downvote"|None,
+  "winner": "a"|"b"|"downvote"|None,   # None for skips/unvoted
   "sub_label": str | None,       # e.g. "10.1" for sub-duels; None for normal
+  "skipped": bool,               # True = held skip (carousel-only, session, never logged); cleared on vote
   "thumb": ImageTk.PhotoImage | None,
 }
 ```
@@ -124,8 +126,10 @@ self._sd_cancel       # threading.Event — set on drill-in close to stop thumbn
 | Method | ~Line | Purpose |
 |--------|-------|---------|
 | `_apply_revote` | 1870 | Edits existing vote — delta wins/losses only, **no duels increment**; now also updates comparisons `outcome`+after-scores (before-scores stay fixed) |
-| `choose` | 3349 | Vote handler — `a`/`b` → `record_result` (session-stamped); **any non-`a`/`b` (skip) does nothing to score, just advances** (live) / steps to next entry (edit mode) |
-| `downvote_side` | 3515 | **Retired** — neutered to a no-score skip (`_replace_side_keep_other`); no keybind/button/menu calls it anymore |
+| `choose` | 3349 | Vote handler — `a`/`b` → `record_result` (session-stamped); **any non-`a`/`b` (skip) does nothing to score, just advances** (live) / steps to next entry (edit mode). Live whole-duel skip (`0`) now also **retains the pair via `_retain_skipped_duel`** (carousel-only, never logged). The `comparison_id is None` recover branch (voting a sub-duel **or a held skip**) clears `skipped` and logs it via `record_result` |
+| `skip_side` | 3603 | Side-swap (`7`/`8`/right-click → `_replace_side_keep_other`): keeps the other image, fresh pick for this side. In **live mode** now `_retain_skipped_duel(self.current)` (pre-swap pair) + explicit `_update_carousel()` (the swap doesn't repaint). No retention in edit/solo mode |
+| `_retain_skipped_duel` | ~2006 | Appends a **held-skip** entry (`skipped=True`, `comparison_id=None`, `winner=None`, before-scores snapshotted) to `duel_history` so a skip shows in the carousel and is recoverable by voting. In-memory only; ignores solo/`None` pairs |
+| `downvote_side` | 3515 | **Retired** — neutered to a no-score skip (`_replace_side_keep_other`); no keybind/button/menu calls it anymore. Does **not** retain a skip (only `skip_side`/`choose(None)` do) |
 | `_open_session` | 5671 | Inserts live session row + takes an `auto` start snapshot (called in `__init__` before `load_duel`) |
 | `_close_session` | 5690 | Stamps `ended_ts` (idempotent); called from `quit()` |
 | `undo_last` | 5706 | Wraps `undo_last_comparisons` + UI refresh + async sidecar rewrite for affected images |
@@ -161,7 +165,7 @@ self._sd_cancel       # threading.Event — set on drill-in close to stop thumbn
 | `_match_tags` | 2841 | Matchmaking tag set: `frozenset(_tags_for_row(row)) - NON_MATCH_TAGS` (strips FAVORITE) |
 | `toggle_favorite` | 2869 | Heart-button handler: toggles FAVORITE on the displayed image (no vote, no reroll) |
 | `_update_favorite_button` | 2896 | Sets the heart glyph/color (♥ red if favorited, ♡ otherwise); called from `_sync_tag_controls` |
-| `_build_action_buttons` | 2765 | Per-side action row: **heart (Favorite)** + Skip + Hide (Upvote/Downvote removed) |
+| `_build_action_buttons` | 2772 | Per-side action row: **heart (Favorite)** + Skip + Hide (Upvote/Downvote removed). Packs the buttons directly into the info row with a uniform `padx`; a flexible spacer packed earlier (in `__init__`) keeps the heart/Skip/Hide/Tags cluster grouped on the right edge with even spacing |
 | `_attach_history_thumbs` | 1242 | Builds entry["thumb"]; also builds entry["thumb_blurred"] for sensitive entries |
 | `_enter_history_mode` | 1255 | Save live_current, set history_index, show entry |
 | `_exit_history_mode` | 1261 | Restore live_current display, clear history_index |
@@ -279,8 +283,9 @@ Carousel highlights sub-duel amber until voted. View stays on parent duel.
 ## Ties/downvotes retired (one-time purge + feature removal)
 - **Feature removed:** no keybind/click/button/menu creates a tie or downvote. `4`/`5` and Shift-click
   (downvote) and the Downvote button/menu item are gone; `choose(None)` / `0` and `skip_side` are
-  score-neutral skips; the drill-in re-vote offers only Left/Right. `record_result`/`_apply_revote`/
-  `_outcome_*` keep tie/downvote branches but they're unreachable (only `a`/`b` is ever passed).
+  score-neutral skips (but now **held in the carousel** — see "Skipped duels"); the drill-in re-vote
+  offers only Left/Right. `record_result`/`_apply_revote`/`_outcome_*` keep tie/downvote branches but
+  they're unreachable (only `a`/`b` is ever passed).
 - **One-time data purge:** `retire_tie_downvote_once(conn)` (called from `init_db` after migration)
   backs up the DB (`backup_db`), takes a `pre-rollback` snapshot, archives every active tie/downvote
   comparison (`active=0`, never DELETE), and `rebuild_scores_from_log` → scores reflect decisive duels
@@ -288,6 +293,28 @@ Carousel highlights sub-duel amber until voted. View stays on parent duel.
   Self-guarding: a permanent no-op once no active tie/downvote rows remain.
 - **Note:** old `downvote_side` deducted −12 **without logging**, so the rebuild (log-driven) also drops
   those unlogged penalties. Archived tie/downvote rows still show in the drill-in as `[undone]`.
+
+## Skipped duels (held in carousel, session-only)
+- **Goal:** a skip is recoverable. Skipped duels are held **in memory** so an unintentional skip can be
+  clicked back to and voted; they are **never logged** to the DB until voted.
+- **What retains a skip:** the live **whole-duel skip** (`0` → `choose(None)`) retains `self.current`;
+  a live **side-swap** (`7`/`8`/right-click → `skip_side` → `_replace_side_keep_other`) retains the
+  **pre-swap** pair. Both call `_retain_skipped_duel(pair)`. Retention happens **only in live mode**
+  (`history_index is None`, not solo). Auto-skips of missing files (`_handle_missing_side`) and the
+  retired `downvote_side` do **NOT** retain (they call `_replace_side_keep_other` directly, bypassing
+  `skip_side`).
+- **Representation:** a normal `duel_history` entry with `skipped=True`, `comparison_id=None`,
+  `winner=None`, `sub_label=None`, and snapshotted `before_a`/`before_b`. It renders as a past-history
+  carousel slot (clickable → `_enter_history_mode`), tinted `SKIPPED_COLOR` with a `"↩ "` label prefix,
+  in both the live-mode and edit-mode carousel branches. The carousel info line shows `| N skipped`.
+- **Recovery:** clicking a held skip enters edit mode; casting a winner hits the `comparison_id is None`
+  branch in `choose` → `record_result` (logs it, `duels+1`), clears `skipped`, and it becomes a normal
+  voted history entry. Skipping again (`0`) just steps to the next entry, leaving it held.
+- **Lifetime:** `duel_history` is in-memory only (never persisted, not loaded at startup), so held skips
+  vanish on app close (= session end) and are wiped by `_reload_after_rollback`. Nothing extra to clear.
+- **Safety:** every site that iterates `duel_history` (`_update_carousel`, `_update_carousel_layout`,
+  `_set_blur_enabled`) only reads paths/thumbs, so held entries (with `comparison_id=None`) are inert
+  there; `_apply_revote` only runs for `comparison_id`-set entries, so held skips never hit it.
 
 ## Async patterns
 - Sidecar writes: daemon thread via `update_image_metadata`
@@ -341,6 +368,7 @@ Carousel highlights sub-duel amber until voted. View stays on parent duel.
 - Don't re-commit derived/heavy data to git (DB, sidecars, backups, installer) — it's `.gitignore`d on purpose; rollback is in-app now
 - Don't rely on replaying old `comparisons` rows (legacy tie/downvote both wrote `chosen_id=NULL`) — roll back via snapshots instead
 - Don't re-introduce tie/downvote as a scoring outcome — the feature is retired (`choose` skip = no score); skips must stay score-neutral
+- Don't log a held skip to the DB or retain one outside live mode — `_retain_skipped_duel` is carousel/in-memory only (`skipped=True`, `comparison_id=None`); don't retain auto-skips of missing files (`_handle_missing_side`) or the retired `downvote_side`
 - Don't put `FAVORITE` (or any `NON_MATCH_TAGS`) into a matchmaking frozenset — always use `_match_tags`; don't route favoriting through the `_on_tag_change` reroll path
 - Don't remove the tie/downvote display branches in the drill-in (`mark`/legend) — archived legacy rows still render them
 

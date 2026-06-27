@@ -62,6 +62,7 @@ ACCENT         = "#569cd6"
 LINK_COLOR     = "#4ea1ff"
 PENDING_COLOR  = "#7a5200"  # amber highlight for sub-duels awaiting a vote
 FUTURE_COLOR   = "#1a3a4a"  # dark teal for pre-rolled upcoming duels
+SKIPPED_COLOR  = "#4a3a5a"  # muted purple for skipped duels held in the carousel (session-only)
 
 # -------------------- CONFIG --------------------
 ROOT_DIR = r"I:\OneDrive\Discord Downloader Output\+\Grabber"
@@ -103,6 +104,10 @@ FOLDER_PRIOR_IMAGES = 8
 LCB_Z = 1.0
 DISLIKE_RATE_PENALTY = 300.0  # multiplied by dislike_rate = dislikes/(n+prior); replaces flat per-file penalty
 VOLUME_BONUS = 50.0           # max bonus for large like-count; scaled by n/(n+prior)
+DISLIKE_PRIOR_IMAGES = 20     # pseudo-images of prior on the dislike rate: a folder is assumed to carry the
+                              # population baseline dislike rate until it shows ~this many images with few
+                              # dislikes. Stops tiny zero-dislike folders from floating to the top of the board.
+                              # Higher = more skeptical (unproven folders pushed lower); lower = trusts small samples sooner.
 
 SPARKLINE_WINDOW_DEFAULT = 60   # comparisons per folder to sample for sparkline
 SPARKLINE_WINDOWS = (20, 40, 60, 100, 200)
@@ -449,16 +454,33 @@ def folder_leaderboard(conn: sqlite3.Connection, metric: str = LEADERBOARD_METRI
             GROUP BY folder
             HAVING COUNT(*) >= ?
         """, (min_n,)).fetchall()
+        # Population baseline dislike rate — the Bayesian prior target for each folder's dislike
+        # penalty. A folder is assumed to carry this baseline rate until it accumulates enough images
+        # (relative to DISLIKE_PRIOR_IMAGES) with few dislikes, so "0 dislikes from 1 image" regresses
+        # to the baseline penalty instead of floating to the top of the board; genuinely proven-clean
+        # large folders still earn a near-zero penalty.
+        dislikes_by_folder = {}
+        total_pool_n = total_pool_dislikes = 0
+        for (folder, _avg_s, n, _w, _l) in data:
+            d = int(_DISLIKE_COUNTS_BY_REL_FOLDER.get(_relative_folder_to_root(folder, ROOT_DIR), 0))
+            dislikes_by_folder[folder] = d
+            total_pool_n += int(n); total_pool_dislikes += d
+        dislike_rate_prior = (total_pool_dislikes / (total_pool_n + total_pool_dislikes)
+                              if (total_pool_n + total_pool_dislikes) > 0 else 0.0)
         for (folder, avg_s, n, wins, losses) in data:
             avg_s = float(avg_s); n = int(n)
             wins = int(wins or 0); losses = int(losses or 0)
             score = ((avg_s * n + global_mu * FOLDER_PRIOR_IMAGES) / (n + FOLDER_PRIOR_IMAGES)
                      if metric in ("shrunken_avg", "dislikes_adjusted") else avg_s)
-            rel_key = _relative_folder_to_root(folder, ROOT_DIR)
-            dislikes_n = int(_DISLIKE_COUNTS_BY_REL_FOLDER.get(rel_key, 0))
+            dislikes_n = dislikes_by_folder[folder]
             if metric == "dislikes_adjusted":
                 score += (n / (n + FOLDER_PRIOR_IMAGES)) * VOLUME_BONUS
-                score -= (dislikes_n / (n + dislikes_n + FOLDER_PRIOR_IMAGES)) * DISLIKE_RATE_PENALTY
+                # Bayesian-shrunk dislike rate: DISLIKE_PRIOR_IMAGES pseudo-images held at the
+                # population baseline rate. Low-evidence folders regress to the baseline penalty;
+                # only folders with many images and few dislikes earn a low penalty.
+                shrunk_dislike_rate = ((dislikes_n + dislike_rate_prior * DISLIKE_PRIOR_IMAGES)
+                                       / (n + dislikes_n + DISLIKE_PRIOR_IMAGES))
+                score -= shrunk_dislike_rate * DISLIKE_RATE_PENALTY
             rows.append({"folder": folder, "avg": avg_s, "n": n, "score": score,
                          "dislikes_n": dislikes_n, "wins": wins, "losses": losses})
     elif metric == "lcb":
@@ -1253,15 +1275,20 @@ class App:
                                        fg=INFO_BAR_FG, bg=INFO_BAR_BG, anchor="w")
         self.right_info_text = tk.Label(self.right_info_row, text="", font=INFO_BAR_FONT,
                                         fg=INFO_BAR_FG, bg=INFO_BAR_BG, anchor="w")
-        self.left_info_text.grid(row=0, column=0, sticky="w", padx=8)
-        self.right_info_text.grid(row=0, column=0, sticky="w", padx=8)
+        # Filename/info text pinned left. A flexible spacer then absorbs the
+        # slack so the per-side controls (heart, Skip, Hide, Tags) stay grouped
+        # on the right edge, but with even spacing between them (set in their
+        # builders) instead of the old tightly-clumped grid.
+        self.left_info_text.pack(side="left", padx=8)
+        self.right_info_text.pack(side="left", padx=8)
+        tk.Frame(self.left_info_row, bg=INFO_BAR_BG).pack(side="left", expand=True, fill="x")
+        tk.Frame(self.right_info_row, bg=INFO_BAR_BG).pack(side="left", expand=True, fill="x")
 
-        self._build_tag_menu("a", self.left_info_row)
-        self._build_tag_menu("b", self.right_info_row)
+        # Order sets L->R placement within the right-hand cluster: heart, Skip, Hide, Tags.
         self._build_action_buttons("a", self.left_info_row)
         self._build_action_buttons("b", self.right_info_row)
-        self.left_info_row.columnconfigure(0, weight=1)
-        self.right_info_row.columnconfigure(0, weight=1)
+        self._build_tag_menu("a", self.left_info_row)
+        self._build_tag_menu("b", self.right_info_row)
 
         # Make info bars behave like the image/video panel for clicks
         for w in (self.left_info_bar, self.left_info_text):
@@ -1332,7 +1359,6 @@ class App:
                 command=self.on_pool_filter_change,
             )
         self.pool_filter.configure(menu=self.pool_filter_menu)
-        self.pool_filter.pack(side="right")
         self.pool_filter.configure(text=self.pool_filter_var.get())
 
         self.tag_filter_vars: dict = {}
@@ -1348,7 +1374,6 @@ class App:
             cursor="hand2",
             anchor="w",
         )
-        self.tag_filter_btn.pack(side="right", padx=(0, 6))
         self.tag_filter_menu = tk.Menu(self.tag_filter_btn, tearoff=0)
         for tag in TAG_OPTIONS:
             var = tk.BooleanVar(value=False)
@@ -1365,14 +1390,18 @@ class App:
         self.sidebar_toggle_btn = tk.Button(self.pool_filter_row, text="Focus",
                                             command=self.toggle_sidebar,
                                             bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat", width=7)
-        self.sidebar_toggle_btn.pack(side="right", padx=(0, 6))
         self.blur_enabled = False
         self._blur_forced_by_focus = False
         self._window_was_focused = True
         self.blur_toggle_btn = tk.Button(self.pool_filter_row, text="Blur",
                                          command=self.toggle_blur,
                                          bg=DARK_PANEL, fg=TEXT_COLOR, activebackground=ACCENT, relief="flat", width=7)
-        self.blur_toggle_btn.pack(side="right", padx=(0, 6))
+        # Group the four controls together on the right of "Pool:", evenly
+        # spaced. side="right" packs right-to-left, so the tuple is ordered
+        # rightmost-first to keep L->R = Blur, Focus, Tags, All.
+        for _w in (self.pool_filter, self.tag_filter_btn,
+                   self.sidebar_toggle_btn, self.blur_toggle_btn):
+            _w.pack(side="right", padx=(0, 6))
         self.pool_filter_row.pack(fill="x", pady=(0, 6))
 
         # ---- Leaderboard ----
@@ -1398,7 +1427,8 @@ class App:
             "dislikes_adjusted": (
                 f"Shrunken Avg + volume bonus (max {VOLUME_BONUS:g}) "
                 f"- dislike rate×{DISLIKE_RATE_PENALTY:g}. "
-                f"Rewards large like-counts; penalizes by dislikes÷(likes+dislikes+{FOLDER_PRIOR_IMAGES})."
+                f"Dislike rate uses a {DISLIKE_PRIOR_IMAGES}-image prior at the population baseline, "
+                f"so small zero-dislike folders regress to neutral instead of topping the board."
             ),
             "avg": "Simple Avg: plain mean score by folder.",
             "lcb": f"Lower Confidence Bound: conservative score (mean - z*SE, z={LCB_Z}).",
@@ -1996,6 +2026,37 @@ class App:
         else:
             entry["thumb"] = self._build_duel_thumbnail(entry["a_path"], entry["b_path"])
 
+    def _retain_skipped_duel(self, pair: Optional[Tuple[tuple, tuple]]) -> None:
+        """Hold a skipped duel in the carousel (session-only; never logged) so an
+        unintentional skip can be recovered by clicking back to it and voting.
+
+        The entry lives in ``duel_history`` with ``skipped=True`` /
+        ``comparison_id=None`` — it writes nothing to the DB until a winner is
+        cast (at which point ``choose`` runs the ``record_result`` path and the
+        skip becomes a real, logged duel). Because ``duel_history`` is in-memory
+        only, held skips vanish when the app/session closes. Solo/unmatched pairs
+        (no opponent) are ignored — there is nothing to compare or recover."""
+        if not pair:
+            return
+        a, b = pair
+        if a is None or b is None:
+            return
+        entry = {
+            "a_id": a[0], "b_id": b[0],
+            "a_path": a[1], "b_path": b[1],
+            "a_tags": a[8] if len(a) > 8 else "",
+            "b_tags": b[8] if len(b) > 8 else "",
+            "winner": None,
+            "comparison_id": None,
+            "before_a": _snapshot_stats(self.conn, a[0]),
+            "before_b": _snapshot_stats(self.conn, b[0]),
+            "sub_label": None,
+            "skipped": True,
+            "thumb": None,
+        }
+        self._attach_history_thumbs(entry)
+        self.duel_history.append(entry)
+
     def _fetch_row(self, img_id: int) -> Optional[tuple]:
         row = self.conn.execute("""
             SELECT id, path, folder, duels, wins, losses, score, hidden, tags
@@ -2323,12 +2384,14 @@ class App:
                         if entry.get("thumb") is None:
                             self._attach_history_thumbs(entry)
                         is_pending = (entry.get("sub_label") and entry.get("comparison_id") is None)
-                        slot_bg = PENDING_COLOR if is_pending else DARK_PANEL
+                        is_skipped = bool(entry.get("skipped"))
+                        slot_bg = PENDING_COLOR if is_pending else (SKIPPED_COLOR if is_skipped else DARK_PANEL)
+                        skip_prefix = "↩ " if is_skipped else ""
                         if self._entry_is_sensitive(entry):
-                            label = f"{display_num}. {self._entry_sensitive_label(entry)}"
+                            label = f"{display_num}. {skip_prefix}{self._entry_sensitive_label(entry)}"
                             thumb = entry.get("thumb_blurred") or entry.get("thumb", "")
                         else:
-                            label = f"{display_num}. {self._history_label(entry)}"
+                            label = f"{display_num}. {skip_prefix}{self._history_label(entry)}"
                             thumb = entry.get("thumb", "")
                         btn.configure(text=label, state="normal", bg=slot_bg, image=thumb)
                         self._carousel_slot_map[i] = vi
@@ -2384,8 +2447,10 @@ class App:
                     btn.configure(text="--", image="", state="disabled", bg=DARK_PANEL)
                     self._carousel_slot_map[i] = None
 
+            skipped_count = sum(1 for e in self.duel_history if e.get("skipped"))
+            skipped_txt = f" | {skipped_count} skipped" if skipped_count else ""
             upcoming = f" | +{future_count} upcoming" if future_count else ""
-            self.carousel_info.configure(text=f"History: {total} (live){upcoming}")
+            self.carousel_info.configure(text=f"History: {total} (live){skipped_txt}{upcoming}")
             self.carousel_prev_btn.configure(state="normal" if total > 0 else "disabled")
             self.carousel_next_btn.configure(state="normal" if self.future_queue else "disabled")
 
@@ -2418,12 +2483,14 @@ class App:
                     btn.configure(wraplength=max(120, self.carousel_thumb_size[0] * 2))
                     is_active  = (idx == active_index)
                     is_pending = (entry.get("sub_label") and entry.get("comparison_id") is None)
-                    slot_bg    = ACCENT if is_active else (PENDING_COLOR if is_pending else DARK_PANEL)
+                    is_skipped = bool(entry.get("skipped"))
+                    slot_bg    = ACCENT if is_active else (PENDING_COLOR if is_pending else (SKIPPED_COLOR if is_skipped else DARK_PANEL))
+                    skip_prefix = "↩ " if is_skipped else ""
                     if not is_active and self._entry_is_sensitive(entry):
-                        label = f"{display_num}. {self._entry_sensitive_label(entry)}"
+                        label = f"{display_num}. {skip_prefix}{self._entry_sensitive_label(entry)}"
                         thumb = entry.get("thumb_blurred") or entry.get("thumb", "")
                     else:
-                        label = f"{display_num}. {self._history_label(entry)}"
+                        label = f"{display_num}. {skip_prefix}{self._history_label(entry)}"
                         thumb = entry.get("thumb", "")
                     btn.configure(
                         text=label,
@@ -2458,7 +2525,7 @@ class App:
             cursor="hand2",
             command=lambda s=side: self._show_custom_tag_menu(s),
         )
-        button.grid(row=0, column=2, sticky="e", padx=8, pady=2)
+        button.pack(side="left", padx=(0, 6), pady=2)
         tag_vars: dict = {}
         for tag in TAG_OPTIONS:
             tag_vars[tag] = tk.BooleanVar(value=False)
@@ -2763,13 +2830,13 @@ class App:
         win.bind("<Destroy>", _cleanup_bind)
 
     def _build_action_buttons(self, side: str, parent: tk.Frame) -> None:
-        actions = tk.Frame(parent, bg=INFO_BAR_BG)
-        actions.grid(row=0, column=1, sticky="e", padx=(0, 8), pady=2)
-
+        # Buttons pack directly into the info row (a flexible spacer to their
+        # left keeps the cluster right-aligned). A uniform padx gives even
+        # spacing between them.
         buttons: dict = {}
         # Favorite (heart) — replaces the old "Upvote" button. Toggles the FAVORITE marker tag.
         heart = tk.Button(
-            actions,
+            parent,
             text="♡",
             command=lambda s=side: self.toggle_favorite(s),
             bg=INFO_BAR_BG,
@@ -2782,13 +2849,13 @@ class App:
             font=("Segoe UI", 11),
             cursor="hand2",
         )
-        heart.pack(side="left", padx=(0, 2))
+        heart.pack(side="left", padx=(0, 6), pady=2)
         buttons["favorite"] = heart
 
         for text, cmd in (("Skip", lambda s=side: self.skip_side(s)),
                           ("Hide", lambda s=side: self.hide_side(s))):
             btn = tk.Button(
-                actions,
+                parent,
                 text=text,
                 command=cmd,
                 bg=INFO_BAR_BG,
@@ -2801,7 +2868,7 @@ class App:
                 font=("Segoe UI", 8),
                 cursor="hand2",
             )
-            btn.pack(side="left", padx=(0, 2))
+            btn.pack(side="left", padx=(0, 6), pady=2)
             buttons[text.lower()] = btn
         self._side[side]["action_buttons"] = buttons
         self._update_favorite_button(side)
@@ -3442,6 +3509,9 @@ class App:
                 else:
                     self._exit_history_mode()
             else:
+                # Live whole-duel skip: hold the pair in the carousel (not logged)
+                # so it can be recovered if the skip was unintentional.
+                self._retain_skipped_duel(self.current)
                 self._stop_video("a")
                 self._stop_video("b")
                 self.load_duel()
@@ -3452,7 +3522,9 @@ class App:
         if self.history_index is not None:
             entry = self.duel_history[self.history_index]
             if entry.get("comparison_id") is None:
-                # Brand-new sub-duel: create a real comparison record.
+                # Unlogged entry — a brand-new sub-duel OR a held skip. Voting now
+                # creates the real comparison record; for a held skip this is the
+                # "recover" path (it stops being skipped and becomes a logged duel).
                 a = self._fetch_row(entry["a_id"])
                 b = self._fetch_row(entry["b_id"])
                 if a and b:
@@ -3461,6 +3533,7 @@ class App:
                     entry["winner"]        = winner
                     entry["before_a"]      = result["before_a"]
                     entry["before_b"]      = result["before_b"]
+                    entry["skipped"]       = False
                     entry["thumb"]         = None
             else:
                 self._apply_revote(self.history_index, winner)
@@ -3596,7 +3669,16 @@ class App:
     def skip_side(self, side: str) -> None:
         if not self.current:
             return
-        self._replace_side_keep_other(side)
+        # A side-swap discards the current pair for a fresh opponent on one side.
+        # In live mode, hold that pre-swap pair in the carousel (not logged) so a
+        # fat-fingered swap is recoverable. _replace_side_keep_other does not
+        # repaint the carousel, so force a refresh to reveal the new held entry.
+        if self.history_index is None and not self.solo_mode:
+            self._retain_skipped_duel(self.current)
+            self._replace_side_keep_other(side)
+            self._update_carousel()
+        else:
+            self._replace_side_keep_other(side)
 
     def undo_side_tag_hide(self, side: str) -> None:
         if not self.current or self.solo_mode:
